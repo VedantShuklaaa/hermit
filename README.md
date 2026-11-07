@@ -1417,7 +1417,7 @@ runs. There was no endpoint before, so there is no before number. Methodology:
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | — | — | — | — | — |
 | ee1a2a6 | 24 h baseline | Token Bridge | 100% (1101/1101) | 50/50 (39 `both_completed`, 11 `both_open`) | 0 | 5092 s |
-| — | reconcile 24 h re-run on EC2 (clean window, 4b + 4d build): recall 100.00% (594/594), 0 missed, lag p50 1 s / p99 3 s / max 11 s, precision 20/20 | — | — | — | — | — |
+| — | reconcile 24 h on EC2 (clean window, 4f build `ee61d91`, one stream start at 19:41Z, window 2026-11-06T19:47Z to 2026-11-07T19:47Z): recall 100.00% (389/389), 0 missed, lag p50 1 s / p99 2 s / max 7 s, precision 20/20 (15 `both_completed`, 5 `both_open`); poll ran 293 cycles, 0 errors, `poll_missed_total` 0 (stream complete without the poll) | — | — | — | — | — |
 
 **24 h baseline, `ee1a2a6`.** Window `2026-10-29T10:06Z` to `2026-10-30T09:06Z`
 (23 h) on EC2, Token Bridge program: 1101 of 1101 successful signatures
