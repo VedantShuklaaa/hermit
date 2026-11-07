@@ -23,6 +23,10 @@ fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppC
         health_port: 0,
         database_url: "postgres://unused".to_string(),
         redis_url: "redis://127.0.0.1:1".to_string(),
+        live_feed: bridge::config::LiveFeedConfig {
+            enabled: false,
+            max: 1000,
+        },
         helius_api_url: upstream_url.to_string(),
         helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),

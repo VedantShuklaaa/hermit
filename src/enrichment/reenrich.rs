@@ -114,6 +114,13 @@ async fn reenrich_one(state: &AppState, row: DueTransfer) -> anyhow::Result<(Ste
     let step = settle(&mut tx, transfer, status_before, enriched);
     if step != Step::Unavailable {
         persist_transaction(&state.db, &tx).await?;
+        // Status advances and origin-tx resolution are update frames. They only
+        // reach the WebSocket and the Redis ring when the live feed is enabled, so
+        // flag-off behaviour stays exactly as before.
+        let changed = step == Step::Advanced || origin_filled;
+        if changed && state.live_feed.enabled() {
+            crate::live_feed::publish(state, &tx).await;
+        }
     }
     Ok((step, origin_filled))
 }

@@ -73,6 +73,16 @@ impl ReenrichConfig {
     }
 }
 
+/// Server-owned live feed backed by Redis.
+#[derive(Clone, Debug)]
+pub struct LiveFeedConfig {
+    /// `LIVE_FEED_REDIS_ENABLED`, default off. Off means no Redis writes, no
+    /// endpoint and byte-for-byte unchanged WebSocket frames.
+    pub enabled: bool,
+    /// Most frames kept in the ring. `LIVE_FEED_MAX`, default 1000.
+    pub max: usize,
+}
+
 /// Stream consumer and recovery worker.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -138,6 +148,7 @@ pub struct AppConfig {
     pub health_port: u16,
     pub database_url: String,
     pub redis_url: String,
+    pub live_feed: LiveFeedConfig,
     /// Helius endpoint for the API lane (`/analyse`, list endpoint).
     /// `HELIUS_API_URL`, falling back to `HELIUS_URL`.
     pub helius_api_url: String,
@@ -267,6 +278,12 @@ impl AppConfig {
                 .unwrap_or(8081),
             database_url: required("DATABASE_URL")?,
             redis_url: required("REDIS_URL")?,
+            live_feed: LiveFeedConfig {
+                enabled: std::env::var("LIVE_FEED_REDIS_ENABLED")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                max: number("LIVE_FEED_MAX", 1000usize).clamp(1, 10_000),
+            },
             helius_api_url: helius.api,
             helius_stream_url: helius.ingest,
             helius_reconcile_url: helius.reconcile,
@@ -410,6 +427,10 @@ impl AppConfig {
             health_port: 0,
             database_url: "postgres://127.0.0.1:1/unused".to_string(),
             redis_url: "redis://127.0.0.1:1".to_string(),
+            live_feed: LiveFeedConfig {
+                enabled: false,
+                max: 1000,
+            },
             helius_api_url: "https://api.helius.test".to_string(),
             helius_stream_url: "https://stream.helius.test".to_string(),
             helius_reconcile_url: "https://reconcile.helius.test".to_string(),

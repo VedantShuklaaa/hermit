@@ -63,7 +63,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .nest("/api/v1", v1::router())
-        .nest("/api/v2", v2::router())
+        .nest("/api/v2", v2::router(state.config.live_feed.enabled))
         .layer(cors)
         .layer(middleware::from_fn(record_http_metrics))
         .with_state(state)

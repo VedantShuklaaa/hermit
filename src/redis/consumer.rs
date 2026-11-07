@@ -556,16 +556,9 @@ impl RedisConsumer {
                     "Transaction persisted successfully"
                 );
 
-                match serde_json::to_string(&analysed.tx) {
-                    Ok(payload) => {
-                        // The sink decides: local channel in `ROLE=all`, Redis
-                        // pub/sub to the api process in `ROLE=stream`.
-                        self.state.broadcast.publish(payload).await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?error, "Failed to serialize transaction for broadcast");
-                    }
-                }
+                // One hook for both consumers: the local channel in `ROLE=all`, Redis
+                // pub/sub in `ROLE=stream`, and the server-owned live feed ring.
+                crate::live_feed::publish(&self.state, &analysed.tx).await;
 
                 let _: i64 = redis::cmd("XACK")
                     .arg(BRIDGE_TX_STREAM)
