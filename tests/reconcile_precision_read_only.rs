@@ -63,6 +63,10 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
         // The analysis path never opens Redis; a value here is only a reminder that
         // nothing in the pass should need it.
         redis_url: "redis://127.0.0.1:1".to_string(),
+        live_feed: bridge::config::LiveFeedConfig {
+            enabled: false,
+            max: 1000,
+        },
         helius_api_url: upstream_url.to_string(),
         helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),

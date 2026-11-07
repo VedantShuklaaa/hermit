@@ -42,6 +42,10 @@ fn test_config(
         health_port: 0,
         database_url: database_url.to_string(),
         redis_url: redis_url.to_string(),
+        live_feed: bridge::config::LiveFeedConfig {
+            enabled: false,
+            max: 1000,
+        },
         helius_api_url: upstream_url.to_string(),
         helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),

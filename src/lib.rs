@@ -8,6 +8,7 @@ pub mod enrichment;
 pub mod error;
 pub mod handler;
 pub mod ingestion;
+pub mod live_feed;
 pub mod metrics;
 pub mod normaliser;
 pub mod protocols;

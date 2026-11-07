@@ -525,6 +525,7 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
 GET /api/v1/transactions/analyse?transaction_hash=<hash>&chain=solana
 GET /api/v2/transactions/analyse?transaction_hash=<hash>&chain=solana
 GET /api/v2/transfers
+GET /api/v2/transfers/live
 WS  /api/v1/transactions/stream
 ```
 
@@ -588,6 +589,40 @@ away when the adapter for that protocol gets a `MessageId` variant.
 
 CORS is origin-allowlisted via `ALLOWED_ORIGINS` — nothing is permitted by
 default.
+
+### Live feed (`GET /api/v2/transfers/live`)
+
+A server-owned ring of the most recent WebSocket frames, so every browser sees
+the same recent transactions instead of each tab keeping its own list. The
+indexer writes it; readers never touch Postgres.
+
+```
+GET /api/v2/transfers/live?limit=15&before=<next_cursor>
+```
+
+| Parameter | Meaning | Rules |
+| --- | --- | --- |
+| `limit` | page size | default 15, clamped to 1..100 |
+| `before` | position from the previous `next_cursor` | opaque; strictly older than the last returned item |
+
+The response is `{ "items": [...], "next_cursor": string|null, "total": <ZCARD>, "server_time": <ms> }`.
+Each item is the v1 WebSocket frame plus `first_seen_at` and `updated_at`
+(milliseconds). `first_seen_at` is the ring position and never changes when an
+enrichment update replaces the frame; `updated_at` is the last write. Items are
+newest first, and `total` is the current ring size, not the filtered count.
+
+The path reads Redis only (`ZREVRANGEBYSCORE` and `HMGET`). If the ring is empty
+after a cold start or Redis restart, one process takes `SET bridge:live:warmup 1
+NX EX 30` and fills it from the newest `LIVE_FEED_MAX` stored analyses; concurrent
+readers get an empty page until that finishes. The warm-up is the only database
+query on this path. When Redis is down the endpoint serves the last in-process
+cursorless page for up to 10 seconds, then `503` with an empty-feed body; a
+circuit breaker admits at most one Redis probe per 5-second window. Responses
+carry `Cache-Control: public, s-maxage=2, stale-while-revalidate=10`.
+
+The endpoint is registered only when `LIVE_FEED_REDIS_ENABLED` is on. When it is
+off the route does not exist (404), the WebSocket payload is byte-for-byte
+unchanged, and the feed issues no Redis command.
 
 ## Running locally
 
@@ -750,6 +785,14 @@ scrape_configs:
 
 ### Config notes
 
+* Live feed (`LIVE_FEED_REDIS_ENABLED`, default off; `LIVE_FEED_MAX`, default
+  1000, clamped 1..10000). When enabled, every frame published to `/stream` is
+  also upserted atomically into `bridge:live:index` (ZSET, score
+  `first_seen_at_ms`, `ZADD NX`) and `bridge:live:frames` (HASH), which is
+  trimmed to `LIVE_FEED_MAX` entries. Enrichment status advances and inbound
+  origin-tx resolution publish an update frame as well. A Redis failure only
+  logs; the WebSocket broadcast and the database write continue. When disabled
+  the endpoint is not registered and no feed Redis command is issued.
 * Helius provider lanes (1c). `HELIUS_API_URL` is the API lane's endpoint and
   `HELIUS_STREAM_URL` is the ingest lane's (ingester backfill, consumer workers,
   recovery, re-enrichment); each falls back to `HELIUS_URL` when unset, so a single

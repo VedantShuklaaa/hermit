@@ -3,6 +3,7 @@ use crate::chains::ChainRegistry;
 use crate::config::{AppConfig, Lane};
 use crate::enrichment::EnrichmentProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
+use crate::live_feed::LiveFeed;
 use crate::protocols::registry::{ProtocolRegistry, default_registry};
 use crate::redis::broadcast::BroadcastSink;
 use crate::services::read_through::ReadThrough;
@@ -47,6 +48,9 @@ pub struct Inner {
     pub wormhole_limiter: Arc<Limiter>,
     pub enrichment: Arc<dyn EnrichmentProvider>,
     pub helius_wait: Duration,
+    /// The server-owned live feed. Off by default; when off it issues no Redis
+    /// command and the endpoint is not routed.
+    pub live_feed: Arc<LiveFeed>,
 }
 
 #[derive(Clone)]
@@ -111,6 +115,7 @@ impl AppState {
             wormhole_limiter.clone(),
             chains.clone(),
         ));
+        let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -129,6 +134,7 @@ impl AppState {
                 wormhole_limiter,
                 enrichment,
                 helius_wait,
+                live_feed,
             }),
         })
     }
@@ -165,6 +171,7 @@ impl AppState {
             wormhole_limiter.clone(),
             chains.clone(),
         ));
+        let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -183,6 +190,7 @@ impl AppState {
                 wormhole_limiter,
                 enrichment,
                 helius_wait,
+                live_feed,
             }),
         })
     }
