@@ -34,16 +34,39 @@ pub struct Log {
 pub struct EvmClient {
     client: Client,
     url: String,
+    /// The URL's host. Metrics and logs carry this and never the URL itself, whose
+    /// path often holds the provider key.
+    host: String,
     limiter: Arc<Limiter>,
 }
 
 impl EvmClient {
     pub fn new(client: Client, url: String, limiter: Arc<Limiter>) -> Self {
+        let host = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
         Self {
             client,
             url,
+            host,
             limiter,
         }
+    }
+
+    /// The endpoint's host, safe to log and to use as a metric label.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub async fn chain_id(&self) -> Result<u64, AppError> {
+        let labels = UpstreamLabels::evm();
+        let result =
+            call_upstream(&self.limiter, labels, || self.rpc("eth_chainId", json!([]))).await?;
+        result
+            .as_str()
+            .and_then(parse_quantity)
+            .ok_or_else(|| bad("eth_chainId: unexpected result shape"))
     }
 
     pub async fn block_number(&self) -> Result<u64, AppError> {
@@ -162,8 +185,9 @@ fn upstream_status_error(status: reqwest::StatusCode) -> AppError {
 /// over a limit. Alchemy's free tier answers HTTP 400 with `-32600` and
 /// `Under the Free tier plan ... up to a 10 block range`; other plans answer with
 /// `-32602` and `invalid argument 0: eth_getLogs is limited to a 2,000 block range`.
-/// A generic invalid-params answer, a timeout, or an unknown error must not halve the
-/// range.
+/// dRPC's free plan answers `ranges over 10000 blocks are not supported on free plan`,
+/// which names no "block range" and no method. A generic invalid-params answer, a
+/// timeout, or an unknown error must not halve the range.
 pub(crate) fn is_range_too_large_error(error: &Value) -> bool {
     let code = error.get("code").and_then(Value::as_i64);
     let message = error
@@ -172,7 +196,7 @@ pub(crate) fn is_range_too_large_error(error: &Value) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    let mentions_range = message.contains("block range") || message.contains("eth_getlogs");
+    let mentions_range = message.contains("range") || message.contains("eth_getlogs");
     let too_large = [
         "too large",
         "too many",
@@ -183,7 +207,10 @@ pub(crate) fn is_range_too_large_error(error: &Value) -> bool {
         "up to",
     ]
     .iter()
-    .any(|needle| message.contains(needle));
+    .any(|needle| message.contains(needle))
+        || (message.contains("not supported")
+            && message.contains("ranges over")
+            && message.contains("block"));
 
     (mentions_range && too_large) || (code == Some(-32602) && mentions_range)
 }
@@ -298,6 +325,29 @@ mod tests {
             }),
         ] {
             assert!(is_range_too_large_error(&error), "{error}");
+        }
+    }
+
+    #[test]
+    fn drpcs_free_plan_range_error_halves_the_range() {
+        // The measured dRPC answer (E0). It names neither "block range" nor the
+        // method, and the number in it (10,000) is not the real boundary (101).
+        assert!(is_range_too_large_error(&json!({
+            "code": -32600,
+            "message": "ranges over 10000 blocks are not supported on free plan"
+        })));
+    }
+
+    #[test]
+    fn an_unsupported_method_is_not_a_range_error() {
+        for message in [
+            "eth_getLogs is not supported",
+            "the archive range is unavailable",
+        ] {
+            assert!(
+                !is_range_too_large_error(&json!({"code": -32601, "message": message})),
+                "{message}"
+            );
         }
     }
 

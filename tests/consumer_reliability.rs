@@ -93,10 +93,8 @@ fn test_config(
         },
         evm: bridge::config::EvmConfig {
             enabled: false,
-            rpc_urls: Default::default(),
-            rps: 5,
+            rpc: Default::default(),
             poll_secs: 12,
-            max_block_range: 10,
             join_max_age_secs: 86_400,
         },
         chain_registry_refresh_secs: 60,

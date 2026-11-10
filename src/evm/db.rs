@@ -15,7 +15,9 @@ pub struct WatchTarget {
     pub core_bridge_address: String,
     pub token_bridge_address: String,
     pub finality_depth: u64,
-    pub rpc_url: String,
+    /// `eth_chainId` the endpoint must answer with. `None` skips the check for a
+    /// target whose EVM chain id has not been recorded yet.
+    pub evm_chain_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +44,7 @@ pub struct JoinStats {
     pub matched: u64,
 }
 
-type TargetRow = (i16, String, String, String, String, i64);
+type TargetRow = (i16, String, String, String, String, i64, Option<i64>);
 
 /// Enabled targets, joined to the active Wormhole chain mapping. A target whose
 /// mapping is not a u16 is skipped with a warning rather than failing the load.
@@ -54,7 +56,8 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
                m.protocol_chain_id,
                t.core_bridge_address,
                t.token_bridge_address,
-               t.finality_depth
+               t.finality_depth,
+               t.evm_chain_id
         FROM evm_watch_targets t
         JOIN chains c ON c.id = t.chain_id
         JOIN protocol_chain_ids m
@@ -72,7 +75,7 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
     Ok(rows
         .into_iter()
         .filter_map(
-            |(chain_id, slug, wormhole_id, core, token, finality_depth)| {
+            |(chain_id, slug, wormhole_id, core, token, finality_depth, evm_chain_id)| {
                 let Ok(wormhole_chain_id) = wormhole_id.parse::<u16>() else {
                     tracing::warn!(%slug, %wormhole_id, "skipping EVM target with a non-u16 Wormhole chain id");
                     return None;
@@ -84,7 +87,7 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
                     core_bridge_address: core,
                     token_bridge_address: token,
                     finality_depth: u64::try_from(finality_depth).unwrap_or(0),
-                    rpc_url: String::new(),
+                    evm_chain_id: evm_chain_id.and_then(|id| u64::try_from(id).ok()),
                 })
             },
         )
