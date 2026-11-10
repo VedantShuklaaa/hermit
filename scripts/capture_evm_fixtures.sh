@@ -5,7 +5,7 @@
 #
 # Writes tests/fixtures/evm_ethereum_<name>.json as the raw eth_getLogs response.
 # The RPC URL holds your provider key and is never written to disk. Fixtures from a
-# paid plan can span a wide range; a free-tier key caps eth_getLogs at 2,000 blocks.
+# paid plan can span a wide range; a free-tier Alchemy key caps eth_getLogs at 10 blocks.
 #
 # The two events are the Core Bridge LogMessagePublished and the Token Bridge
 # TransferRedeemed, filtered to the official mainnet contract addresses.

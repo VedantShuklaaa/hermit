@@ -789,6 +789,7 @@ cargo test
   `tests/bridge_transfers_schema.rs`. `tests/reenrich_backfill.rs` runs the pass
   against the fake upstream: a twenty-row open backlog still leaves half of a
   six-row batch to the backfill, and the next pass reaches the remaining origin rows.
+* `tests/fixtures/evm_ethereum_real_1439615.json` is a raw `eth_getLogs` response captured from Ethereum mainnet (blocks 26385278-26385287; includes the Token Bridge `TransferRedeemed` for sequence 1439615, tx `0xb5c9306b...f861f9`). `evm_ethereum_log_message_published.json` and `evm_ethereum_transfer_redeemed.json` remain synthetic, since the join tests need one matching send/redeem pair. Recapture with `bash scripts/capture_evm_fixtures.sh <name> <from> <to>` (free-tier Alchemy keys allow at most 10 blocks per `eth_getLogs`).
 
 ***
 
