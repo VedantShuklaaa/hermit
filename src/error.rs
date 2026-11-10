@@ -32,6 +32,12 @@ pub enum AppError {
     #[error("upstream provider timed out: {0}")]
     UpstreamTimeout(&'static str),
 
+    /// A provider refused an `eth_getLogs` window as too large. The watcher halves
+    /// its range and retries; it must not be treated as a transient retry, or the
+    /// same oversized request would be sent again.
+    #[error("upstream provider block range too large: {0}")]
+    UpstreamRangeTooLarge(&'static str),
+
     #[error("failed to normalise transaction data: {0}")]
     Normalisation(String),
 
@@ -72,6 +78,9 @@ impl AppError {
                 (StatusCode::TOO_MANY_REQUESTS, "UPSTREAM_RATE_LIMITED")
             }
             AppError::UpstreamTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "UPSTREAM_TIMEOUT"),
+            AppError::UpstreamRangeTooLarge(_) => {
+                (StatusCode::BAD_GATEWAY, "UPSTREAM_RANGE_TOO_LARGE")
+            }
             AppError::Normalisation(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "NORMALISATION_FAILED")
             }
@@ -98,6 +107,7 @@ impl AppError {
             | AppError::VaaNotAvailable(_)
             | AppError::Normalisation(_)
             | AppError::BadRequest(_)
+            | AppError::UpstreamRangeTooLarge(_)
             | AppError::Internal(_) => false,
         }
     }

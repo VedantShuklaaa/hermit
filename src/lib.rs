@@ -6,6 +6,7 @@ pub mod db;
 pub mod domain;
 pub mod enrichment;
 pub mod error;
+pub mod evm;
 pub mod handler;
 pub mod ingestion;
 pub mod live_feed;

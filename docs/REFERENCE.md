@@ -106,12 +106,37 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     `Inbound` rows written by the old WormholeScan fallback (which stored the
     redeem tx's Solana signer). Outbound rows and already-NULL rows are untouched;
     a second run matches nothing.
-* `services::detect` turns adapter output into the API's `BridgeTransfer` with
-  status `Detected`, then `apply_wormholescan` raises it: `Pending` when a
-  matching VAA exists, `Completed` when the destination tx is known. No VAA, a
-  failed WormholeScan call or a VAA for another message leaves it `Detected`.
-  Token symbol and decimals are a best-effort lookup with a 2 s timeout. The
-  upsert never moves a status backwards, and the cached analysis follows the same rule.
+  * `20261110120000_evm_log_watching.sql` adds `evm_watch_targets` (per-chain
+    Core Bridge and Token Bridge addresses and finality depth, seeded with
+    Ethereum and its Wormhole chain ID 2), `evm_watch_cursors` and
+    `evm_log_events`.
+* **EVM log watching (Ethereum only).** One watcher per enabled
+  `evm_watch_targets` row polls `eth_getLogs` over the configured address and
+  topic filters through its own limiter (`EVM_RPS`) and stores events keyed by
+  the message identity `(emitter_chain, emitter_address, sequence)` plus tx hash,
+  block number, block hash and block timestamp. `LogMessagePublished` on the Core
+  Bridge is kept only when the indexed sender is the Token Bridge, and its tx
+  hash is the source tx. `TransferRedeemed` on the Token Bridge names the
+  original message (`emitterChainId`, `emitterAddress`, `sequence`) and its tx
+  hash is the destination tx. Topics are `keccak256` of the ABI signatures, and
+  a test recomputes both. The watcher reads only finalized blocks (the
+  `finalized` tag, or `head - finality_depth` when the provider rejects it),
+  advances a persisted cursor per chain in the same transaction that stores a
+  range's events, and on a cursor-hash mismatch deletes events at or after the
+  cursor and rewinds one block. Ingest is idempotent on
+  `UNIQUE (chain_id, tx_hash, log_index)`. The event-side join fills
+  `source_tx_hash` (inbound) or `destination_tx_hash` + `Completed` (outbound);
+  a transfer-side lookup fills the same fields before enrichment falls back to
+  WormholeScan, with no age limit, so an event recorded before the row was built
+  still matches. WormholeScan stays the fallback for pre-watcher events, unwatched
+  destinations and missing metadata.
+* `services::detect` turns adapter output into the API's `BridgeTransfer`: an
+  outbound send starts `Pending`, an inbound redeem (decoded from the posted
+  VAA) starts `Completed`. `apply_wormholescan` then raises the status: `Pending`
+  when a matching VAA exists, `Completed` when the destination tx is known; a
+  failed or mismatched enrichment leaves the chain-derived status alone. Token
+  symbol and decimals are a best-effort lookup with a 2 s timeout. The upsert
+  never moves a status backwards, and the cached analysis follows the same rule.
 
 ### Architecture after Phase 2
 
@@ -184,6 +209,7 @@ hermit/
 │   └── scaling-log.md
 ├── scripts/
 │   ├── bench_list.sh
+│   ├── capture_evm_fixtures.sh         # eth_getLogs for the watched topics
 │   └── capture_fixtures.sh
 ├── src/
 │   ├── main.rs                         # wiring, supervised workers, HTTP server
@@ -225,7 +251,15 @@ hermit/
 │   ├── enrichment/
 │   │   ├── mod.rs                      # EnrichmentProvider trait
 │   │   ├── wormholescan.rs             # /operations, /global-tx, /vaas fallback
+│   │   ├── evm_first.rs                # EVM event lookup before WormholeScan
 │   │   └── reenrich.rs                 # background pass
+│   ├── evm/
+│   │   ├── mod.rs
+│   │   ├── client.rs                   # JSON-RPC, own limiter, range-halving
+│   │   ├── db.rs                       # targets, cursor, events, joins
+│   │   ├── decode.rs                   # LogMessagePublished, TransferRedeemed
+│   │   ├── lookup.rs                   # transfer-side tx hash lookup
+│   │   └── watcher.rs                  # poll loop, finality, reorgs
 │   ├── ingestion/
 │   │   ├── solana.rs
 │   │   ├── backfill.rs                 # pure backfill planning
@@ -260,6 +294,7 @@ hermit/
 │   ├── chain_registry_db.rs
 │   ├── common/
 │   ├── decode_unit.rs
+│   ├── evm_log_watch.rs
 │   ├── fixtures_decode.rs
 │   ├── golden_fixtures.rs
 │   ├── list_transfers.rs
@@ -369,7 +404,8 @@ and the miss is not cached, so a later request retries.
 * **Stale data beats a slow answer.** Pending transfers past their freshness
   window are served from Postgres while a background task refreshes them.
 * **Enrichment never gates persistence.** A transfer decoded from Solana data is
-  stored as `Detected` even if WormholeScan is down, and a status never moves backwards.
+  stored even if WormholeScan is down (outbound as `Pending`, inbound as
+  `Completed`), and a status never moves backwards.
 * **Account preloads fail loud on the live path.** Adapter-requested accounts
   (the posted VAA of a redeem) are read in one `getMultipleAccounts` call through
   the Helius limiter. A live message whose preload fails transiently is left
@@ -639,6 +675,14 @@ scrape_configs:
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV) but nothing reads it
   yet. A4 wires it and retires the single-address setting.
 * **Chain registry:** `CHAIN_REGISTRY_REFRESH_SECS` (default 60, min 5).
+* **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
+  per chain (suffix is the lowercased `chains.slug`, e.g.
+  `EVM_RPC_ETHEREUM`; a chain without a URL is skipped with a warning).
+  `EVM_RPS` (5), `EVM_POLL_SECS` (12), `EVM_MAX_BLOCK_RANGE` (10; halved on a
+  genuine range-too-large JSON-RPC error, never on a 429 or timeout),
+  `EVM_JOIN_MAX_AGE_SECS` (86400; limits only the event-side retry sweep, the
+  transfer-side lookup has no age limit). Enabling without any
+  `EVM_RPC_<CHAIN>` is a startup error.
 * **Re-enrichment:** `REENRICH_ENABLED` (on), `REENRICH_INTERVAL_SECS` (30),
   `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60), `REENRICH_RETRY_SECS`
   (120), `REENRICH_MAX_AGE_SECS` (7 days), `REENRICH_ORIGIN_SHARE` (40; `0`
@@ -692,6 +736,18 @@ cargo test
   origin tx WormholeScan reports. Unit tests in `src/services/detect.rs`
   (mapping, origin tx rules, EVM `0x`, legacy-path fix), `src/enrichment/wormholescan.rs`
   (`/vaas` fallback), `src/domain/bridge_transfer.rs` (derived direction).
+* `tests/evm_log_watch.rs`: Postgres 18 (Docker) and a loopback axum JSON-RPC
+  stub, so no live RPC. Captured fixtures decode to the message identity; the
+  watcher stores logs, advances the cursor and joins an inbound `source_tx_hash`
+  and an outbound `destination_tx_hash`/`Completed`; a genuine range-too-large
+  answer halves the window (10 -> 5 -> 2); a 429 keeps the window and retries; a
+  cursor-hash mismatch drops events and rewinds; the transfer-side lookup fills
+  both directions and a later plain re-analysis does not erase the hash. Unit
+  tests in `src/evm/decode.rs` (topics equal `keccak256` of their signatures,
+  sender/address filters, malformed logs) and `src/evm/client.rs` (429, timeout,
+  unknown error and the Alchemy free-tier range error). Capture logs with
+  `scripts/capture_evm_fixtures.sh` and an `EVM_RPC_ETHEREUM` from the
+  environment; the key is never written.
 * `tests/persistence_idempotency.rs`: Postgres 18 via testcontainers (Docker).
   Redelivering the same tx never duplicates rows in `transactions`,
   `bridge_transfers` or `wormhole_messages`.
@@ -778,7 +834,7 @@ only real adapter.
 * \[x] A2. Generalised domain model and schema (`protocol`, `via`, `direction`, chain refs, per-protocol message key, `NUMERIC` amounts). `bridge_transfers` split from `wormhole_messages`. Existing rows migrated in place, tested on staged legacy data
 * \[x] A3. DB-backed chain registry seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs stored as `unresolved(protocol, id)`. Registry carries status and provenance for the later LLM-proposal upgrade (not built in this phase). Done: tables, seed, `load_snapshot`, DB tests, SQL `resolve_chain`, unresolved IDs persisted, callers moved off `ChainId` (kept only as the frozen `/api/v1` type), refresh task wired
 * \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list
-* \[x] A5. Chain-first detection: persisted as `Detected` from Helius data alone; WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
+* \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share
 * \[x] A8. Ingestion always on, no longer tied to `/stream` clients. Ingester starts under `spawn_supervised`; Helius spend bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped by `INGEST_BACKFILL_MAX`, paced by `INGEST_BACKFILL_PACE_MS`, Redis `SET NX EX` dedupe. Workers read through the live Helius limiter (4/s free plan), so bursts queue in the stream instead of being dropped
@@ -786,7 +842,7 @@ only real adapter.
 * \[x] A10. API versioning: `/api/v2` serves the generalised model; `/api/v1` keeps its Wormhole-shaped response through a compatibility mapper, pinned byte for byte by fixture snapshots. WebSocket stream unchanged. Every decoded transfer persisted with its `event_index`
 
 Benchmarks: classification precision on the fixture set; pure classify ns/op (criterion).
-Exit: Wormhole transfers persisted as `Detected` with WormholeScan fully unavailable; every non-transfer fixture rejected with a reason; migration tested on staged rows (done in A2).
+Exit: Wormhole transfers persisted with WormholeScan fully unavailable (outbound as `Pending` since the status change; this item predates it); every non-transfer fixture rejected with a reason; migration tested on staged rows (done in A2).
 
 #### Phase B and later: one protocol per phase
 
@@ -813,7 +869,7 @@ Out of scope for the first delivery; Phase A ships only the registry shape and `
 * \[x] 1a. Split `analyse_tx` into fetch (IO), decode (pure), enrich (IO). Delivered by A1
 * \[x] 1b. Destination tx resolution: operation payload paths first, then `global-tx` through the WormholeScan limiter. Delivered by A5b
 * \[x] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL, limiter and token patience. `build_registry` takes a lane, `AppState` carries lane and endpoint (`state.helius_url`), `AppState::for_ingest` derives the ingest copy for `ROLE=all`. `reconcile` keeps its own lane
-* \[x] 1d. Golden tests per fixture and status matrix. Every outbound fixture is `Detected` from on-chain decode alone; a matched VAA without destination tx raises it to `Pending`; matched VAA plus destination tx to `Completed`; no VAA, a VAA for another message, or a destination tx with no VAA leaves it `Detected`. Registry membership no longer chooses a status. Inbound redeems are `Completed` at detection. The old WormholeScan-driven matrix remains only for the fallback path in `services::correlator`
+* \[x] 1d. Golden tests per fixture and status matrix. Every outbound fixture is `Pending` from on-chain decode alone; a matched VAA without destination tx leaves it `Pending`; matched VAA plus destination tx raises it to `Completed`; no VAA, a VAA for another message, or a destination tx with no VAA also leaves it `Pending`. Registry membership no longer chooses a status. Inbound redeems are `Completed` at detection. The old WormholeScan-driven matrix remains only for the fallback path in `services::correlator`
 * \[x] 1e. `src/bin/replay.rs`
 * \[ ] 1f. Criterion bench for the pure classify/decode path
 

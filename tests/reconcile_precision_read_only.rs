@@ -112,6 +112,14 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             worker_count: 5,
             read_count: 10,
         },
+        evm: bridge::config::EvmConfig {
+            enabled: false,
+            rpc_urls: Default::default(),
+            rps: 5,
+            poll_secs: 12,
+            max_block_range: 10,
+            join_max_age_secs: 86_400,
+        },
         chain_registry_refresh_secs: 60,
         health_max_ingest_age_secs: 3600,
     }

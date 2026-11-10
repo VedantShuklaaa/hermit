@@ -92,7 +92,8 @@ async fn analyse_tx_inner(
     tx.bridge_transfer = None;
 
     // Chain first: if an adapter decodes a transfer from the Solana tx alone, it is
-    // stored as `Detected` whatever WormholeScan says. WormholeScan only enriches.
+    // stored whatever WormholeScan says (outbound as `Pending`, inbound as
+    // `Completed`). WormholeScan only enriches.
     if let Some(solana_tx) = &solana_tx {
         // Sends out of Solana and redeems into it are both stored (A7). For a redeem the
         // observed Solana tx is the destination side, see `detect::to_bridge_transfer`.

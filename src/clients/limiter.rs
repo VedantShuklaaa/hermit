@@ -48,6 +48,11 @@ impl UpstreamLabels {
     pub const fn wormhole() -> Self {
         Self::new("wormhole", "shared")
     }
+
+    /// An EVM JSON-RPC call from a chain watcher.
+    pub const fn evm() -> Self {
+        Self::new("evm", "watcher")
+    }
 }
 
 fn record_wait(started: Instant, labels: UpstreamLabels) {

@@ -2,7 +2,9 @@ use crate::chain_adapters::registry::AdapterRegistry;
 use crate::chains::ChainRegistry;
 use crate::config::{AppConfig, Lane};
 use crate::enrichment::EnrichmentProvider;
+use crate::enrichment::evm_first::EvmFirstProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
+use crate::evm::lookup::EvmEventLookup;
 use crate::live_feed::LiveFeed;
 use crate::protocols::registry::{ProtocolRegistry, default_registry};
 use crate::redis::broadcast::BroadcastSink;
@@ -109,12 +111,13 @@ impl AppState {
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(wormhole_rps).unwrap(),
         )));
-        let enrichment = Arc::new(WormholeScanProvider::new(
+        let enrichment = build_enrichment(
+            &config,
             http_client.clone(),
-            config.wormhole_url.clone(),
             wormhole_limiter.clone(),
             chains.clone(),
-        ));
+            db.clone(),
+        );
         let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
         Ok(Self {
@@ -165,12 +168,13 @@ impl AppState {
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(config.wormhole_rps).unwrap(),
         )));
-        let enrichment = Arc::new(WormholeScanProvider::new(
+        let enrichment = build_enrichment(
+            &config,
             http_client.clone(),
-            config.wormhole_url.clone(),
             wormhole_limiter.clone(),
             chains.clone(),
-        ));
+            db.clone(),
+        );
         let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
         Ok(Self {
@@ -226,6 +230,32 @@ impl AppState {
                 ..(*self.inner).clone()
             }),
         }
+    }
+}
+
+/// WormholeScan, wrapped by the stored-EVM-log lookup when EVM watching is enabled. The
+/// wrapper answers first only for a missing source (inbound) or destination (outbound)
+/// hash and otherwise delegates, so WormholeScan remains the fallback.
+fn build_enrichment(
+    config: &AppConfig,
+    http_client: Client,
+    limiter: Arc<Limiter>,
+    chains: ChainRegistry,
+    db: PgPool,
+) -> Arc<dyn EnrichmentProvider> {
+    let wormholescan: Arc<dyn EnrichmentProvider> = Arc::new(WormholeScanProvider::new(
+        http_client,
+        config.wormhole_url.clone(),
+        limiter,
+        chains.clone(),
+    ));
+    if config.evm.enabled {
+        Arc::new(EvmFirstProvider::new(
+            wormholescan,
+            EvmEventLookup::new(db, chains),
+        ))
+    } else {
+        wormholescan
     }
 }
 

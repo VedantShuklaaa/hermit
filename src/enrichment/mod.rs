@@ -2,8 +2,9 @@
 //! API onto a transfer that was already decoded from Solana data. Enrichment can raise a
 //! transfer's status but never gates persistence and never moves a status backwards.
 //!
-//! WormholeScan is the only provider today. A later protocol adds its own implementation
-//! of [`EnrichmentProvider`] next to it.
+//! WormholeScan is the protocol-API provider. [`evm_first::EvmFirstProvider`] wraps it
+//! when EVM watching is enabled, so a stored bridge log answers first and WormholeScan
+//! is only the fallback.
 
 use crate::domain::bridge::BridgeEvent;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeTransfer};
@@ -11,6 +12,7 @@ use crate::error::AppError;
 use async_trait::async_trait;
 use serde_json::Value;
 
+pub mod evm_first;
 pub mod reenrich;
 pub mod wormholescan;
 
