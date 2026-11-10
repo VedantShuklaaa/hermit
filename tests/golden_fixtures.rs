@@ -317,14 +317,14 @@ fn inbound_redeems_become_completed_inbound_transfers() {
 // Status matrix (1d), redefined for chain-first detection.
 //
 // The status no longer starts from WormholeScan's answer. An adapter decodes the
-// transfer from the Solana tx alone, so every outbound send starts `Detected` and
-// enrichment can only raise it. Registry membership decides whether a chain
-// reference resolves and whether an explorer URL exists, never the status, so each
-// outbound row runs against both an unregistered and a registered destination.
+// transfer from the Solana tx alone, so every outbound send starts `Pending` (the send
+// is observed, its redeem is not) and enrichment or a watched EVM log can only raise
+// it. Registry membership decides whether a chain reference resolves and whether an
+// explorer URL exists, never the status, so each outbound row runs against both an
+// unregistered and a registered destination.
 //
-// `Detected`  chain data only: no VAA, a VAA for another message, or a destination
-//             tx with no VAA behind it (the chain is the source of truth)
-// `Pending`   the matched VAA exists, its destination tx does not yet
+// `Pending`   the send is observed but no redeem is known: no VAA, a VAA for another
+//             message, or a matched VAA without a destination tx
 // `Completed` the matched VAA and its destination tx are both known
 //
 // A Solana-inbound redeem is `Completed` at detection: the observed tx is the
@@ -412,17 +412,17 @@ const OUTBOUND_MATRIX: [StatusCase; 7] = [
     StatusCase {
         fixture: "completed_outbound",
         operation: Operation::Nothing,
-        expected: "Detected",
+        expected: "Pending",
     },
     StatusCase {
         fixture: "completed_outbound",
         operation: Operation::DestinationTxWithoutVaa,
-        expected: "Detected",
+        expected: "Pending",
     },
     StatusCase {
         fixture: "completed_outbound",
         operation: Operation::OtherMessage,
-        expected: "Detected",
+        expected: "Pending",
     },
     StatusCase {
         fixture: "completed_outbound",
@@ -471,7 +471,7 @@ fn status_matrix_for_chain_first_detection() {
             // The chain alone is enough to persist the transfer.
             assert_eq!(
                 status_name(&t.status),
-                "Detected",
+                "Pending",
                 "{}: before enrichment",
                 case.fixture
             );

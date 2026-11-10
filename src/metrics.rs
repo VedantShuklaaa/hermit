@@ -26,6 +26,13 @@ pub const INGEST_BACKFILL_PUBLISHED_TOTAL: &str = "ingest_backfill_published_tot
 pub const POLL_CYCLES_TOTAL: &str = "poll_cycles_total";
 pub const POLL_MISSED_TOTAL: &str = "poll_missed_total";
 pub const POLL_LAST_SUCCESS_TIMESTAMP_SECONDS: &str = "poll_last_success_timestamp_seconds";
+pub const EVM_BLOCKS_TOTAL: &str = "evm_blocks_total";
+pub const EVM_EVENTS_TOTAL: &str = "evm_events_total";
+pub const EVM_JOIN_MATCHES_TOTAL: &str = "evm_join_matches_total";
+pub const EVM_REORGS_TOTAL: &str = "evm_reorgs_total";
+pub const EVM_RANGE_HALVINGS_TOTAL: &str = "evm_range_halvings_total";
+pub const EVM_WATCH_CURSOR_BLOCK: &str = "evm_watch_cursor_block";
+pub const EVM_WATCH_TARGET_BLOCK: &str = "evm_watch_target_block";
 
 /// Installs the Prometheus recorder and starts its HTTP listener on
 /// `0.0.0.0:$METRICS_PORT` (default 9100). Every role calls this once at startup.
@@ -113,6 +120,34 @@ fn describe() {
     metrics::describe_gauge!(
         POLL_LAST_SUCCESS_TIMESTAMP_SECONDS,
         "Unix time of the last successful reconciliation-poll cycle, by program"
+    );
+    metrics::describe_counter!(
+        EVM_BLOCKS_TOTAL,
+        "Finalized EVM blocks read by a chain watcher"
+    );
+    metrics::describe_counter!(
+        EVM_EVENTS_TOTAL,
+        "Bridge events decoded from EVM logs, by chain and event kind"
+    );
+    metrics::describe_counter!(
+        EVM_JOIN_MATCHES_TOTAL,
+        "Stored EVM events joined to a bridge transfer, by chain"
+    );
+    metrics::describe_counter!(
+        EVM_REORGS_TOTAL,
+        "Reorgs detected by a chain watcher (cursor block hash no longer canonical), by chain"
+    );
+    metrics::describe_counter!(
+        EVM_RANGE_HALVINGS_TOTAL,
+        "eth_getLogs calls rejected as too large whose block range was halved, by chain"
+    );
+    metrics::describe_gauge!(
+        EVM_WATCH_CURSOR_BLOCK,
+        "Last block a chain watcher has stored events for, by chain"
+    );
+    metrics::describe_gauge!(
+        EVM_WATCH_TARGET_BLOCK,
+        "Finalized block a chain watcher is reading towards, by chain"
     );
 }
 

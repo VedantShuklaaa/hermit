@@ -1,4 +1,5 @@
 use crate::clients::limiter::API_TOKEN_WAIT;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Which part of the pipeline this process runs. `All` keeps the single-process
@@ -71,6 +72,29 @@ impl ReenrichConfig {
         }
         (batch - origin, origin)
     }
+}
+
+/// EVM log watching for one or more chains. The targets and contract addresses
+/// live in Postgres (`evm_watch_targets`); this only carries how to reach them
+/// and how hard to poll.
+#[derive(Clone, Debug)]
+pub struct EvmConfig {
+    /// `EVM_WATCH_ENABLED`, default off. Off starts no watchers and skips the
+    /// transfer-side event lookup.
+    pub enabled: bool,
+    /// `EVM_RPC_<CHAIN>` per chain, keyed by the chain registry slug (`ethereum`
+    /// for `EVM_RPC_ETHEREUM`).
+    pub rpc_urls: BTreeMap<String, String>,
+    /// Requests/sec across every EVM watcher. One key and one quota.
+    pub rps: u32,
+    /// Seconds between polls.
+    pub poll_secs: u64,
+    /// Most blocks one `eth_getLogs` call asks for. Alchemy's free tier caps
+    /// here; a genuine range-too-large answer halves the live value.
+    pub max_block_range: u64,
+    /// How long an unmatched stored event is retried by the event-side join.
+    /// The transfer-side lookup is not age-limited.
+    pub join_max_age_secs: i64,
 }
 
 /// Server-owned live feed backed by Redis.
@@ -186,6 +210,7 @@ pub struct AppConfig {
     pub ingest: IngestConfig,
     pub reenrich: ReenrichConfig,
     pub worker: WorkerConfig,
+    pub evm: EvmConfig,
     /// How often the in-memory chain registry reloads from Postgres.
     pub chain_registry_refresh_secs: u64,
     /// `/health` answers 503 once the ingest heartbeat is older than this. Generous on
@@ -269,6 +294,14 @@ impl AppConfig {
         let ping_secs = number("INGEST_PING_SECS", 30u64).max(1);
         let watchdog_secs = number("INGEST_WATCHDOG_SECS", 90u64).max(ping_secs + 1);
 
+        // EVM_RPC_<CHAIN>: the suffix is the chain registry slug. Empty values are
+        // ignored so a commented-out placeholder cannot start a watcher with no URL.
+        let evm_rpc_urls = collect_evm_rpc_urls(std::env::vars());
+        let evm_enabled = flag(std::env::var("EVM_WATCH_ENABLED").ok().as_deref());
+        if evm_enabled && evm_rpc_urls.is_empty() {
+            anyhow::bail!("EVM_WATCH_ENABLED is set but no EVM_RPC_<CHAIN> is configured");
+        }
+
         Ok(Self {
             role,
             pubsub_channel: optional("TX_EVENTS_CHANNEL", "bridge:tx_events"),
@@ -329,6 +362,14 @@ impl AppConfig {
                 reclaim_interval_secs: number("WORKER_RECLAIM_INTERVAL_SECS", 30u64).max(1),
                 worker_count: number("CONSUMER_COUNT", 5usize).max(1),
                 read_count: number("CONSUMER_READ_COUNT", 10usize).max(1),
+            },
+            evm: EvmConfig {
+                enabled: evm_enabled,
+                rpc_urls: evm_rpc_urls,
+                rps: number("EVM_RPS", 5u32).max(1),
+                poll_secs: number("EVM_POLL_SECS", 12u64).max(1),
+                max_block_range: number("EVM_MAX_BLOCK_RANGE", 10u64).max(1),
+                join_max_age_secs: number("EVM_JOIN_MAX_AGE_SECS", 86_400i64).max(1),
             },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
             health_max_ingest_age_secs: number("HEALTH_MAX_INGEST_AGE_SECS", 3600i64).max(1),
@@ -476,10 +517,41 @@ impl AppConfig {
                 worker_count: 5,
                 read_count: 10,
             },
+            evm: EvmConfig {
+                enabled: false,
+                rpc_urls: BTreeMap::new(),
+                rps: 5,
+                poll_secs: 12,
+                max_block_range: 10,
+                join_max_age_secs: 86_400,
+            },
             chain_registry_refresh_secs: 60,
             health_max_ingest_age_secs: 3600,
         }
     }
+}
+
+/// `EVM_RPC_<CHAIN>` variables, keyed by lower-case chain slug. Empty names and values
+/// are ignored, so a commented-out placeholder cannot start a watcher with no URL.
+fn collect_evm_rpc_urls<I>(vars: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix("EVM_RPC_")?;
+            let value = value.trim();
+            if suffix.is_empty() || value.is_empty() {
+                return None;
+            }
+            Some((suffix.to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
+}
+
+/// The boolean convention the other switches use: `1` or `true`, case-insensitive.
+fn flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -536,6 +608,36 @@ mod tests {
 
     fn s(value: &str) -> Option<String> {
         Some(value.to_string())
+    }
+
+    #[test]
+    fn evm_rpc_urls_are_keyed_by_lower_case_chain_slug() {
+        let urls = collect_evm_rpc_urls([
+            ("EVM_RPC_ETHEREUM".to_string(), " https://eth ".to_string()),
+            ("EVM_RPC_POLYGON".to_string(), "https://polygon".to_string()),
+            ("EVM_RPC_".to_string(), "https://ignored".to_string()),
+            ("EVM_RPC_BASE".to_string(), "   ".to_string()),
+            ("HELIUS_URL".to_string(), "https://ignored".to_string()),
+        ]);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls.get("ethereum").map(String::as_str),
+            Some("https://eth")
+        );
+        assert_eq!(
+            urls.get("polygon").map(String::as_str),
+            Some("https://polygon")
+        );
+    }
+
+    #[test]
+    fn evm_watch_accepts_one_and_true_only() {
+        assert!(flag(Some("1")));
+        assert!(flag(Some("true")));
+        assert!(flag(Some("TRUE")));
+        assert!(!flag(Some("0")));
+        assert!(!flag(Some("yes")));
+        assert!(!flag(None));
     }
 
     #[test]

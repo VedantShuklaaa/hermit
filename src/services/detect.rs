@@ -1,7 +1,9 @@
 //! Chain-first detection. The adapters decode a transfer from Solana data alone, this
-//! module turns it into a [`BridgeTransfer`] with status `Detected`, and WormholeScan
-//! data is layered on top afterwards. Enrichment can raise the status but never gates
-//! persistence, and it is only applied when the VAA matches the message decoded on chain.
+//! module turns it into a [`BridgeTransfer`] and WormholeScan data is layered on top
+//! afterwards. An outbound send starts `Pending` until its redeem is seen; an inbound
+//! redeem is `Completed` because the observed Solana tx is its destination.
+//! Enrichment can raise the status but never gates persistence, and it is only applied
+//! when the VAA matches the message decoded on chain.
 
 use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
@@ -54,11 +56,11 @@ fn wormhole_id(chain: &RawChainRef) -> Result<u16, AppError> {
 
 /// A decoded transfer as the API's `BridgeTransfer`.
 ///
-/// An outbound send starts as `Detected`: the chain shows the send, nothing else has
-/// confirmed it yet. An inbound redeem is `Completed` at detection: the observed Solana tx
-/// succeeded (adapters reject a failed tx) and it is the destination side of the transfer,
-/// so there is nothing left to wait for. Its source tx is on the origin chain and unknown
-/// until enrichment learns it.
+/// An outbound send starts as `Pending`: the chain shows the send but no redeem has been
+/// observed yet, and `Pending` is exactly that. An inbound redeem is `Completed` at
+/// detection: the observed Solana tx succeeded (adapters reject a failed tx) and it is
+/// the destination side of the transfer, so there is nothing left to wait for. Its source
+/// tx is on the origin chain and unknown until enrichment or the EVM log watcher learns it.
 pub fn to_bridge_transfer(
     d: &DetectedTransfer,
     metadata: Option<TokenMetadata>,
@@ -102,7 +104,7 @@ pub fn to_bridge_transfer(
         status: if inbound {
             BridgeStatus::Completed
         } else {
-            BridgeStatus::Detected
+            BridgeStatus::Pending
         },
     })
 }
@@ -140,7 +142,7 @@ pub fn source_tx_from_operation(raw: &Value) -> Option<String> {
 pub enum Enrichment {
     /// The VAA matches the decoded message: status raised, destination tx filled if known.
     Applied,
-    /// WormholeScan has no usable VAA yet. The transfer stays `Detected`.
+    /// WormholeScan has no usable VAA yet. The transfer is unchanged.
     NoVaa,
     /// The VAA describes a different message. Ignored, the chain wins.
     Mismatch,
@@ -262,6 +264,32 @@ pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str, chains: &
     true
 }
 
+/// Completes an outbound transfer from chain data (a `TransferRedeemed` log), which is
+/// stronger evidence than a matched VAA. Unlike [`apply_destination_tx`] this also
+/// accepts a `Detected` row. It never overwrites a known destination tx and never
+/// rewrites a `Completed` row.
+pub fn apply_chain_destination_tx(
+    transfer: &mut BridgeTransfer,
+    hash: &str,
+    chains: &Snapshot,
+) -> bool {
+    let hash = hash.trim();
+    if hash.is_empty()
+        || transfer.direction() != Direction::Outbound
+        || transfer.destination_tx_hash.is_some()
+        || matches!(transfer.status, BridgeStatus::Completed)
+    {
+        return false;
+    }
+    transfer.destination_explorer_url = chains.explorer_tx_url_for(
+        &RawChainRef::wormhole(transfer.destination_chain.wormhole_id()),
+        hash,
+    );
+    transfer.destination_tx_hash = Some(hash.to_string());
+    transfer.status = BridgeStatus::Completed;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn a_detected_transfer_maps_to_the_api_shape_as_detected() {
+    fn a_detected_transfer_maps_to_the_api_shape_as_pending() {
         let t = to_bridge_transfer(
             &detected(),
             Some(TokenMetadata {
@@ -321,7 +349,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(t.status, BridgeStatus::Detected));
+        assert!(matches!(t.status, BridgeStatus::Pending));
         assert_eq!(t.source_chain, ChainId::Solana);
         assert_eq!(t.destination_chain, ChainId::Ethereum);
         assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
@@ -362,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn no_vaa_leaves_the_transfer_detected() {
+    fn no_vaa_leaves_the_transfer_pending() {
         for raw in [
             json!({}),
             json!({"vaa": {}}),
@@ -370,7 +398,7 @@ mod tests {
         ] {
             let mut t = transfer();
             assert_eq!(apply_wormholescan(&mut t, &raw, &snap()), Enrichment::NoVaa);
-            assert!(matches!(t.status, BridgeStatus::Detected));
+            assert!(matches!(t.status, BridgeStatus::Pending));
         }
     }
 
@@ -414,7 +442,7 @@ mod tests {
                 apply_wormholescan(&mut t, &raw, &snap()),
                 Enrichment::Mismatch
             );
-            assert!(matches!(t.status, BridgeStatus::Detected));
+            assert!(matches!(t.status, BridgeStatus::Pending));
             assert!(t.destination_tx_hash.is_none());
         }
     }
@@ -469,6 +497,7 @@ mod tests {
     #[test]
     fn apply_destination_tx_completes_only_a_pending_transfer() {
         let mut detected_only = transfer();
+        detected_only.status = BridgeStatus::Detected;
         assert!(!apply_destination_tx(&mut detected_only, "0xdest", &snap()));
         assert!(matches!(detected_only.status, BridgeStatus::Detected));
 
@@ -477,6 +506,38 @@ mod tests {
         assert!(apply_destination_tx(&mut pending, "0xdest", &snap()));
         assert!(matches!(pending.status, BridgeStatus::Completed));
         assert_eq!(pending.destination_tx_hash.as_deref(), Some("0xdest"));
+    }
+
+    #[test]
+    fn chain_destination_tx_completes_a_detected_or_pending_transfer() {
+        for status in [BridgeStatus::Detected, BridgeStatus::Pending] {
+            let mut t = transfer();
+            t.status = status;
+            assert!(apply_chain_destination_tx(&mut t, "0xdest", &snap()));
+            assert!(matches!(t.status, BridgeStatus::Completed));
+            assert_eq!(t.destination_tx_hash.as_deref(), Some("0xdest"));
+        }
+    }
+
+    #[test]
+    fn chain_destination_tx_never_rewrites_a_known_outcome() {
+        let mut known = transfer();
+        known.destination_tx_hash = Some("0xfirst".into());
+        assert!(!apply_chain_destination_tx(&mut known, "0xsecond", &snap()));
+        assert_eq!(known.destination_tx_hash.as_deref(), Some("0xfirst"));
+
+        let mut completed = transfer();
+        completed.status = BridgeStatus::Completed;
+        assert!(!apply_chain_destination_tx(
+            &mut completed,
+            "0xdest",
+            &snap()
+        ));
+        assert!(completed.destination_tx_hash.is_none());
+
+        let mut inbound = inbound_transfer();
+        assert!(!apply_chain_destination_tx(&mut inbound, "0xdest", &snap()));
+        assert_eq!(inbound.destination_tx_hash.as_deref(), Some("redeem"));
     }
 
     #[test]
@@ -740,6 +801,6 @@ mod tests {
 
         assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
         assert!(t.destination_tx_hash.is_none());
-        assert!(matches!(t.status, BridgeStatus::Detected));
+        assert!(matches!(t.status, BridgeStatus::Pending));
     }
 }

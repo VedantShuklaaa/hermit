@@ -4,7 +4,8 @@ A real-time indexer for bridge transactions on Solana. It decodes bridge
 activity straight from Solana data, in both directions (sends out of Solana,
 redeems and solver fills into it). Each transfer is persisted from on-chain
 data alone, enriched afterwards with its counterpart leg and final status from
-protocol APIs, and streamed live to clients over WebSocket.
+watched EVM logs, falling back to protocol APIs, and streamed live to clients
+over WebSocket.
 
 The product is moving from a Wormhole transfer indexer to a protocol-agnostic
 core with one adapter per bridge protocol. Today only the Wormhole Token Bridge
@@ -17,7 +18,8 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 
 | Area | State |
 | --- | --- |
-| Wormhole Token Bridge | Outbound sends indexed chain-first (`Detected` from Solana data alone, WormholeScan enriches). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
+| Wormhole Token Bridge | Outbound sends indexed chain-first and start `Pending` (Solana data alone; EVM logs and WormholeScan enrich). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
+| EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
 | Chains | DB-backed registry, refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Unknown chains stored as unresolved |
@@ -62,10 +64,11 @@ flowchart LR
     ADP -->|rejected| DROP["Counted by reason, acked"]
     ADP --> COMP["Compose: one transfer per message identity, via recorded"]
     COMP --> CHR["Chain registry: resolve or unresolved"]
-    CHR --> DB[(Postgres: Detected)]
+    CHR --> DB[(Postgres: Pending)]
     DB --> BCAST[Broadcast channel]
     BCAST --> WSX["WS clients"]
-    DB --> ENR["Enrichment providers: WormholeScan, ..."]
+    DB --> ENR["Tx hashes: EVM logs first, WormholeScan fallback"]
+    EVM["EVM log watcher: eth_getLogs, one cursor per chain"] --> DB
     ENR -->|"destination tx, status"| DB
     WK -->|"infra failure"| DLQ[(Dead-letter stream)]
 ```
@@ -83,7 +86,7 @@ hermit/
 ├── deploy/Caddyfile            # TLS reverse proxy
 ├── migrations/                 # sqlx migrations, embedded at compile time
 ├── docs/                       # REFERENCE.md and per-experiment notes
-├── scripts/                    # bench_list.sh, capture_fixtures.sh
+├── scripts/                    # bench_list.sh, capture_fixtures.sh, capture_evm_fixtures.sh
 ├── src/
 │   ├── main.rs, lib.rs, config.rs, state.rs, error.rs, shutdown.rs
 │   ├── bin/                    # replay, reconcile, seed_transfers
@@ -95,6 +98,7 @@ hermit/
 │   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole adapter
 │   ├── chains/                 # DB-backed chain registry
 │   ├── enrichment/             # providers + background re-enrichment
+│   ├── evm/                    # Ethereum log watcher, cursor, tx-hash lookup
 │   ├── ingestion/              # WS listener, backfill, checkpoint gate
 │   ├── redis/                  # producer, consumer group, recovery
 │   ├── services/               # analyser, detect, read-through, reconcile, transfers

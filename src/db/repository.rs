@@ -213,9 +213,18 @@ async fn write_transfer(
             status = CASE WHEN bridge_transfers.status = 'Completed'
                             OR (bridge_transfers.status = 'Pending' AND EXCLUDED.status = 'Detected')
                           THEN bridge_transfers.status ELSE EXCLUDED.status END,
-            -- only replace the cached response if it describes the same observed tx
+            -- only replace the cached response if it describes the same observed tx and
+            -- does not lose a tx hash that the stored response already knew
             analysis = CASE WHEN bridge_transfers.observed_tx_hash = EXCLUDED.observed_tx_hash
                              AND NOT (bridge_transfers.status = 'Pending' AND EXCLUDED.status = 'Detected')
+                             AND NOT (
+                                 bridge_transfers.analysis #>> '{bridge_transfer,destination_tx_hash}' IS NOT NULL
+                                 AND EXCLUDED.analysis #>> '{bridge_transfer,destination_tx_hash}' IS NULL
+                             )
+                             AND NOT (
+                                 bridge_transfers.analysis #>> '{bridge_transfer,source_tx_hash}' IS NOT NULL
+                                 AND EXCLUDED.analysis #>> '{bridge_transfer,source_tx_hash}' IS NULL
+                             )
                             THEN EXCLUDED.analysis ELSE bridge_transfers.analysis END,
             updated_at = NOW()
         RETURNING id
