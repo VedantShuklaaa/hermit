@@ -16,6 +16,7 @@ use bridge::chains::ChainRegistry;
 use bridge::clients::limiter::Limiter;
 use bridge::domain::analysis::DecodedTransfer;
 use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
+use bridge::error::AppError;
 use bridge::evm::client::EvmClient;
 use bridge::evm::db as evm_db;
 use bridge::evm::decode::{self, EventKind};
@@ -44,6 +45,11 @@ const REDEEM_TX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const SEQUENCE: u64 = 1234;
 const CURSOR_BLOCK: u64 = 17_999_999;
 const TARGET_BLOCK: u64 = 18_000_001;
+
+/// Alchemy's current free-tier `eth_getLogs` rejection. It arrives with HTTP 400,
+/// which is why the capture script's `curl -f` failed on it.
+const ALCHEMY_RANGE_ERROR_MESSAGE: &str =
+    "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range";
 
 type EventDump = (
     String,
@@ -80,6 +86,16 @@ fn limiter() -> Arc<Limiter> {
     )))
 }
 
+/// How the stub rejects an over-wide `eth_getLogs` window.
+#[derive(Default, Clone, Copy)]
+enum RangeError {
+    /// HTTP 200 with the older free-tier wording.
+    #[default]
+    Http200,
+    /// HTTP 400 with Alchemy's current free-tier wording.
+    AlchemyHttp400,
+}
+
 /// A loopback JSON-RPC node. It serves a finalized head, canonical block hashes and the
 /// two captured logs, and records the block span of every `eth_getLogs` request.
 #[derive(Default)]
@@ -90,8 +106,14 @@ struct StubState {
     target_block: Option<u64>,
     /// Reject `eth_getLogs` windows wider than this as range-too-large.
     max_ok_range: Option<u64>,
+    /// The status and body used for that rejection.
+    range_error: RangeError,
     /// Answer the first `eth_getLogs` request with HTTP 429.
     fail_first_429: AtomicBool,
+    /// Answer the first `eth_getLogs` request with an unrelated HTTP 400.
+    fail_first_unrelated_400: AtomicBool,
+    /// Delay every `eth_getLogs` answer, to exercise a client timeout.
+    get_logs_delay: Option<Duration>,
 }
 
 impl StubState {
@@ -150,18 +172,44 @@ async fn rpc(State(state): State<Arc<StubState>>, Json(body): Json<Value>) -> Re
             let span = to.saturating_sub(from) + 1;
             state.spans.lock().unwrap().push(span);
 
+            if let Some(delay) = state.get_logs_delay {
+                tokio::time::sleep(delay).await;
+            }
             if state.fail_first_429.swap(false, Ordering::SeqCst) {
                 return (axum::http::StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
             }
+            if state.fail_first_unrelated_400.swap(false, Ordering::SeqCst) {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": {"code": -32602, "message": "invalid argument 0: cannot unmarshal"}
+                    })),
+                )
+                    .into_response();
+            }
             if state.max_ok_range.is_some_and(|max| span > max) {
-                return Json(json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "error": {
-                        "code": -32602,
-                        "message": "invalid argument 0: eth_getLogs is limited to a 2,000 block range"
-                    }
-                }))
-                .into_response();
+                return match state.range_error {
+                    RangeError::Http200 => Json(json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": {
+                            "code": -32602,
+                            "message": "invalid argument 0: eth_getLogs is limited to a 2,000 block range"
+                        }
+                    }))
+                    .into_response(),
+                    RangeError::AlchemyHttp400 => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "error": {
+                                "code": -32600,
+                                "message": ALCHEMY_RANGE_ERROR_MESSAGE
+                            }
+                        })),
+                    )
+                        .into_response(),
+                };
             }
 
             let matching: Vec<Value> = state
@@ -613,6 +661,112 @@ async fn only_a_range_too_large_answer_halves_the_window() {
     assert!(spans.contains(&5), "10 halved to 5: {spans:?}");
     assert!(spans.contains(&2), "5 halved to 2: {spans:?}");
     assert!(spans.iter().all(|span| *span <= 10));
+}
+
+#[tokio::test]
+async fn an_alchemy_http_400_range_error_halves_the_window() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let state = Arc::new(StubState {
+        max_ok_range: Some(4),
+        range_error: RangeError::AlchemyHttp400,
+        target_block: Some(CURSOR_BLOCK + 30),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+
+    let handle = tokio::spawn(watcher(url, pool.clone(), chain_id, 10).run(shutdown.clone()));
+    wait_until("the cursor to reach the head", || {
+        let pool = pool.clone();
+        async move {
+            let block: Option<i64> = sqlx::query_scalar(
+                "SELECT block_number FROM evm_watch_cursors WHERE chain_id = $1",
+            )
+            .bind(chain_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            block == Some((CURSOR_BLOCK + 30) as i64)
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let spans = state.spans.lock().unwrap().clone();
+    assert_eq!(
+        spans.first().copied(),
+        Some(10),
+        "first window is the max range"
+    );
+    assert!(
+        spans.contains(&5),
+        "10 halved to 5 despite HTTP 400: {spans:?}"
+    );
+    assert!(spans.contains(&2), "5 halved to 2: {spans:?}");
+    assert!(spans.iter().all(|span| *span <= 10));
+}
+
+#[tokio::test]
+async fn an_unrelated_http_400_is_not_a_range_error() {
+    let state = Arc::new(StubState {
+        fail_first_unrelated_400: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let url = stub(state).await;
+    let client = EvmClient::new(reqwest::Client::new(), url, limiter());
+
+    let error = client
+        .logs(
+            1,
+            10,
+            &[CORE, TOKEN],
+            &[
+                decode::LOG_MESSAGE_PUBLISHED_TOPIC,
+                decode::TRANSFER_REDEEMED_TOPIC,
+            ],
+        )
+        .await
+        .expect_err("an unrelated 400 must not become a range error");
+    assert!(
+        matches!(error, AppError::UpstreamProvider { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_timeout_is_not_a_range_error() {
+    let state = Arc::new(StubState {
+        get_logs_delay: Some(Duration::from_millis(500)),
+        ..Default::default()
+    });
+    let url = stub(state).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(50))
+        .build()
+        .expect("http client");
+    let client = EvmClient::new(http, url, limiter());
+
+    let error = client
+        .logs(
+            1,
+            10,
+            &[CORE, TOKEN],
+            &[
+                decode::LOG_MESSAGE_PUBLISHED_TOPIC,
+                decode::TRANSFER_REDEEMED_TOPIC,
+            ],
+        )
+        .await
+        .expect_err("a timeout must not become a range error");
+    assert!(matches!(error, AppError::UpstreamTimeout(_)), "{error:?}");
 }
 
 #[tokio::test]

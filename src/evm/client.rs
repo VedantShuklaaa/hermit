@@ -110,19 +110,24 @@ impl EvmClient {
         });
 
         let resp = self.client.post(&self.url).json(&body).send().await?;
+        let status = resp.status();
 
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(AppError::UpstreamRateLimited(PROVIDER));
         }
-        if !resp.status().is_success() {
-            return Err(AppError::UpstreamProvider {
-                provider: PROVIDER,
-                message: format!("status {}", resp.status()),
-                retryable: status_is_retryable(resp.status()),
-            });
-        }
 
-        let payload: Value = resp.json().await?;
+        // A JSON-RPC error can arrive with a non-2xx status: Alchemy answers an
+        // over-wide `eth_getLogs` with HTTP 400. Read the body before deciding the
+        // request failed, so that answer can still halve the range.
+        let payload: Value = match resp.json().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                if status.is_success() {
+                    return Err(error.into());
+                }
+                return Err(upstream_status_error(status));
+            }
+        };
 
         if let Some(error) = payload.get("error") {
             // Only eth_getLogs can be too large. A 429, timeout or unknown error is
@@ -137,14 +142,28 @@ impl EvmClient {
             });
         }
 
+        if !status.is_success() {
+            return Err(upstream_status_error(status));
+        }
+
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
     }
 }
 
+fn upstream_status_error(status: reqwest::StatusCode) -> AppError {
+    AppError::UpstreamProvider {
+        provider: PROVIDER,
+        message: format!("status {status}"),
+        retryable: status_is_retryable(status),
+    }
+}
+
 /// A genuine range-too-large answer: the message names the block range and says it is
-/// over a limit. Alchemy's free tier answers `-32602` with
-/// `invalid argument 0: eth_getLogs is limited to a 2,000 block range`. A generic
-/// invalid-params answer, a timeout, or an unknown error must not halve the range.
+/// over a limit. Alchemy's free tier answers HTTP 400 with `-32600` and
+/// `Under the Free tier plan ... up to a 10 block range`; other plans answer with
+/// `-32602` and `invalid argument 0: eth_getLogs is limited to a 2,000 block range`.
+/// A generic invalid-params answer, a timeout, or an unknown error must not halve the
+/// range.
 pub(crate) fn is_range_too_large_error(error: &Value) -> bool {
     let code = error.get("code").and_then(Value::as_i64);
     let message = error
@@ -267,11 +286,19 @@ mod tests {
 
     #[test]
     fn alchemys_free_tier_range_error_halves_the_range() {
-        let error = json!({
-            "code": -32602,
-            "message": "invalid argument 0: eth_getLogs is limited to a 2,000 block range"
-        });
-        assert!(is_range_too_large_error(&error));
+        for error in [
+            json!({
+                "code": -32602,
+                "message": "invalid argument 0: eth_getLogs is limited to a 2,000 block range"
+            }),
+            // Alchemy's current free-tier answer, delivered with HTTP 400.
+            json!({
+                "code": -32600,
+                "message": "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range"
+            }),
+        ] {
+            assert!(is_range_too_large_error(&error), "{error}");
+        }
     }
 
     #[test]
@@ -295,6 +322,7 @@ mod tests {
             json!({"code": -32000, "message": "internal error"}),
             json!({"code": -32005, "message": "rate limit exceeded"}),
             json!({"code": -32602, "message": "invalid argument 0: cannot unmarshal"}),
+            json!({"code": -32600, "message": "invalid request"}),
             json!({"message": "unknown"}),
         ] {
             assert!(
