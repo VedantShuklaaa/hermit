@@ -859,3 +859,80 @@ Not measured in these runs.
 - Zero non-2xx across all six runs.
 - The `bridge-stream` process still shares the box's CPU with the API, so this
   run does not isolate the API from ingest load.
+
+## How to run the EVM RPC probes
+
+E0 measures two facts per endpoint before the multi-endpoint design is chosen:
+the largest `eth_getLogs` block range the endpoint accepts, and how far the
+`finalized` and `safe` tags lag the head. Neither script writes to the
+repository or prints the URL, so a provider key in the URL stays out of the
+terminal and the logs.
+
+1. Range probe. Run it for the primary and, when one is configured, the
+   fallback:
+
+   ```bash
+   EVM_RPC_ETHEREUM=<url> scripts/probe_evm_range.sh ethereum
+   EVM_RPC_ETHEREUM_FALLBACK=<url> scripts/probe_evm_range.sh ethereum --fallback
+   ```
+
+   Without `--address` the probe sends the two Wormhole topic0 hashes and no
+   address filter. That keeps the result set small while the block range is what
+   is measured. Once a chain's Core Bridge and Token Bridge addresses are
+   verified, pass `--address <core>,<token>`; a cap that depends on the matched
+   logs then shows up as well. The probe assumes the endpoint rejects a range
+   monotonically: doubling finds an upper bound, and binary search finds the
+   boundary. A true 1-block rejection or a non-range error stops the run instead
+   of being reported as a cap. If nothing is rejected up to `--max`, the result
+   carries `no_rejection_up_to` rather than claiming a cap.
+
+   Both scripts call `eth_chainId` first and exit if it does not match the
+   slug's chain ID (Ethereum 1, Polygon 137, Avalanche 43114, Arbitrum 42161,
+   Optimism 10, Base 8453). This catches a URL copied for the wrong chain;
+   dRPC serves every chain from the same host.
+
+2. Finality probe:
+
+   ```bash
+   EVM_RPC_BASE=<url> scripts/probe_evm_finality.sh base
+   ```
+
+   A tag the endpoint does not support is printed as `unsupported`. That is a
+   result: the watcher currently falls back to `head - finality_depth`.
+
+3. Copy one row per endpoint into the table below. Add the date, provider and
+   plan in the note. Leave a cell blank if it was not measured; do not fill it
+   from an estimate.
+
+## EVM RPC capabilities
+
+| Date | Chain | Endpoint (host) | Role | Max `getLogs` range | `finalized` lag (blocks) | `finalized` lag (s) | `safe` lag (blocks) | `safe` lag (s) | Note |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-11-11 | ethereum | eth-mainnet.g.alchemy.com | primary | 10 (11 rejected) | 84 | 1008 | 52 | 624 | Alchemy free plan; `finalized` supported; 12 s blocks |
+| 2026-11-11 | ethereum | lb.drpc.live | fallback | 101 (102 rejected) | 86 | 1044 | 55 | 660 | dRPC free plan; message claims 10,000 but measured 101; 12 s blocks |
+| 2026-11-11 | base | lb.drpc.live | primary | 101 (102 rejected) | 5895 | 1179 | 946 | 189 | dRPC free plan; 0.2 s blocks; `finalized` lags about 19.7 min |
+| 2026-11-11 | base | base-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 5875 | 1175 | 358 | 72 | Alchemy free plan; 10-block cap; 0.2 s blocks |
+| 2026-11-11 | arbitrum | lb.drpc.live | primary | 101 (102 rejected) | 4338 | 1236 | 3110 | 876 | dRPC free plan; 0.285 s blocks (about 3.5 blocks/s) |
+| 2026-11-11 | arbitrum | arb-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 3791 | 1067 | 2093 | 587 | Alchemy free plan; 10-block cap; 0.281 s blocks |
+| 2026-11-11 | avalanche | rpc.ankr.com | primary | no rejection to 100,000 | 5 | 3 | 6 | 4 | Ankr public; `finalized` one block ahead of `safe` in both samples; about 0.6 s blocks |
+| 2026-11-11 | avalanche | avax-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 4 | 3 | 5 | 5 | Alchemy free plan; 10-block cap; `finalized` one block ahead of `safe`; 0.75-1.0 s blocks |
+
+**Findings (2026-11-11).**
+
+- Free-tier `eth_getLogs` caps are plan-level, not chain-level. Alchemy rejected
+  11 blocks on all four chains. dRPC rejected 102 on Ethereum, Base and
+  Arbitrum, so 101 is the accepted maximum despite its message claiming 10,000.
+  The Ankr public Avalanche endpoint rejected no range up to the 100,000 tested.
+- `finalized` is supported on all eight endpoints. The lag is why finality must
+  be per chain: Ethereum 84 blocks (about 17 min), Base about 5,880 blocks
+  (about 19.6 min), Arbitrum 3,791 to 4,338 blocks (about 18 to 21 min),
+  Avalanche 4 to 5 blocks (about 3 to 5 s).
+- Avalanche reports `finalized` one block ahead of `safe` on both Ankr and
+  Alchemy. Do not assume `finalized <= safe` when validating tags.
+- dRPC's error text ("ranges over 10000 blocks are not supported on free plan")
+  is not matched by `is_range_too_large_error` in `src/evm/client.rs`, which
+  looks for "block range" or "eth_getlogs". Configure dRPC chains at 101 or
+  lower, and fix the classifier in E1.
+- All range runs used the default filter: the two Wormhole topic0 hashes and no
+  address filter.
+- The Ankr Avalanche endpoint is public; its rate limits were not measured.
