@@ -130,6 +130,14 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   WormholeScan, with no age limit, so an event recorded before the row was built
   still matches. WormholeScan stays the fallback for pre-watcher events, unwatched
   destinations and missing metadata.
+
+  An endpoint is measured before its chain is enabled. `scripts/probe_evm_range.sh
+  <chain>` doubles the `eth_getLogs` block range until the endpoint rejects it and
+  binary-searches the boundary; `scripts/probe_evm_finality.sh <chain>` reports the
+  `latest`, `safe` and `finalized` block numbers and lag. Both read
+  `EVM_RPC_<CHAIN>` (or `EVM_RPC_<CHAIN>_FALLBACK` with `--fallback`), print only
+  the endpoint host so a key in the URL is not leaked, and write nothing to the
+  repository. Record the results in `docs/scaling-log.md`.
 * `services::detect` turns adapter output into the API's `BridgeTransfer`: an
   outbound send starts `Pending`, an inbound redeem (decoded from the posted
   VAA) starts `Completed`. `apply_wormholescan` then raises the status: `Pending`
@@ -210,7 +218,9 @@ hermit/
 ├── scripts/
 │   ├── bench_list.sh
 │   ├── capture_evm_fixtures.sh         # eth_getLogs for the watched topics
-│   └── capture_fixtures.sh
+│   ├── capture_fixtures.sh
+│   ├── probe_evm_finality.sh           # latest/safe/finalized lag per endpoint
+│   └── probe_evm_range.sh              # max eth_getLogs block range per endpoint
 ├── src/
 │   ├── main.rs                         # wiring, supervised workers, HTTP server
 │   ├── lib.rs
@@ -934,6 +944,51 @@ Suspects, all resolved:
 * \[x] 4g. Evaluated Helius streaming options: Enhanced WebSockets need Developer+, LaserStream gRPC mainnet needs Business+, webhooks limited to 1 on Free and need a public endpoint. Decision: keep `logsSubscribe`, build 4f as the safety net. Notes: [4g-helius-streaming-options.md](4g-helius-streaming-options.md)
 
 Exit: recall at least 99.9% for every indexed program over 24 h; classification precision and p99 ingestion lag recorded.
+
+### Phase E: EVM coverage (separate checklist)
+
+Separate from the phases above because this is chain coverage, not a new bridge
+protocol. Each item is its own branch and is ticked only when its exit criteria
+are met. Free-tier endpoints only: no paid RPC plan is in scope. Bridge addresses
+come from the Wormhole docs, never from memory. Dependencies: E0 -> E1/E2 -> E3;
+E4 and E5 are conditional on measured catch-up, not planned work.
+
+* \[x] E0. Measure every candidate endpoint. `scripts/probe_evm_range.sh` reports
+  the largest accepted `eth_getLogs` range; `scripts/probe_evm_finality.sh`
+  reports the `finalized` and `safe` lag. Procedure and results table:
+  `docs/scaling-log.md`. Measured 2026-11-11 for the primary and fallback of all
+  four chains.
+  Exit: the capabilities table is filled for the primary and fallback of
+  Ethereum, Base, Arbitrum and Avalanche.
+* \[ ] E1. Multi-endpoint watcher. `EVM_RPC_<CHAIN>` is the primary and
+  `EVM_RPC_<CHAIN>_FALLBACK` an optional second endpoint; optional per-endpoint
+  range and RPS overrides. Each endpoint gets its own limiter, because provider
+  quotas are per key. The watcher picks a healthy endpoint, fails over on
+  429/timeout/5xx, shrinks only the endpoint that rejected the range, and never
+  advances the cursor on a failed range. Metrics carry chain and endpoint host,
+  never the URL. The primary/fallback choice comes from E0's table.
+  Exit: a single-URL configuration behaves as today; loopback tests cover
+  failover, range shrinking and every endpoint down; existing tests pass.
+* \[ ] E2. Per-chain finality. Migration adds `finality_mode` (`finalized` or
+  `depth`); depth mode reads `head - finality_depth`. A cursor mismatch rewinds
+  and deletes the affected window instead of one block, so a reorg deeper than
+  one block cannot leave stale events.
+  Exit: each target selects its mode; a two-block reorg test removes the stale
+  events; Ethereum behaviour is unchanged.
+* \[ ] E3. Enable Base, Arbitrum and Avalanche. One `evm_watch_targets` row per
+  chain with Core Bridge and Token Bridge addresses verified against the Wormhole
+  docs, `EVM_RPC_<CHAIN>` configured, one real captured fixture per chain and a
+  real redeeming tx decoded. Depends on E1 and E2.
+  Exit: one real event decoded per chain, watcher tests pass, `.env.example` and
+  this reference updated.
+* \[ ] E4. Pipeline the 10-block chunks. Batch `eth_getLogs` chunks and block
+  timestamp lookups in one JSON-RPC request. Only if E0/E1 measurements show the
+  watcher falling behind on catch-up.
+  Exit: measured catch-up before and after in `docs/scaling-log.md`.
+* \[ ] E5. WebSocket log subscription. `eth_subscribe("logs")` with a finalized
+  boundary and a `getLogs` backfill on reconnect. Deferred: only if E1 and E4
+  still cannot keep up.
+  Exit: measured recall and lag against the cursor path.
 
 ***
 

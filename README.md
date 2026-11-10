@@ -86,7 +86,7 @@ hermit/
 ├── deploy/Caddyfile            # TLS reverse proxy
 ├── migrations/                 # sqlx migrations, embedded at compile time
 ├── docs/                       # REFERENCE.md and per-experiment notes
-├── scripts/                    # bench_list.sh, capture_fixtures.sh, capture_evm_fixtures.sh
+├── scripts/                    # bench_list.sh, capture_fixtures.sh, capture_evm_fixtures.sh, probe_evm_*.sh
 ├── src/
 │   ├── main.rs, lib.rs, config.rs, state.rs, error.rs, shutdown.rs
 │   ├── bin/                    # replay, reconcile, seed_transfers
@@ -169,9 +169,11 @@ Per-file coverage: [reference](docs/REFERENCE.md#testing-detail).
 | 3 | Scale the API | 3b, 3c, 3e, 3f, 3g, perf-1, perf-2 done. 3a, 3d open |
 | 4 | WebSocket stream recall/precision | 4a to 4g done |
 | B+ | One protocol per phase | Not started |
+| E | EVM coverage (separate checklist) | E0 done; E1 to E3 open |
 
 Each checkpoint: branch, tests/fixtures, benchmark, Results row, PR, tag, deploy,
-re-run on EC2. The full checklist is in the [reference](docs/REFERENCE.md#roadmap).
+re-run on EC2. The full checklist is in the [reference](docs/REFERENCE.md#roadmap);
+EVM coverage is in [Phase E](docs/REFERENCE.md#phase-e-evm-coverage-separate-checklist).
 
 ## Headline numbers
 
