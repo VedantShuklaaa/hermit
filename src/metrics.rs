@@ -27,6 +27,7 @@ pub const POLL_CYCLES_TOTAL: &str = "poll_cycles_total";
 pub const POLL_MISSED_TOTAL: &str = "poll_missed_total";
 pub const POLL_LAST_SUCCESS_TIMESTAMP_SECONDS: &str = "poll_last_success_timestamp_seconds";
 pub const EVM_BLOCKS_TOTAL: &str = "evm_blocks_total";
+pub const EVM_ENDPOINT_FAILOVERS_TOTAL: &str = "evm_endpoint_failovers_total";
 pub const EVM_EVENTS_TOTAL: &str = "evm_events_total";
 pub const EVM_JOIN_MATCHES_TOTAL: &str = "evm_join_matches_total";
 pub const EVM_REORGS_TOTAL: &str = "evm_reorgs_total";
@@ -123,7 +124,11 @@ fn describe() {
     );
     metrics::describe_counter!(
         EVM_BLOCKS_TOTAL,
-        "Finalized EVM blocks read by a chain watcher"
+        "Finalized EVM blocks read by a chain watcher, by chain and endpoint host"
+    );
+    metrics::describe_counter!(
+        EVM_ENDPOINT_FAILOVERS_TOTAL,
+        "Times a chain watcher moved off a failing EVM RPC endpoint, by chain and endpoint host"
     );
     metrics::describe_counter!(
         EVM_EVENTS_TOTAL,

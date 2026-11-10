@@ -110,11 +110,20 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     Core Bridge and Token Bridge addresses and finality depth, seeded with
     Ethereum and its Wormhole chain ID 2), `evm_watch_cursors` and
     `evm_log_events`.
+  * `20261111120000_evm_watch_target_chain_id.sql` adds
+    `evm_watch_targets.evm_chain_id` (the `eth_chainId` the endpoint must answer
+    with, checked at watcher startup) and sets Ethereum to 1.
 * **EVM log watching (Ethereum only).** One watcher per enabled
   `evm_watch_targets` row polls `eth_getLogs` over the configured address and
-  topic filters through its own limiter (`EVM_RPS`) and stores events keyed by
+  topic filters and stores events keyed by
   the message identity `(emitter_chain, emitter_address, sequence)` plus tx hash,
-  block number, block hash and block timestamp. `LogMessagePublished` on the Core
+  block number, block hash and block timestamp. The chain runs on
+  `EVM_RPC_<CHAIN>` and an optional `EVM_RPC_<CHAIN>_FALLBACK`. Each endpoint has
+  its own limiter and its own live `eth_getLogs` window: a 429, timeout or 5xx
+  moves the watcher to the next endpoint, and a range-too-large answer halves only
+  the window of the endpoint that rejected it. A failed chunk stores nothing and
+  leaves the cursor alone. The watcher calls `eth_chainId` once at startup and
+  drops an endpoint that serves another chain. `LogMessagePublished` on the Core
   Bridge is kept only when the indexed sender is the Token Bridge, and its tx
   hash is the source tx. `TransferRedeemed` on the Token Bridge names the
   original message (`emitterChainId`, `emitterAddress`, `sequence`) and its tx
@@ -688,11 +697,15 @@ scrape_configs:
 * **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
   per chain (suffix is the lowercased `chains.slug`, e.g.
   `EVM_RPC_ETHEREUM`; a chain without a URL is skipped with a warning).
-  `EVM_RPS` (5), `EVM_POLL_SECS` (12), `EVM_MAX_BLOCK_RANGE` (10; halved on a
-  genuine range-too-large JSON-RPC error, never on a 429 or timeout),
+  `EVM_RPC_<CHAIN>_FALLBACK` is an optional second endpoint. `EVM_RPS` (5) and
+  `EVM_MAX_BLOCK_RANGE` (10) are the defaults for every endpoint;
+  `EVM_RPC_<CHAIN>[_FALLBACK]_RPS` and `EVM_RPC_<CHAIN>[_FALLBACK]_MAX_RANGE`
+  override them per endpoint. Each endpoint has its own limiter (a provider quota
+  is per key); the watcher fails over on 429, timeout and 5xx and halves only the
+  endpoint that rejected a range, never on a 429 or timeout. `EVM_POLL_SECS` (12),
   `EVM_JOIN_MAX_AGE_SECS` (86400; limits only the event-side retry sweep, the
-  transfer-side lookup has no age limit). Enabling without any
-  `EVM_RPC_<CHAIN>` is a startup error.
+  transfer-side lookup has no age limit). Enabling without any `EVM_RPC_<CHAIN>`
+  is a startup error, as is a fallback without its primary.
 * **Re-enrichment:** `REENRICH_ENABLED` (on), `REENRICH_INTERVAL_SECS` (30),
   `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60), `REENRICH_RETRY_SECS`
   (120), `REENRICH_MAX_AGE_SECS` (7 days), `REENRICH_ORIGIN_SHARE` (40; `0`
@@ -960,13 +973,16 @@ E4 and E5 are conditional on measured catch-up, not planned work.
   four chains.
   Exit: the capabilities table is filled for the primary and fallback of
   Ethereum, Base, Arbitrum and Avalanche.
-* \[ ] E1. Multi-endpoint watcher. `EVM_RPC_<CHAIN>` is the primary and
+* \[x] E1. Multi-endpoint watcher. `EVM_RPC_<CHAIN>` is the primary and
   `EVM_RPC_<CHAIN>_FALLBACK` an optional second endpoint; optional per-endpoint
   range and RPS overrides. Each endpoint gets its own limiter, because provider
   quotas are per key. The watcher picks a healthy endpoint, fails over on
   429/timeout/5xx, shrinks only the endpoint that rejected the range, and never
   advances the cursor on a failed range. Metrics carry chain and endpoint host,
-  never the URL. The primary/fallback choice comes from E0's table.
+  never the URL. The primary/fallback choice comes from E0's table. Done: the
+  env names are `EVM_RPC_<CHAIN>[_FALLBACK]_RPS` and
+  `EVM_RPC_<CHAIN>[_FALLBACK]_MAX_RANGE`; startup checks `eth_chainId` when
+  `evm_watch_targets.evm_chain_id` is set.
   Exit: a single-URL configuration behaves as today; loopback tests cover
   failover, range shrinking and every endpoint down; existing tests pass.
 * \[ ] E2. Per-chain finality. Migration adds `finality_mode` (`finalized` or

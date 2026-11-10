@@ -21,7 +21,7 @@ use bridge::evm::client::EvmClient;
 use bridge::evm::db as evm_db;
 use bridge::evm::decode::{self, EventKind};
 use bridge::evm::lookup::EvmEventLookup;
-use bridge::evm::watcher::EvmWatcher;
+use bridge::evm::watcher::{EvmWatcher, WatcherEndpoint};
 use bridge::protocols::amount::RawAmount;
 use bridge::protocols::{DetectedTransfer, Direction, MessageId, TokenRef};
 use bridge::services::detect;
@@ -102,6 +102,9 @@ enum RangeError {
 struct StubState {
     logs: Vec<Value>,
     spans: Mutex<Vec<u64>>,
+    /// Every JSON-RPC method this endpoint was asked for, so a test can see which
+    /// endpoint the watcher picked and in what order.
+    requests: Mutex<Vec<String>>,
     /// Finalized head. `None` uses [`TARGET_BLOCK`].
     target_block: Option<u64>,
     /// Reject `eth_getLogs` windows wider than this as range-too-large.
@@ -112,6 +115,10 @@ struct StubState {
     fail_first_429: AtomicBool,
     /// Answer the first `eth_getLogs` request with an unrelated HTTP 400.
     fail_first_unrelated_400: AtomicBool,
+    /// Answer every `eth_getLogs` request with HTTP 503.
+    fail_get_logs: AtomicBool,
+    /// Answer every request with HTTP 503, so the endpoint looks down.
+    fail_all: AtomicBool,
     /// Delay every `eth_getLogs` answer, to exercise a client timeout.
     get_logs_delay: Option<Duration>,
 }
@@ -134,7 +141,17 @@ async fn rpc(State(state): State<Arc<StubState>>, Json(body): Json<Value>) -> Re
         .unwrap_or_default();
     let target = state.target();
 
+    state.requests.lock().unwrap().push(method.to_string());
+    if state.fail_all.load(Ordering::SeqCst) {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     match method {
+        "eth_chainId" => Json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": "0x1"
+        }))
+        .into_response(),
         "eth_blockNumber" => Json(json!({
             "jsonrpc": "2.0", "id": 1,
             "result": format!("0x{:x}", target + 64)
@@ -210,6 +227,9 @@ async fn rpc(State(state): State<Arc<StubState>>, Json(body): Json<Value>) -> Re
                     )
                         .into_response(),
                 };
+            }
+            if state.fail_get_logs.load(Ordering::SeqCst) {
+                return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
 
             let matching: Vec<Value> = state
@@ -411,7 +431,23 @@ where
     panic!("timed out waiting for {what}");
 }
 
+fn endpoint(url: String, max_block_range: u64) -> WatcherEndpoint {
+    WatcherEndpoint {
+        url,
+        limiter: limiter(),
+        max_block_range,
+    }
+}
+
 fn watcher(url: String, pool: PgPool, chain_id: i16, max_block_range: u64) -> EvmWatcher {
+    watcher_with_endpoints(vec![endpoint(url, max_block_range)], pool, chain_id)
+}
+
+fn watcher_with_endpoints(
+    endpoints: Vec<WatcherEndpoint>,
+    pool: PgPool,
+    chain_id: i16,
+) -> EvmWatcher {
     EvmWatcher::new(
         evm_db::WatchTarget {
             chain_id,
@@ -420,14 +456,13 @@ fn watcher(url: String, pool: PgPool, chain_id: i16, max_block_range: u64) -> Ev
             core_bridge_address: CORE.to_string(),
             token_bridge_address: TOKEN.to_string(),
             finality_depth: 64,
-            rpc_url: url,
+            evm_chain_id: Some(1),
         },
         reqwest::Client::new(),
-        limiter(),
+        endpoints,
         pool,
         86_400,
         60,
-        max_block_range,
     )
 }
 
@@ -816,6 +851,221 @@ async fn a_429_keeps_the_window_and_retries() {
         Some(10),
         "the retry after a 429 keeps the range: {spans:?}"
     );
+}
+
+/// A dead primary must not stop the chain: the watcher moves to the fallback and
+/// the cursor advances from the fallback's logs.
+#[tokio::test]
+async fn a_failing_primary_fails_over_to_the_fallback() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let primary = Arc::new(StubState {
+        fail_all: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let fallback = Arc::new(StubState {
+        logs: captured_logs(),
+        ..Default::default()
+    });
+    let primary_url = stub(primary.clone()).await;
+    let fallback_url = stub(fallback.clone()).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(
+        watcher_with_endpoints(
+            vec![endpoint(primary_url, 10), endpoint(fallback_url, 10)],
+            pool.clone(),
+            chain_id,
+        )
+        .run(shutdown.clone()),
+    );
+
+    wait_until("the cursor to reach the head", || {
+        let pool = pool.clone();
+        async move {
+            let block: Option<i64> = sqlx::query_scalar(
+                "SELECT block_number FROM evm_watch_cursors WHERE chain_id = $1",
+            )
+            .bind(chain_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            block == Some(TARGET_BLOCK as i64)
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+
+    let primary_requests = primary.requests.lock().unwrap().clone();
+    assert!(
+        primary_requests
+            .iter()
+            .any(|method| method == "eth_getBlockByNumber"),
+        "the primary is tried first: {primary_requests:?}"
+    );
+    assert!(
+        !fallback.requests.lock().unwrap().is_empty(),
+        "the fallback served the chain"
+    );
+
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM evm_log_events")
+        .fetch_one(pool)
+        .await
+        .expect("event count");
+    assert_eq!(events, 2);
+}
+
+/// A range rejection is a fact about one provider, not the chain: the primary
+/// halves its own window, then fails over at the smaller window, and the fallback
+/// still asks for its full configured window.
+#[tokio::test]
+async fn a_range_rejection_shrinks_only_the_endpoint_that_rejected_it() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let rejecting = Arc::new(StubState {
+        max_ok_range: Some(5),
+        fail_get_logs: AtomicBool::new(true),
+        target_block: Some(CURSOR_BLOCK + 30),
+        ..Default::default()
+    });
+    let healthy = Arc::new(StubState {
+        logs: captured_logs(),
+        target_block: Some(CURSOR_BLOCK + 30),
+        ..Default::default()
+    });
+    let rejecting_url = stub(rejecting.clone()).await;
+    let healthy_url = stub(healthy.clone()).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(
+        watcher_with_endpoints(
+            vec![endpoint(rejecting_url, 10), endpoint(healthy_url, 10)],
+            pool.clone(),
+            chain_id,
+        )
+        .run(shutdown.clone()),
+    );
+
+    wait_until("the cursor to reach the head", || {
+        let pool = pool.clone();
+        async move {
+            let block: Option<i64> = sqlx::query_scalar(
+                "SELECT block_number FROM evm_watch_cursors WHERE chain_id = $1",
+            )
+            .bind(chain_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            block == Some((CURSOR_BLOCK + 30) as i64)
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+
+    let rejected_spans = rejecting.spans.lock().unwrap().clone();
+    assert_eq!(
+        rejected_spans.first().copied(),
+        Some(10),
+        "the rejecting endpoint starts at its configured window"
+    );
+    assert!(
+        rejected_spans.contains(&5),
+        "its window halves to 5: {rejected_spans:?}"
+    );
+    assert!(rejected_spans.iter().all(|span| *span <= 10));
+
+    let healthy_spans = healthy.spans.lock().unwrap().clone();
+    assert_eq!(
+        healthy_spans.first().copied(),
+        Some(10),
+        "the fallback keeps its own window: {healthy_spans:?}"
+    );
+    assert!(
+        healthy_spans.iter().all(|span| *span <= 10),
+        "the fallback's window never grows past its configuration: {healthy_spans:?}"
+    );
+}
+
+/// Every endpoint down is a failed poll: nothing is stored and the cursor is not
+/// moved, so the next poll re-reads the same window.
+#[tokio::test]
+async fn every_endpoint_down_leaves_the_cursor_alone() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let primary = Arc::new(StubState {
+        fail_all: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let fallback = Arc::new(StubState {
+        fail_all: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let primary_url = stub(primary.clone()).await;
+    let fallback_url = stub(fallback.clone()).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(
+        watcher_with_endpoints(
+            vec![endpoint(primary_url, 10), endpoint(fallback_url, 10)],
+            pool.clone(),
+            chain_id,
+        )
+        .run(shutdown.clone()),
+    );
+
+    wait_until("both endpoints to be tried", || {
+        let primary = primary.clone();
+        let fallback = fallback.clone();
+        async move {
+            let tried = |state: &StubState| {
+                state
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|method| method == "eth_getBlockByNumber")
+            };
+            tried(&primary) && tried(&fallback)
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(15), handle).await;
+
+    let cursor: (i64, String) = sqlx::query_as(
+        "SELECT block_number, block_hash FROM evm_watch_cursors WHERE chain_id = $1",
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await
+    .expect("cursor");
+    assert_eq!(cursor.0, CURSOR_BLOCK as i64, "the cursor did not move");
+    assert_eq!(cursor.1, hash_for(CURSOR_BLOCK));
+
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM evm_log_events")
+        .fetch_one(pool)
+        .await
+        .expect("event count");
+    assert_eq!(events, 0);
 }
 
 #[tokio::test]

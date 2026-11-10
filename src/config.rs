@@ -82,19 +82,40 @@ pub struct EvmConfig {
     /// `EVM_WATCH_ENABLED`, default off. Off starts no watchers and skips the
     /// transfer-side event lookup.
     pub enabled: bool,
-    /// `EVM_RPC_<CHAIN>` per chain, keyed by the chain registry slug (`ethereum`
-    /// for `EVM_RPC_ETHEREUM`).
-    pub rpc_urls: BTreeMap<String, String>,
-    /// Requests/sec across every EVM watcher. One key and one quota.
-    pub rps: u32,
+    /// `EVM_RPC_<CHAIN>` and its optional `EVM_RPC_<CHAIN>_FALLBACK`, keyed by the
+    /// chain registry slug (`ethereum` for `EVM_RPC_ETHEREUM`).
+    pub rpc: BTreeMap<String, EvmChainRpcConfig>,
     /// Seconds between polls.
     pub poll_secs: u64,
-    /// Most blocks one `eth_getLogs` call asks for. Alchemy's free tier caps
-    /// here; a genuine range-too-large answer halves the live value.
-    pub max_block_range: u64,
     /// How long an unmatched stored event is retried by the event-side join.
     /// The transfer-side lookup is not age-limited.
     pub join_max_age_secs: i64,
+}
+
+/// One chain's RPC endpoints: a primary and an optional fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmChainRpcConfig {
+    pub primary: EvmRpcEndpointConfig,
+    pub fallback: Option<EvmRpcEndpointConfig>,
+}
+
+impl EvmChainRpcConfig {
+    /// Primary first, then the fallback when configured.
+    pub fn endpoints(&self) -> impl Iterator<Item = &EvmRpcEndpointConfig> {
+        std::iter::once(&self.primary).chain(self.fallback.as_ref())
+    }
+}
+
+/// One EVM RPC endpoint. The URL is the only place a provider key appears; the
+/// range and rate overrides are optional and fall back to the process defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmRpcEndpointConfig {
+    pub url: String,
+    /// `EVM_RPC_<CHAIN>[_FALLBACK]_MAX_RANGE`, default `EVM_MAX_BLOCK_RANGE`.
+    pub max_block_range: u64,
+    /// `EVM_RPC_<CHAIN>[_FALLBACK]_RPS`, default `EVM_RPS`. Limits this endpoint
+    /// only, because a provider quota is per key.
+    pub rps: u32,
 }
 
 /// Server-owned live feed backed by Redis.
@@ -296,9 +317,12 @@ impl AppConfig {
 
         // EVM_RPC_<CHAIN>: the suffix is the chain registry slug. Empty values are
         // ignored so a commented-out placeholder cannot start a watcher with no URL.
-        let evm_rpc_urls = collect_evm_rpc_urls(std::env::vars());
+        // Every endpoint defaults to the process-wide range and rate.
+        let evm_rps = number("EVM_RPS", 5u32).max(1);
+        let evm_max_block_range = number("EVM_MAX_BLOCK_RANGE", 10u64).max(1);
+        let evm_rpc = collect_evm_rpc(std::env::vars(), evm_max_block_range, evm_rps)?;
         let evm_enabled = flag(std::env::var("EVM_WATCH_ENABLED").ok().as_deref());
-        if evm_enabled && evm_rpc_urls.is_empty() {
+        if evm_enabled && evm_rpc.is_empty() {
             anyhow::bail!("EVM_WATCH_ENABLED is set but no EVM_RPC_<CHAIN> is configured");
         }
 
@@ -365,10 +389,8 @@ impl AppConfig {
             },
             evm: EvmConfig {
                 enabled: evm_enabled,
-                rpc_urls: evm_rpc_urls,
-                rps: number("EVM_RPS", 5u32).max(1),
+                rpc: evm_rpc,
                 poll_secs: number("EVM_POLL_SECS", 12u64).max(1),
-                max_block_range: number("EVM_MAX_BLOCK_RANGE", 10u64).max(1),
                 join_max_age_secs: number("EVM_JOIN_MAX_AGE_SECS", 86_400i64).max(1),
             },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
@@ -519,10 +541,8 @@ impl AppConfig {
             },
             evm: EvmConfig {
                 enabled: false,
-                rpc_urls: BTreeMap::new(),
-                rps: 5,
+                rpc: BTreeMap::new(),
                 poll_secs: 12,
-                max_block_range: 10,
                 join_max_age_secs: 86_400,
             },
             chain_registry_refresh_secs: 60,
@@ -531,22 +551,116 @@ impl AppConfig {
     }
 }
 
-/// `EVM_RPC_<CHAIN>` variables, keyed by lower-case chain slug. Empty names and values
-/// are ignored, so a commented-out placeholder cannot start a watcher with no URL.
-fn collect_evm_rpc_urls<I>(vars: I) -> BTreeMap<String, String>
+/// `EVM_RPC_<CHAIN>`, `EVM_RPC_<CHAIN>_FALLBACK` and their `_MAX_RANGE` / `_RPS`
+/// overrides, keyed by lower-case chain slug. Empty names and values are ignored, so
+/// a commented-out placeholder cannot start a watcher with no URL. A fallback with no
+/// primary is an error: it would never be used.
+fn collect_evm_rpc<I, K, V>(
+    vars: I,
+    default_range: u64,
+    default_rps: u32,
+) -> anyhow::Result<BTreeMap<String, EvmChainRpcConfig>>
 where
-    I: IntoIterator<Item = (String, String)>,
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
 {
-    vars.into_iter()
-        .filter_map(|(key, value)| {
-            let suffix = key.strip_prefix("EVM_RPC_")?;
-            let value = value.trim();
-            if suffix.is_empty() || value.is_empty() {
-                return None;
+    #[derive(Default)]
+    struct RawEndpoint {
+        url: Option<String>,
+        max_block_range: Option<u64>,
+        rps: Option<u32>,
+    }
+
+    #[derive(Default)]
+    struct RawChain {
+        primary: RawEndpoint,
+        fallback: RawEndpoint,
+    }
+
+    enum Field {
+        PrimaryUrl,
+        FallbackUrl,
+        PrimaryRange,
+        FallbackRange,
+        PrimaryRps,
+        FallbackRps,
+    }
+
+    let mut raw: BTreeMap<String, RawChain> = BTreeMap::new();
+    for (key, value) in vars {
+        let Some(rest) = key.as_ref().strip_prefix("EVM_RPC_") else {
+            continue;
+        };
+        let (chain, field) = if let Some(chain) = rest.strip_suffix("_FALLBACK_MAX_RANGE") {
+            (chain, Field::FallbackRange)
+        } else if let Some(chain) = rest.strip_suffix("_FALLBACK_RPS") {
+            (chain, Field::FallbackRps)
+        } else if let Some(chain) = rest.strip_suffix("_MAX_RANGE") {
+            (chain, Field::PrimaryRange)
+        } else if let Some(chain) = rest.strip_suffix("_RPS") {
+            (chain, Field::PrimaryRps)
+        } else if let Some(chain) = rest.strip_suffix("_FALLBACK") {
+            (chain, Field::FallbackUrl)
+        } else {
+            (rest, Field::PrimaryUrl)
+        };
+        if chain.is_empty() {
+            continue;
+        }
+
+        let value = value.as_ref().trim();
+        let entry = raw.entry(chain.to_ascii_lowercase()).or_default();
+        match field {
+            Field::PrimaryUrl => entry.primary.url = non_empty_value(value),
+            Field::FallbackUrl => entry.fallback.url = non_empty_value(value),
+            Field::PrimaryRange => entry.primary.max_block_range = parse_override(value),
+            Field::FallbackRange => entry.fallback.max_block_range = parse_override(value),
+            Field::PrimaryRps => entry.primary.rps = parse_override(value),
+            Field::FallbackRps => entry.fallback.rps = parse_override(value),
+        }
+    }
+
+    let mut chains = BTreeMap::new();
+    for (slug, raw) in raw {
+        let RawChain { primary, fallback } = raw;
+        let Some(primary_url) = primary.url else {
+            if fallback.url.is_some() {
+                let name = slug.to_ascii_uppercase();
+                anyhow::bail!("EVM_RPC_{name}_FALLBACK is set but EVM_RPC_{name} is not");
             }
-            Some((suffix.to_ascii_lowercase(), value.to_string()))
-        })
-        .collect()
+            continue;
+        };
+
+        let endpoint =
+            |url: String, max_block_range: Option<u64>, rps: Option<u32>| EvmRpcEndpointConfig {
+                url,
+                max_block_range: max_block_range.unwrap_or(default_range).max(1),
+                rps: rps.unwrap_or(default_rps).max(1),
+            };
+        let primary = endpoint(primary_url, primary.max_block_range, primary.rps);
+        let fallback = match fallback {
+            RawEndpoint {
+                url: Some(url),
+                max_block_range,
+                rps,
+            } => Some(endpoint(url, max_block_range, rps)),
+            RawEndpoint { url: None, .. } => None,
+        };
+
+        chains.insert(slug, EvmChainRpcConfig { primary, fallback });
+    }
+    Ok(chains)
+}
+
+fn non_empty_value(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// A numeric override. Blank or unparseable means "use the default", matching the
+/// `EVM_RPS` and `EVM_MAX_BLOCK_RANGE` handling.
+fn parse_override<T: std::str::FromStr>(value: &str) -> Option<T> {
+    value.parse().ok()
 }
 
 /// The boolean convention the other switches use: `1` or `true`, case-insensitive.
@@ -611,23 +725,50 @@ mod tests {
     }
 
     #[test]
-    fn evm_rpc_urls_are_keyed_by_lower_case_chain_slug() {
-        let urls = collect_evm_rpc_urls([
-            ("EVM_RPC_ETHEREUM".to_string(), " https://eth ".to_string()),
-            ("EVM_RPC_POLYGON".to_string(), "https://polygon".to_string()),
-            ("EVM_RPC_".to_string(), "https://ignored".to_string()),
-            ("EVM_RPC_BASE".to_string(), "   ".to_string()),
-            ("HELIUS_URL".to_string(), "https://ignored".to_string()),
-        ]);
-        assert_eq!(urls.len(), 2);
-        assert_eq!(
-            urls.get("ethereum").map(String::as_str),
-            Some("https://eth")
-        );
-        assert_eq!(
-            urls.get("polygon").map(String::as_str),
-            Some("https://polygon")
-        );
+    fn evm_rpc_configs_are_keyed_by_lower_case_chain_slug() {
+        let chains = collect_evm_rpc(
+            [
+                ("EVM_RPC_ETHEREUM", " https://eth "),
+                ("EVM_RPC_POLYGON", "https://polygon"),
+                ("EVM_RPC_ETHEREUM_FALLBACK", "https://eth-backup"),
+                ("EVM_RPC_ETHEREUM_MAX_RANGE", "101"),
+                ("EVM_RPC_ETHEREUM_RPS", "3"),
+                ("EVM_RPC_ETHEREUM_FALLBACK_MAX_RANGE", "10"),
+                ("EVM_RPC_ETHEREUM_FALLBACK_RPS", "7"),
+                ("EVM_RPC_", "https://ignored"),
+                ("EVM_RPC_BASE", "   "),
+                ("HELIUS_URL", "https://ignored"),
+            ],
+            10,
+            5,
+        )
+        .expect("config");
+
+        assert_eq!(chains.len(), 2);
+        let ethereum = &chains["ethereum"];
+        assert_eq!(ethereum.primary.url, "https://eth");
+        assert_eq!(ethereum.primary.max_block_range, 101);
+        assert_eq!(ethereum.primary.rps, 3);
+
+        let fallback = ethereum.fallback.as_ref().expect("fallback");
+        assert_eq!(fallback.url, "https://eth-backup");
+        assert_eq!(fallback.max_block_range, 10);
+        assert_eq!(fallback.rps, 7);
+
+        // Unset overrides take the process defaults.
+        let polygon = &chains["polygon"];
+        assert_eq!(polygon.primary.url, "https://polygon");
+        assert_eq!(polygon.primary.max_block_range, 10);
+        assert_eq!(polygon.primary.rps, 5);
+        assert!(polygon.fallback.is_none());
+    }
+
+    #[test]
+    fn a_fallback_without_a_primary_is_an_error() {
+        let error = collect_evm_rpc([("EVM_RPC_BASE_FALLBACK", "https://backup")], 10, 5)
+            .expect_err("fallback without a primary")
+            .to_string();
+        assert!(error.contains("EVM_RPC_BASE"), "{error}");
     }
 
     #[test]

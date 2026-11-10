@@ -5,7 +5,7 @@ use bridge::config::{AppConfig, Lane, Role};
 use bridge::db;
 use bridge::enrichment::reenrich;
 use bridge::evm::db as evm_db;
-use bridge::evm::watcher::EvmWatcher;
+use bridge::evm::watcher::{EvmWatcher, WatcherEndpoint};
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::protocols::registry::ProtocolRegistry;
 use bridge::redis::broadcast;
@@ -19,6 +19,7 @@ use governor::{Quota, RateLimiter};
 use mimalloc::MiMalloc;
 use reqwest::Client;
 use rustls::crypto::ring;
+use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -380,9 +381,10 @@ fn spawn_ingester(
 }
 
 /// One watcher per enabled `evm_watch_targets` row, each matched to its chain slug's
-/// `EVM_RPC_<CHAIN>`. All watchers share one EVM limiter, so the configured `EVM_RPS`
-/// is a budget for the whole process. A missing URL skips that chain with a warning
-/// rather than failing the role.
+/// `EVM_RPC_<CHAIN>` (primary) and optional `EVM_RPC_<CHAIN>_FALLBACK`. A provider
+/// quota is per key, so each endpoint gets its own limiter; a URL reused by two
+/// chains shares one. A missing URL skips that chain with a warning rather than
+/// failing the role.
 async fn spawn_evm_watchers(
     config: &AppConfig,
     db: sqlx::PgPool,
@@ -410,12 +412,10 @@ async fn spawn_evm_watchers(
         return;
     }
 
-    let limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
-        NonZeroU32::new(config.evm.rps).unwrap(),
-    )));
+    let mut limiters: HashMap<String, Arc<Limiter>> = HashMap::new();
 
-    for mut target in targets {
-        let Some(url) = config.evm.rpc_urls.get(&target.slug).cloned() else {
+    for target in targets {
+        let Some(rpc) = config.evm.rpc.get(&target.slug) else {
             tracing::warn!(
                 chain = %target.slug,
                 env = %format!("EVM_RPC_{}", target.slug.to_ascii_uppercase()),
@@ -423,16 +423,33 @@ async fn spawn_evm_watchers(
             );
             continue;
         };
-        target.rpc_url = url;
+
+        let endpoints: Vec<WatcherEndpoint> = rpc
+            .endpoints()
+            .map(|endpoint| {
+                let limiter = limiters
+                    .entry(endpoint.url.clone())
+                    .or_insert_with(|| {
+                        Arc::new(RateLimiter::direct(Quota::per_second(
+                            NonZeroU32::new(endpoint.rps).unwrap(),
+                        )))
+                    })
+                    .clone();
+                WatcherEndpoint {
+                    url: endpoint.url.clone(),
+                    limiter,
+                    max_block_range: endpoint.max_block_range,
+                }
+            })
+            .collect();
 
         let watcher = EvmWatcher::new(
             target,
             http_client.clone(),
-            limiter.clone(),
+            endpoints,
             db.clone(),
             config.evm.join_max_age_secs,
             config.evm.poll_secs,
-            config.evm.max_block_range,
         );
         let watcher_shutdown = shutdown.clone();
         spawn_supervised("evm-watcher", shutdown.clone(), move || {
