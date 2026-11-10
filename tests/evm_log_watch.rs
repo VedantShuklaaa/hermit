@@ -249,6 +249,64 @@ async fn captured_fixtures_decode_to_the_message_identity() {
     assert_eq!(redeem.sequence, SEQUENCE);
 }
 
+fn real_logs() -> Vec<Value> {
+    fixture("evm_ethereum_real_1439615.json")["result"]
+        .as_array()
+        .cloned()
+        .expect("real logs")
+}
+
+/// Mainnet capture, blocks 26385278..=26385287. The Token Bridge redeem for
+/// sequence 1439615 (tx 0xb5c9306b...f861f9) must decode, and every field is
+/// checked against the raw topics rather than hardcoded values.
+#[tokio::test]
+async fn real_mainnet_redeem_decodes() {
+    const REDEEM_TOPIC: &str = "0xcaf280c8cfeba144da67230d9b009c8f868a75bac9a528fa0474be1ba317c169";
+
+    let all = real_logs();
+    assert_eq!(all.len(), 9, "capture should hold 8 sends and 1 redeem");
+
+    let redeem_raw: Vec<Value> = all
+        .iter()
+        .filter(|l| l["topics"][0].as_str() == Some(REDEEM_TOPIC))
+        .cloned()
+        .collect();
+    assert_eq!(redeem_raw.len(), 1);
+
+    let topics = redeem_raw[0]["topics"].as_array().expect("topics");
+    let t1 = topics[1].as_str().expect("emitter chain topic");
+    let t2 = topics[2].as_str().expect("emitter address topic");
+    let want_chain = u16::from_str_radix(&t1[t1.len() - 4..], 16).expect("chain");
+    let want_emitter = t2.trim_start_matches("0x").to_lowercase();
+
+    let state = Arc::new(StubState {
+        logs: redeem_raw,
+        ..Default::default()
+    });
+    let url = stub(state).await;
+    let client = EvmClient::new(reqwest::Client::new(), url, limiter());
+    let logs = client
+        .logs(
+            26_385_278,
+            26_385_287,
+            &[CORE, TOKEN],
+            &[
+                decode::LOG_MESSAGE_PUBLISHED_TOPIC,
+                decode::TRANSFER_REDEEMED_TOPIC,
+            ],
+        )
+        .await
+        .expect("logs");
+    assert_eq!(logs.len(), 1);
+
+    let redeem =
+        decode::decode_log(&logs[0], expected_wormhole_id(), CORE, TOKEN).expect("redeem decodes");
+    assert_eq!(redeem.event_kind, EventKind::TransferRedeemed);
+    assert_eq!(redeem.sequence, 1_439_615);
+    assert_eq!(redeem.emitter_chain, want_chain);
+    assert_eq!(redeem.emitter_address, want_emitter);
+}
+
 fn decoded(
     direction: Direction,
     emitter_chain: u16,
