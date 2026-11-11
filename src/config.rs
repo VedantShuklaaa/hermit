@@ -145,11 +145,44 @@ pub struct WorkerConfig {
     pub read_count: usize,
 }
 
+/// Which live feed the ingester reads. `logsSubscribe` is the production default;
+/// `laserstream` is the experimental gRPC source (build with `--features laserstream`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestSourceKind {
+    LogsSubscribe,
+    LaserStream,
+}
+
+impl IngestSourceKind {
+    /// Parses `INGEST_SOURCE`. `logs` is the default and the only value the default
+    /// build accepts.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "logs" | "logssubscribe" => Ok(Self::LogsSubscribe),
+            "laserstream" => Ok(Self::LaserStream),
+            other => {
+                anyhow::bail!("invalid INGEST_SOURCE {other:?}: expected one of logs, laserstream")
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LogsSubscribe => "logs",
+            Self::LaserStream => "laserstream",
+        }
+    }
+}
+
 /// Always-on Solana ingestion (A8).
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
     /// Kill switch. `INGEST_ENABLED=0` stops the ingester from starting at all.
     pub enabled: bool,
+    /// `INGEST_SOURCE`, default `logs` (the existing `logsSubscribe` WebSocket).
+    pub source: IngestSourceKind,
+    /// `LASERSTREAM_ENDPOINT`, used only when `source` is `LaserStream`.
+    pub laserstream_endpoint: String,
     /// Replay the signatures missed since the checkpoint each time a connection starts.
     pub backfill: bool,
     /// Most signatures one backfill run will publish. Bounds the Helius spend after a long
@@ -326,6 +359,16 @@ impl AppConfig {
             anyhow::bail!("EVM_WATCH_ENABLED is set but no EVM_RPC_<CHAIN> is configured");
         }
 
+        let ingest_source = IngestSourceKind::parse(&optional("INGEST_SOURCE", "logs"))?;
+        #[cfg(not(feature = "laserstream"))]
+        {
+            if ingest_source == IngestSourceKind::LaserStream {
+                anyhow::bail!(
+                    "INGEST_SOURCE=laserstream requires a build with --features laserstream"
+                );
+            }
+        }
+
         Ok(Self {
             role,
             pubsub_channel: optional("TX_EVENTS_CHANNEL", "bridge:tx_events"),
@@ -366,6 +409,11 @@ impl AppConfig {
                 enabled: std::env::var("INGEST_ENABLED")
                     .map(|v| v != "0")
                     .unwrap_or(true),
+                source: ingest_source,
+                laserstream_endpoint: optional(
+                    "LASERSTREAM_ENDPOINT",
+                    "https://laserstream-devnet-ewr.helius-rpc.com",
+                ),
                 backfill: std::env::var("LIVE_BACKFILL")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true),
@@ -511,6 +559,8 @@ impl AppConfig {
             allowed_origins: Vec::new(),
             ingest: IngestConfig {
                 enabled: false,
+                source: IngestSourceKind::LogsSubscribe,
+                laserstream_endpoint: "https://laserstream-devnet-ewr.helius-rpc.com".to_string(),
                 backfill: false,
                 backfill_max: 0,
                 backfill_pace_ms: 0,
@@ -838,6 +888,23 @@ mod tests {
         assert!(error.contains("HELIUS_STREAM_URL"), "{error}");
 
         assert!(resolve_helius_urls(Role::All, None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn ingest_source_defaults_to_logs_and_rejects_unknown_values() {
+        assert_eq!(
+            IngestSourceKind::parse("logs").unwrap(),
+            IngestSourceKind::LogsSubscribe
+        );
+        assert_eq!(
+            IngestSourceKind::parse(" LaserStream ").unwrap(),
+            IngestSourceKind::LaserStream
+        );
+        assert!(IngestSourceKind::parse("websocket").is_err());
+        assert_eq!(
+            AppConfig::test_config().ingest.source,
+            IngestSourceKind::LogsSubscribe
+        );
     }
 
     #[test]

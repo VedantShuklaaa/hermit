@@ -12,7 +12,9 @@ mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, Lane, ReenrichConfig, WorkerConfig};
+use bridge::config::{
+    AppConfig, IngestConfig, IngestSourceKind, Lane, ReenrichConfig, WorkerConfig,
+};
 use bridge::db::repository;
 use bridge::domain::bridge_transfer::ChainId;
 use bridge::services::precision::precision_pass;
@@ -84,6 +86,8 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
         allowed_origins: Vec::new(),
         ingest: IngestConfig {
             enabled: false,
+            source: IngestSourceKind::LogsSubscribe,
+            laserstream_endpoint: "https://laserstream-devnet-ewr.helius-rpc.com".to_string(),
             backfill: false,
             backfill_max: 0,
             backfill_pace_ms: 0,

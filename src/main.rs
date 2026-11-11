@@ -1,12 +1,17 @@
+#[cfg(feature = "laserstream")]
+use anyhow::Context;
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::{ChainRegistry, db::run_refresh_loop};
 use bridge::clients::limiter::Limiter;
-use bridge::config::{AppConfig, Lane, Role};
+use bridge::config::{AppConfig, IngestSourceKind, Lane, Role};
 use bridge::db;
 use bridge::enrichment::reenrich;
 use bridge::evm::db as evm_db;
 use bridge::evm::watcher::{EvmWatcher, WatcherEndpoint};
+#[cfg(feature = "laserstream")]
+use bridge::ingestion::laserstream::LaserStreamIngester;
 use bridge::ingestion::solana::SolanaIngester;
+use bridge::ingestion::source::IngestSource;
 use bridge::protocols::registry::ProtocolRegistry;
 use bridge::redis::broadcast;
 use bridge::redis::consumer::RedisConsumer;
@@ -144,7 +149,7 @@ async fn run_all(config: AppConfig) -> anyhow::Result<()> {
         db.clone(),
         http_client.clone(),
         shutdown.clone(),
-    );
+    )?;
 
     spawn_evm_watchers(&config, db.clone(), http_client.clone(), shutdown.clone()).await;
 
@@ -263,7 +268,7 @@ async fn run_stream(config: AppConfig) -> anyhow::Result<()> {
         db.clone(),
         http_client.clone(),
         shutdown.clone(),
-    );
+    )?;
 
     spawn_evm_watchers(&config, db.clone(), http_client.clone(), shutdown.clone()).await;
 
@@ -353,31 +358,65 @@ fn spawn_ingester(
     db: sqlx::PgPool,
     http_client: Client,
     shutdown: CancellationToken,
-) {
+) -> anyhow::Result<()> {
     if !config.ingest.enabled {
         tracing::warn!("INGEST_ENABLED=0, Solana ingestion is disabled");
-        return;
+        return Ok(());
     }
 
-    let solana_ingester = Arc::new(SolanaIngester::new(
-        config.solana_ws_url.clone(),
-        config.solana_token_bridge_program.clone(),
-        redis,
-        db,
-        http_client,
-        config.helius_url(Lane::Ingest).to_string(),
-        config.ingest.clone(),
-    ));
+    tracing::info!(
+        source = config.ingest.source.as_str(),
+        "starting Solana ingestion"
+    );
+
+    let source = match config.ingest.source {
+        IngestSourceKind::LogsSubscribe => IngestSource::LogsSubscribe(SolanaIngester::new(
+            config.solana_ws_url.clone(),
+            config.solana_token_bridge_program.clone(),
+            redis,
+            db,
+            http_client,
+            config.helius_url(Lane::Ingest).to_string(),
+            config.ingest.clone(),
+        )),
+        IngestSourceKind::LaserStream => {
+            #[cfg(feature = "laserstream")]
+            {
+                let api_key = std::env::var("HELIUS_API_KEY")
+                    .context("INGEST_SOURCE=laserstream requires HELIUS_API_KEY")?;
+
+                IngestSource::LaserStream(LaserStreamIngester::new(
+                    config.ingest.laserstream_endpoint.clone(),
+                    api_key,
+                    config.solana_token_bridge_program.clone(),
+                    redis,
+                    db,
+                    config.ingest.dedupe_ttl_secs,
+                ))
+            }
+
+            #[cfg(not(feature = "laserstream"))]
+            {
+                anyhow::bail!(
+                    "INGEST_SOURCE=laserstream requires a build with --features laserstream"
+                )
+            }
+        }
+    };
+
+    let source = Arc::new(source);
 
     // Always on: starts with the process and runs whether or not anyone is connected to
-    // /stream, so the database is a complete record. The ingester reconnects on its own;
+    // /stream, so the database is a complete record. The source reconnects on its own;
     // the supervisor only has to cover a panic.
     spawn_supervised("solana-ingester", shutdown.clone(), move || {
-        let solana_ingester = solana_ingester.clone();
+        let source = source.clone();
         let shutdown = shutdown.clone();
 
-        async move { solana_ingester.run(shutdown).await }
+        async move { source.run(shutdown).await }
     });
+
+    Ok(())
 }
 
 /// One watcher per enabled `evm_watch_targets` row, each matched to its chain slug's

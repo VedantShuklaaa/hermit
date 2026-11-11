@@ -9,7 +9,9 @@ mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, Lane, ReenrichConfig, WorkerConfig};
+use bridge::config::{
+    AppConfig, IngestConfig, IngestSourceKind, Lane, ReenrichConfig, WorkerConfig,
+};
 use bridge::redis::consumer::RedisConsumer;
 use bridge::state::AppState;
 use redis::aio::MultiplexedConnection;
@@ -63,6 +65,8 @@ fn test_config(
         allowed_origins: Vec::new(),
         ingest: IngestConfig {
             enabled: false,
+            source: IngestSourceKind::LogsSubscribe,
+            laserstream_endpoint: "https://laserstream-devnet-ewr.helius-rpc.com".to_string(),
             backfill: false,
             backfill_max: 0,
             backfill_pace_ms: 0,

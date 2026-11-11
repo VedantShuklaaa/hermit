@@ -146,6 +146,29 @@ cargo run --bin reconcile -- --window-hours 2 --precision-sample 20  # stream re
 HTTPS with Caddy, metrics, health and every config variable:
 [reference](docs/REFERENCE.md#operations).
 
+## LaserStream (experimental)
+
+The live feed can optionally come from Helius LaserStream (gRPC) instead of
+`logsSubscribe`. It is off by default: the default build and dependency graph
+are unchanged, and `logsSubscribe` remains the production path.
+
+The key is read only from `HELIUS_API_KEY` (never commit it):
+
+```bash
+# Connectivity probe: pings the endpoint, prints 20 confirmed slots, exits.
+HELIUS_API_KEY=... cargo run --features laserstream --example laserstream_probe
+
+# Run the indexer on LaserStream for one program.
+INGEST_SOURCE=laserstream HELIUS_API_KEY=... cargo run --features laserstream
+```
+
+`INGEST_SOURCE=logs` (the default) keeps the WebSocket source. When
+`laserstream` is selected, `LASERSTREAM_ENDPOINT` overrides the endpoint
+(default `https://laserstream-devnet-ewr.helius-rpc.com`). Both sources publish
+the same transaction candidates to the same Redis stream, so the consumer,
+decode, persistence and read paths are identical. LaserStream does not run the
+backfill yet; use `logs` for gaps.
+
 ## Testing
 
 ```bash
