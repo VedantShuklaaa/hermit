@@ -380,11 +380,21 @@ fn spawn_ingester(
     });
 }
 
+/// A configured endpoint must be an absolute HTTP(S) URL. A malformed value is
+/// skipped at startup instead of failing every poll for that chain. The URL itself is
+/// never logged: its path can hold a provider key.
+fn usable_rpc_endpoint(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .map(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .unwrap_or(false)
+}
+
 /// One watcher per enabled `evm_watch_targets` row, each matched to its chain slug's
 /// `EVM_RPC_<CHAIN>` (primary) and optional `EVM_RPC_<CHAIN>_FALLBACK`. A provider
 /// quota is per key, so each endpoint gets its own limiter; a URL reused by two
-/// chains shares one. A missing URL skips that chain with a warning rather than
-/// failing the role.
+/// chains shares one. A missing or malformed URL skips that chain with a warning
+/// rather than failing the role, and a row that fails validation is already skipped
+/// by [`evm_db::load_targets`], so it cannot stop the other chains.
 async fn spawn_evm_watchers(
     config: &AppConfig,
     db: sqlx::PgPool,
@@ -400,15 +410,16 @@ async fn spawn_evm_watchers(
         Err(error) => {
             tracing::error!(
                 ?error,
-                "could not load EVM watch targets (check evm_watch_targets, including \
-                 finality_mode/finality_depth), EVM watching is off"
+                "could not read evm_watch_targets, EVM watching is off"
             );
             return;
         }
     };
     if targets.is_empty() {
+        // `load_targets` has already logged an error when rows existed but every one
+        // was invalid, so this covers the "nothing configured" case without hiding it.
         tracing::warn!(
-            "EVM_WATCH_ENABLED is set but evm_watch_targets has no enabled, active chain"
+            "EVM_WATCH_ENABLED is set but evm_watch_targets has no usable enabled, active chain"
         );
         return;
     }
@@ -425,24 +436,37 @@ async fn spawn_evm_watchers(
             continue;
         };
 
-        let endpoints: Vec<WatcherEndpoint> = rpc
-            .endpoints()
-            .map(|endpoint| {
-                let limiter = limiters
-                    .entry(endpoint.url.clone())
-                    .or_insert_with(|| {
-                        Arc::new(RateLimiter::direct(Quota::per_second(
-                            NonZeroU32::new(endpoint.rps).unwrap(),
-                        )))
-                    })
-                    .clone();
-                WatcherEndpoint {
-                    url: endpoint.url.clone(),
-                    limiter,
-                    max_block_range: endpoint.max_block_range,
-                }
-            })
-            .collect();
+        let mut endpoints: Vec<WatcherEndpoint> = Vec::new();
+        for endpoint in rpc.endpoints() {
+            if !usable_rpc_endpoint(&endpoint.url) {
+                // The URL can carry a provider key in its path, so it is never logged.
+                tracing::warn!(
+                    chain = %target.slug,
+                    "skipping EVM RPC endpoint with a malformed URL (expected http or https)"
+                );
+                continue;
+            }
+            let limiter = limiters
+                .entry(endpoint.url.clone())
+                .or_insert_with(|| {
+                    Arc::new(RateLimiter::direct(Quota::per_second(
+                        NonZeroU32::new(endpoint.rps).unwrap(),
+                    )))
+                })
+                .clone();
+            endpoints.push(WatcherEndpoint {
+                url: endpoint.url.clone(),
+                limiter,
+                max_block_range: endpoint.max_block_range,
+            });
+        }
+        if endpoints.is_empty() {
+            tracing::warn!(
+                chain = %target.slug,
+                "no usable RPC endpoint for watched EVM chain, not watching it"
+            );
+            continue;
+        }
 
         let watcher = EvmWatcher::new(
             target,
@@ -494,4 +518,18 @@ fn spawn_reconcile_poll(
 
         async move { poller.run(shutdown).await }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usable_rpc_endpoint;
+
+    #[test]
+    fn rpc_endpoint_urls_must_be_absolute_http_or_https() {
+        assert!(usable_rpc_endpoint("https://eth.example/v1/key"));
+        assert!(usable_rpc_endpoint("http://127.0.0.1:8545"));
+        assert!(!usable_rpc_endpoint("eth.example/v1/key"));
+        assert!(!usable_rpc_endpoint("ftp://eth.example"));
+        assert!(!usable_rpc_endpoint(""));
+    }
 }

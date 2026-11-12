@@ -135,8 +135,14 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   a test recomputes both. Each target's `finality_mode` decides what counts as
   final: `finalized` reads the node's `finalized` tag and falls back to
   `head - finality_depth` only when the provider rejects it, while `depth`
-  always reads `head - finality_depth` and never asks for the tag. A `depth`
-  target with `finality_depth = 0` is rejected when targets load at startup.
+  always reads `head - finality_depth` and never asks for the tag. Each row is
+  parsed and validated before its watcher is spawned: a row with an unknown
+  `finality_mode`, a negative `finality_depth` (or zero in `depth` mode), a
+  non-`u16` Wormhole chain id, a negative `evm_chain_id`, or a bridge address
+  that is not 20-byte hex is skipped and logged with the chain and the reason.
+  The other chains still start, and only a failure to read the rows turns EVM
+  watching off. If every row is invalid, no watcher starts and startup logs an
+  error.
   The watcher advances a persisted cursor per chain in the same transaction that
   stores a range's events. On a cursor-hash mismatch it walks the stored block
   hashes of event-bearing blocks from the cursor down to the rewind bound
@@ -721,7 +727,8 @@ scrape_configs:
 * **Chain registry:** `CHAIN_REGISTRY_REFRESH_SECS` (default 60, min 5).
 * **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
   per chain (suffix is the lowercased `chains.slug`, e.g.
-  `EVM_RPC_ETHEREUM`; a chain without a URL is skipped with a warning).
+  `EVM_RPC_ETHEREUM`; a chain whose URL is missing or is not an absolute
+  http/https URL is skipped with a warning, and the other chains keep running).
   `EVM_RPC_<CHAIN>_FALLBACK` is an optional second endpoint. `EVM_RPS` (5) and
   `EVM_MAX_BLOCK_RANGE` (10) are the defaults for every endpoint;
   `EVM_RPC_<CHAIN>[_FALLBACK]_RPS` and `EVM_RPC_<CHAIN>[_FALLBACK]_MAX_RANGE`
