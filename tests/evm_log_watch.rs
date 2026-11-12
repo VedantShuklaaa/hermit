@@ -437,6 +437,81 @@ async fn ethereum_chain_id(pool: &PgPool) -> i16 {
         .expect("ethereum chain")
 }
 
+/// A writer that keeps everything the test's thread logs, so a skip can be asserted.
+/// `set_default` is thread-local, so concurrent tests do not share it.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("logs").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
+fn log_text(logs: &CapturedLogs) -> String {
+    String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8 logs")
+}
+
+/// The four chains enabled together in the resilience tests. `ethereum` is seeded by
+/// the migrations; the others get a target here.
+const WATCHED_CHAINS: [&str; 4] = ["arbitrum", "avalanche", "base", "ethereum"];
+
+async fn add_watch_targets(pool: &PgPool) {
+    for slug in ["base", "arbitrum", "avalanche"] {
+        sqlx::query(
+            r#"
+            INSERT INTO evm_watch_targets (
+                chain_id, core_bridge_address, token_bridge_address, finality_depth
+            )
+            SELECT id, $1, $2, 64 FROM chains WHERE slug = $3
+            "#,
+        )
+        .bind(CORE)
+        .bind(TOKEN)
+        .bind(slug)
+        .execute(pool)
+        .await
+        .expect("insert watch target");
+    }
+}
+
+async fn set_finality(pool: &PgPool, slug: &str, mode: &str, depth: i64) {
+    sqlx::query(
+        "UPDATE evm_watch_targets
+         SET finality_mode = $1, finality_depth = $2
+         WHERE chain_id = (SELECT id FROM chains WHERE slug = $3)",
+    )
+    .bind(mode)
+    .bind(depth)
+    .bind(slug)
+    .execute(pool)
+    .await
+    .expect("set finality");
+}
+
 async fn wait_until<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,
@@ -1676,9 +1751,10 @@ async fn a_reorg_deeper_than_the_bound_leaves_the_cursor_and_events_alone() {
 }
 
 /// A `depth` target with no depth has no usable finality target, so loading the
-/// targets (watcher startup) rejects it instead of silently reading the head.
+/// targets (watcher startup) skips it instead of silently reading the head. The skip
+/// must not fail the whole load, even when it is the only row.
 #[tokio::test]
-async fn a_depth_target_without_a_positive_depth_fails_at_startup() {
+async fn a_depth_target_without_a_positive_depth_is_skipped_at_startup() {
     let db = common::test_db().await;
     let pool = &db.pool;
     let chain_id = ethereum_chain_id(pool).await;
@@ -1708,11 +1784,111 @@ async fn a_depth_target_without_a_positive_depth_fails_at_startup() {
         .await
         .expect("invalid depth target");
 
-    let error = evm_db::load_targets(pool)
+    let targets = evm_db::load_targets(pool)
         .await
-        .expect_err("depth mode with depth 0 must be rejected");
-    let message = error.to_string();
-    assert!(message.contains("finality_depth"), "{message}");
+        .expect("one bad row must not fail the load");
+    assert!(
+        targets.iter().all(|target| target.chain_id != chain_id),
+        "the depth-0 target must be skipped"
+    );
+}
+
+/// Four targets, one malformed: the other three still load, and the skipped row is
+/// logged with its chain and the reason.
+#[tokio::test]
+async fn one_malformed_target_is_skipped_and_the_rest_still_load() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    add_watch_targets(pool).await;
+    set_finality(pool, "base", "depth", 0).await;
+
+    let (logs, _guard) = capture_logs();
+    let targets = evm_db::load_targets(pool)
+        .await
+        .expect("the bad row must not fail the load");
+
+    let slugs: Vec<&str> = targets.iter().map(|target| target.slug.as_str()).collect();
+    assert_eq!(targets.len(), 3, "three valid targets: {slugs:?}");
+    assert!(
+        !slugs.contains(&"base"),
+        "the malformed row must be skipped"
+    );
+    for slug in ["arbitrum", "avalanche", "ethereum"] {
+        assert!(slugs.contains(&slug), "{slug} must still load: {slugs:?}");
+    }
+
+    let logs = log_text(&logs);
+    assert!(logs.contains("base"), "the log must name the chain: {logs}");
+    assert!(
+        logs.contains("finality_depth"),
+        "the log must carry the reason: {logs}"
+    );
+}
+
+/// The same result whether the malformed row sorts first (`arbitrum`) or last
+/// (`ethereum`): the other three chains still load.
+#[tokio::test]
+async fn a_malformed_target_is_skipped_first_or_last() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    add_watch_targets(pool).await;
+
+    // `arbitrum` is first in the loader's slug order.
+    set_finality(pool, "arbitrum", "depth", 0).await;
+    let first = evm_db::load_targets(pool).await.expect("load targets");
+    assert_eq!(first.len(), 3, "three targets with the first row bad");
+    assert!(!first.iter().any(|target| target.slug == "arbitrum"));
+
+    // Move the fault to `ethereum`, which is last in the slug order.
+    set_finality(pool, "arbitrum", "finalized", 64).await;
+    set_finality(pool, "ethereum", "depth", 0).await;
+    let last = evm_db::load_targets(pool).await.expect("load targets");
+    assert_eq!(last.len(), 3, "three targets with the last row bad");
+    assert!(!last.iter().any(|target| target.slug == "ethereum"));
+    assert!(last.iter().any(|target| target.slug == "base"));
+}
+
+/// Every row malformed: no target loads, the load does not abort or panic, and the
+/// fully broken configuration is logged as an error.
+#[tokio::test]
+async fn every_malformed_target_starts_no_watcher() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    add_watch_targets(pool).await;
+    for slug in WATCHED_CHAINS {
+        set_finality(pool, slug, "depth", 0).await;
+    }
+
+    let (logs, _guard) = capture_logs();
+    let targets = evm_db::load_targets(pool)
+        .await
+        .expect("an all-invalid set must not fail the load");
+    assert!(targets.is_empty(), "no watcher may start");
+
+    let logs = log_text(&logs);
+    assert!(
+        logs.contains("no EVM watcher will start"),
+        "the all-invalid set must be logged: {logs}"
+    );
+}
+
+/// Valid rows behave exactly as before: all four load with their own finality.
+#[tokio::test]
+async fn valid_targets_load_unchanged() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    add_watch_targets(pool).await;
+
+    let targets = evm_db::load_targets(pool).await.expect("load targets");
+    let mut slugs: Vec<&str> = targets.iter().map(|target| target.slug.as_str()).collect();
+    slugs.sort_unstable();
+    assert_eq!(slugs, WATCHED_CHAINS);
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.finality_mode == FinalityMode::Finalized)
+    );
+    assert!(targets.iter().all(|target| target.finality_depth == 64));
 }
 
 #[tokio::test]

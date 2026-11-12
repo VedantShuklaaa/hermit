@@ -19,7 +19,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Area | State |
 | --- | --- |
 | Wormhole Token Bridge | Outbound sends indexed chain-first and start `Pending` (Solana data alone; EVM logs and WormholeScan enrich). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
-| EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan |
+| EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan. A bad chain row or RPC URL is skipped and logged, leaving the other chains watching |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
 | Chains | DB-backed registry, refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Unknown chains stored as unresolved |

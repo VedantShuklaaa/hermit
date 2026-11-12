@@ -1,7 +1,7 @@
 //! Postgres side of EVM watching: targets, the persisted cursor, stored events and
 //! the event-side join to `bridge_transfers`.
 
-use super::decode::EventKind;
+use super::decode::{EventKind, pad_address};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -50,12 +50,28 @@ pub struct WatchTarget {
 impl WatchTarget {
     /// A `depth` target without a positive depth has no usable finality target, so
     /// startup must reject it instead of reading unfinalized blocks. The migration's
-    /// CHECK only constrains the mode name; the depth rule needs this check.
+    /// CHECK only constrains the mode name; the depth rule needs this check. The
+    /// address shape is checked here too, so a row that predates the CHECK (or a
+    /// database where it was dropped) is skipped rather than failing every poll.
     pub fn validate(&self) -> Result<()> {
         if self.finality_mode == FinalityMode::Depth && self.finality_depth == 0 {
             bail!(
                 "evm_watch_targets row for chain '{}' uses finality_mode='depth' but finality_depth is 0; \
                  set finality_depth > 0 or use finality_mode='finalized'",
+                self.slug
+            );
+        }
+        if pad_address(&self.core_bridge_address).is_none() {
+            bail!(
+                "evm_watch_targets row for chain '{}' has an invalid core_bridge_address; \
+                 expected a 20-byte hex address",
+                self.slug
+            );
+        }
+        if pad_address(&self.token_bridge_address).is_none() {
+            bail!(
+                "evm_watch_targets row for chain '{}' has an invalid token_bridge_address; \
+                 expected a 20-byte hex address",
                 self.slug
             );
         }
@@ -98,8 +114,13 @@ type TargetRow = (
     Option<i64>,
 );
 
-/// Enabled targets, joined to the active Wormhole chain mapping. A target whose
-/// mapping is not a u16 is skipped with a warning rather than failing the load.
+/// Enabled targets, joined to the active Wormhole chain mapping.
+///
+/// A row that fails to parse or validate is skipped with a warning naming the chain
+/// and the reason, so one bad row cannot stop the other chains. Only failing to read
+/// the rows is an error. When every row is skipped the caller gets an empty list and
+/// the event is logged as an error, so a fully broken configuration is not mistaken
+/// for "no chains configured".
 pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
     let rows: Vec<TargetRow> = sqlx::query_as(
         r#"
@@ -126,34 +147,66 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
     .await?;
 
     let mut targets = Vec::with_capacity(rows.len());
-    for (chain_id, slug, wormhole_id, core, token, finality_mode, finality_depth, evm_chain_id) in
-        rows
-    {
-        let Ok(wormhole_chain_id) = wormhole_id.parse::<u16>() else {
-            tracing::warn!(%slug, %wormhole_id, "skipping EVM target with a non-u16 Wormhole chain id");
-            continue;
-        };
-        let finality_mode = FinalityMode::parse(&finality_mode).ok_or_else(|| {
-            anyhow::anyhow!(
-                "evm_watch_targets row for chain '{slug}' has unknown finality_mode '{finality_mode}'"
-            )
-        })?;
-        let target = WatchTarget {
-            chain_id,
-            slug,
-            wormhole_chain_id,
-            core_bridge_address: core,
-            token_bridge_address: token,
-            finality_mode,
-            finality_depth: u64::try_from(finality_depth).unwrap_or(0),
-            evm_chain_id: evm_chain_id.and_then(|id| u64::try_from(id).ok()),
-        };
-        // Startup validation: a depth target with no depth cannot produce a
-        // finality target, so refuse the configuration instead of reading head.
-        target.validate()?;
-        targets.push(target);
+    let mut skipped = 0usize;
+    for row in rows {
+        let slug = row.1.clone();
+        match target_from_row(row) {
+            Ok(target) => targets.push(target),
+            Err(error) => {
+                skipped += 1;
+                tracing::warn!(chain = %slug, %error, "skipping invalid EVM watch target");
+            }
+        }
+    }
+
+    if targets.is_empty() && skipped > 0 {
+        tracing::error!(
+            skipped,
+            "every enabled EVM watch target was invalid; no EVM watcher will start"
+        );
     }
     Ok(targets)
+}
+
+/// Parses and validates one queried row. A failure is the reason the row is skipped;
+/// it never becomes a load error.
+fn target_from_row(
+    (
+        chain_id,
+        slug,
+        wormhole_id,
+        core,
+        token,
+        finality_mode,
+        finality_depth,
+        evm_chain_id,
+    ): TargetRow,
+) -> Result<WatchTarget> {
+    let wormhole_chain_id = wormhole_id
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("Wormhole chain id '{wormhole_id}' is not a u16"))?;
+    let finality_mode = FinalityMode::parse(&finality_mode)
+        .ok_or_else(|| anyhow::anyhow!("unknown finality_mode '{finality_mode}'"))?;
+    let finality_depth = u64::try_from(finality_depth)
+        .map_err(|_| anyhow::anyhow!("negative finality_depth {finality_depth}"))?;
+    let evm_chain_id = match evm_chain_id {
+        Some(id) => {
+            Some(u64::try_from(id).map_err(|_| anyhow::anyhow!("negative evm_chain_id {id}"))?)
+        }
+        None => None,
+    };
+    let target = WatchTarget {
+        chain_id,
+        slug,
+        wormhole_chain_id,
+        core_bridge_address: core,
+        token_bridge_address: token,
+        finality_mode,
+        finality_depth,
+        evm_chain_id,
+    };
+    target.validate()?;
+    Ok(target)
 }
 
 pub async fn load_cursor(pool: &PgPool, chain_id: i16) -> Result<Option<Cursor>> {
@@ -572,4 +625,89 @@ pub async fn lookup_redeem_tx(
     .bind(sequence.to_string())
     .fetch_optional(pool)
     .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row() -> TargetRow {
+        (
+            3,
+            "base".to_string(),
+            "30".to_string(),
+            "0x98f3c9e6E3fAce36bAAd05FE09d375Ef1464288B".to_string(),
+            "0x3ee18B2214AFF97000D974cf647E7C347E8fa585".to_string(),
+            "finalized".to_string(),
+            64,
+            Some(8453),
+        )
+    }
+
+    #[test]
+    fn a_valid_row_parses() {
+        let target = target_from_row(row()).expect("valid row");
+        assert_eq!(target.slug, "base");
+        assert_eq!(target.wormhole_chain_id, 30);
+        assert_eq!(target.finality_mode, FinalityMode::Finalized);
+        assert_eq!(target.finality_depth, 64);
+        assert_eq!(target.evm_chain_id, Some(8453));
+    }
+
+    #[test]
+    fn a_non_u16_wormhole_id_is_rejected() {
+        let mut bad = row();
+        bad.2 = "70000".to_string();
+        let error = target_from_row(bad).expect_err("70000 is not a u16");
+        assert!(error.to_string().contains("Wormhole chain id"));
+    }
+
+    #[test]
+    fn an_unknown_finality_mode_is_rejected() {
+        let mut bad = row();
+        bad.5 = "safe".to_string();
+        let error = target_from_row(bad).expect_err("unknown mode");
+        assert!(error.to_string().contains("finality_mode"));
+    }
+
+    #[test]
+    fn a_depth_target_without_depth_is_rejected() {
+        let mut bad = row();
+        bad.5 = "depth".to_string();
+        bad.6 = 0;
+        let error = target_from_row(bad).expect_err("depth 0");
+        assert!(error.to_string().contains("finality_depth"));
+    }
+
+    #[test]
+    fn a_negative_depth_is_rejected() {
+        let mut bad = row();
+        bad.6 = -1;
+        let error = target_from_row(bad).expect_err("negative depth");
+        assert!(error.to_string().contains("finality_depth"));
+    }
+
+    #[test]
+    fn a_bad_core_bridge_address_is_rejected() {
+        let mut bad = row();
+        bad.3 = "0x1234".to_string();
+        let error = target_from_row(bad).expect_err("bad core bridge address");
+        assert!(error.to_string().contains("core_bridge_address"));
+    }
+
+    #[test]
+    fn a_bad_token_bridge_address_is_rejected() {
+        let mut bad = row();
+        bad.4 = "not-an-address".to_string();
+        let error = target_from_row(bad).expect_err("bad token bridge address");
+        assert!(error.to_string().contains("token_bridge_address"));
+    }
+
+    #[test]
+    fn a_negative_evm_chain_id_is_rejected() {
+        let mut bad = row();
+        bad.7 = Some(-1);
+        let error = target_from_row(bad).expect_err("negative EVM chain id");
+        assert!(error.to_string().contains("evm_chain_id"));
+    }
 }
