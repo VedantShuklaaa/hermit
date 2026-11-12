@@ -2,7 +2,7 @@
 
 Detailed notes moved out of the README. Start with [README.md](../README.md).
 
-Contents: [Domain model](#domain-model-and-implementation-notes) · [Project structure](#project-structure-full) · [Read path](#read-path) · [Reliability](#reliability-properties) · [API details](#api-details) · [Operations](#operations) · [Testing detail](#testing-detail) · [Roadmap](#roadmap) · [Benchmarks](#benchmarks)
+Contents: [Domain model](#domain-model-and-implementation-notes) · [Project structure](#project-structure-full) · [Read path](#read-path) · [Reliability](#reliability-properties) · [Known limitations](#known-limitations) · [API details](#api-details) · [Operations](#operations) · [Testing detail](#testing-detail) · [Roadmap](#roadmap) · [Benchmarks](#benchmarks)
 
 ***
 
@@ -483,6 +483,12 @@ and the miss is not cached, so a later request retries.
   for the first token of a message, but `Overloaded` is transient, so the
   message stays pending and recovery redelivers it. The wait must stay well
   below the reclaim idle time (5 min).
+
+***
+
+## Known limitations
+
+* **An orphaned join stays.** A hash or `Completed` status written from an event that a reorg later deletes is never cleared; a generous `finality_depth` is the mitigation.
 
 ***
 
