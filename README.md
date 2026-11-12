@@ -169,7 +169,7 @@ Per-file coverage: [reference](docs/REFERENCE.md#testing-detail).
 | 3 | Scale the API | 3b, 3c, 3e, 3f, 3g, perf-1, perf-2 done. 3a, 3d open |
 | 4 | WebSocket stream recall/precision | 4a to 4g done |
 | B+ | One protocol per phase | Not started |
-| E | EVM coverage (separate checklist) | E0 to E2 done; E3 open |
+| E | EVM coverage (separate checklist) | E0 to E3 done; E4 open |
 
 Each checkpoint: branch, tests/fixtures, benchmark, Results row, PR, tag, deploy,
 re-run on EC2. The full checklist is in the [reference](docs/REFERENCE.md#roadmap);

@@ -396,6 +396,148 @@ async fn real_mainnet_redeem_decodes() {
     assert_eq!(redeem.emitter_address, want_emitter);
 }
 
+fn fixture_result(name: &str) -> (u64, Value) {
+    let value = fixture(name)["result"][0].clone();
+    let block = value["blockNumber"]
+        .as_str()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        .expect("fixture block number");
+    (block, value)
+}
+
+/// The fixtures in this test were captured on 2026-11-13 with free public
+/// endpoints: `base-rpc.publicnode.com`, `arb1.arbitrum.io/rpc`,
+/// `api.avax.network` and `avalanche-c-chain-rpc.publicnode.com`. Each send is a
+/// Core Bridge `LogMessagePublished` whose
+/// indexed sender is the chain's Token Bridge; each redeem is a Token Bridge
+/// `TransferRedeemed`. Both are decoded through the same client path the watcher
+/// uses, including the raw JSON parsing.
+async fn assert_real_capture_decodes(chain: &str, wormhole_id: u16, core: &str, token: &str) {
+    let (send_block, send_raw) = fixture_result(&format!("evm_{chain}_log_message_published.json"));
+    let (redeem_block, redeem_raw) = fixture_result(&format!("evm_{chain}_transfer_redeemed.json"));
+    let from = send_block.min(redeem_block);
+    let to = send_block.max(redeem_block);
+
+    let state = Arc::new(StubState {
+        logs: vec![send_raw.clone(), redeem_raw.clone()],
+        ..Default::default()
+    });
+    let url = stub(state).await;
+    let client = EvmClient::new(reqwest::Client::new(), url, limiter());
+    let logs = client
+        .logs(
+            from,
+            to,
+            &[core, token],
+            &[
+                decode::LOG_MESSAGE_PUBLISHED_TOPIC,
+                decode::TRANSFER_REDEEMED_TOPIC,
+            ],
+        )
+        .await
+        .expect("logs");
+    assert_eq!(logs.len(), 2, "{chain}: both fixtures should be served");
+
+    let send = logs
+        .iter()
+        .find(|log| {
+            log.topics
+                .first()
+                .is_some_and(|topic| topic.as_str() == decode::LOG_MESSAGE_PUBLISHED_TOPIC)
+        })
+        .expect("send log");
+    let redeem = logs
+        .iter()
+        .find(|log| {
+            log.topics
+                .first()
+                .is_some_and(|topic| topic.as_str() == decode::TRANSFER_REDEEMED_TOPIC)
+        })
+        .expect("redeem log");
+
+    assert_eq!(
+        send.address.to_ascii_lowercase(),
+        core.to_ascii_lowercase(),
+        "{chain}: send comes from the Core Bridge"
+    );
+    assert_eq!(
+        send.topics[1].trim_start_matches("0x"),
+        decode::pad_address(token).expect("token bridge address"),
+        "{chain}: the indexed sender is the Token Bridge"
+    );
+    assert_eq!(
+        redeem.address.to_ascii_lowercase(),
+        token.to_ascii_lowercase(),
+        "{chain}: redeem comes from the Token Bridge"
+    );
+    assert_eq!(send.tx_hash.len(), 66, "{chain}: real send tx hash");
+    assert_eq!(redeem.tx_hash.len(), 66, "{chain}: real redeem tx hash");
+    assert_eq!(
+        send.tx_hash,
+        send_raw["transactionHash"].as_str().unwrap(),
+        "{chain}"
+    );
+    assert_eq!(
+        redeem.tx_hash,
+        redeem_raw["transactionHash"].as_str().unwrap(),
+        "{chain}"
+    );
+
+    let decoded_send = decode::decode_log(send, wormhole_id, core, token).expect("send decodes");
+    assert_eq!(decoded_send.event_kind, EventKind::LogMessagePublished);
+    assert_eq!(decoded_send.emitter_chain, wormhole_id);
+    assert_eq!(
+        decoded_send.emitter_address,
+        decode::pad_address(token).expect("token bridge address")
+    );
+    let send_sequence = u64::from_be_bytes(send.data[24..32].try_into().expect("sequence word"));
+    assert_eq!(decoded_send.sequence, send_sequence, "{chain}");
+
+    let decoded_redeem =
+        decode::decode_log(redeem, wormhole_id, core, token).expect("redeem decodes");
+    assert_eq!(decoded_redeem.event_kind, EventKind::TransferRedeemed);
+    let chain_topic = redeem.topics[1].trim_start_matches("0x");
+    let want_chain =
+        u16::from_str_radix(&chain_topic[chain_topic.len() - 4..], 16).expect("emitter chain");
+    let want_emitter = redeem.topics[2]
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
+    let sequence_topic = redeem.topics[3].trim_start_matches("0x");
+    let want_sequence =
+        u64::from_str_radix(&sequence_topic[sequence_topic.len() - 16..], 16).expect("sequence");
+    assert_eq!(decoded_redeem.emitter_chain, want_chain, "{chain}");
+    assert_eq!(decoded_redeem.emitter_address, want_emitter, "{chain}");
+    assert_eq!(decoded_redeem.sequence, want_sequence, "{chain}");
+}
+
+#[tokio::test]
+async fn real_captures_decode_for_base_arbitrum_and_avalanche() {
+    let cases = [
+        (
+            "base",
+            30,
+            "0xbebdb6C8ddC678FfA9f8748f85C815C556Dd8ac6",
+            "0x8d2de8d2f73F1F4cAB472AC9A881C9b123C79627",
+        ),
+        (
+            "arbitrum",
+            23,
+            "0xa5f208e072434bC67592E4C49C1B991BA79BCA46",
+            "0x0b2402144Bb366A632D14B83F244D2e0e21bD39c",
+        ),
+        (
+            "avalanche",
+            6,
+            "0x54a8e5f9c4CbA08F9943965859F6c34eAF03E26c",
+            "0x0e082F06FF657D94310cB8cE8B0D9a04541d8052",
+        ),
+    ];
+
+    for (chain, wormhole_id, core, token) in cases {
+        assert_real_capture_decodes(chain, wormhole_id, core, token).await;
+    }
+}
+
 fn decoded(
     direction: Direction,
     emitter_chain: u16,
@@ -475,8 +617,10 @@ fn log_text(logs: &CapturedLogs) -> String {
     String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8 logs")
 }
 
-/// The four chains enabled together in the resilience tests. `ethereum` is seeded by
-/// the migrations; the others get a target here.
+/// The four chains enabled together in the resilience tests. All four are seeded by
+/// the migrations; this helper rewrites the three added rows to the stub's shared
+/// Ethereum addresses, depth and no chain-id check, so the loopback node behaves as
+/// it did before E3.
 const WATCHED_CHAINS: [&str; 4] = ["arbitrum", "avalanche", "base", "ethereum"];
 
 async fn add_watch_targets(pool: &PgPool) {
@@ -484,9 +628,16 @@ async fn add_watch_targets(pool: &PgPool) {
         sqlx::query(
             r#"
             INSERT INTO evm_watch_targets (
-                chain_id, core_bridge_address, token_bridge_address, finality_depth
+                chain_id, core_bridge_address, token_bridge_address,
+                finality_depth, finality_mode, evm_chain_id
             )
-            SELECT id, $1, $2, 64 FROM chains WHERE slug = $3
+            SELECT id, $1, $2, 64, 'finalized', NULL FROM chains WHERE slug = $3
+            ON CONFLICT (chain_id) DO UPDATE
+            SET core_bridge_address = EXCLUDED.core_bridge_address,
+                token_bridge_address = EXCLUDED.token_bridge_address,
+                finality_depth = EXCLUDED.finality_depth,
+                finality_mode = EXCLUDED.finality_mode,
+                evm_chain_id = EXCLUDED.evm_chain_id
             "#,
         )
         .bind(CORE)
@@ -494,7 +645,7 @@ async fn add_watch_targets(pool: &PgPool) {
         .bind(slug)
         .execute(pool)
         .await
-        .expect("insert watch target");
+        .expect("upsert watch target");
     }
 }
 
@@ -1889,6 +2040,63 @@ async fn valid_targets_load_unchanged() {
             .all(|target| target.finality_mode == FinalityMode::Finalized)
     );
     assert!(targets.iter().all(|target| target.finality_depth == 64));
+}
+
+/// The E3 migration, not the test helper: all three added chains carry the
+/// verified addresses, Wormhole and EVM chain ids, finality mode and fallback
+/// depths.
+#[tokio::test]
+async fn migration_seeds_the_three_added_chains() {
+    let db = common::test_db().await;
+    let targets = evm_db::load_targets(&db.pool).await.expect("load targets");
+
+    let cases = [
+        (
+            "base",
+            30,
+            8453,
+            "0xbebdb6C8ddC678FfA9f8748f85C815C556Dd8ac6",
+            "0x8d2de8d2f73F1F4cAB472AC9A881C9b123C79627",
+            6500,
+        ),
+        (
+            "arbitrum",
+            23,
+            42161,
+            "0xa5f208e072434bC67592E4C49C1B991BA79BCA46",
+            "0x0b2402144Bb366A632D14B83F244D2e0e21bD39c",
+            5000,
+        ),
+        (
+            "avalanche",
+            6,
+            43114,
+            "0x54a8e5f9c4CbA08F9943965859F6c34eAF03E26c",
+            "0x0e082F06FF657D94310cB8cE8B0D9a04541d8052",
+            32,
+        ),
+    ];
+
+    for (slug, wormhole_id, evm_chain_id, core, token, depth) in cases {
+        let target = targets
+            .iter()
+            .find(|target| target.slug == slug)
+            .unwrap_or_else(|| panic!("{slug} must be seeded"));
+        assert_eq!(target.wormhole_chain_id, wormhole_id, "{slug}");
+        assert_eq!(target.evm_chain_id, Some(evm_chain_id), "{slug}");
+        assert_eq!(
+            target.core_bridge_address.to_ascii_lowercase(),
+            core.to_ascii_lowercase(),
+            "{slug}"
+        );
+        assert_eq!(
+            target.token_bridge_address.to_ascii_lowercase(),
+            token.to_ascii_lowercase(),
+            "{slug}"
+        );
+        assert_eq!(target.finality_mode, FinalityMode::Finalized, "{slug}");
+        assert_eq!(target.finality_depth, depth, "{slug}");
+    }
 }
 
 #[tokio::test]
