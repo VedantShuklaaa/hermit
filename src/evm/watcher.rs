@@ -11,9 +11,16 @@
 //! answers the tag, else `head - finality_depth`. A target in `depth` mode always reads
 //! `head - finality_depth` and never asks for the tag. Only blocks at or below the
 //! target are read, so a reorg below it is not expected. The cursor's block hash is
-//! still checked every poll; a mismatch walks stored event block hashes back to the
-//! deepest block that no longer matches, deletes the stale events and rewinds the
-//! cursor below that block in one transaction, bounded by the target's finality window.
+//! still checked every poll. A mismatch walks the stored event block hashes down from
+//! the cursor to the target's rewind bound and looks for the newest checkpoint whose
+//! hash still matches the chain. That checkpoint proves every block at or below it is
+//! canonical, so the cursor rewinds to it and every event above it is deleted in one
+//! transaction. Rewinding to a matching checkpoint, rather than to the lowest stale
+//! event block, re-reads the whole region that may have changed, including blocks that
+//! stored no hash. When no stored checkpoint within the bound matches, the window floor
+//! (the existing depth/128-block bound) is the conservative rewind point; if the floor
+//! itself is a stale checkpoint, the reorg is deeper than the bound and the poll fails
+//! without touching the cursor or the stored events.
 
 use super::client::{Block, EvmClient, Log};
 use super::db::{self, Cursor, FinalityMode, NewEvent, WatchTarget};
@@ -61,7 +68,11 @@ struct Rewind {
     delete_from: u64,
     rewound_to: u64,
     removed: u64,
-    bound_hit: bool,
+    /// The stored checkpoint the cursor landed on, when one still matched the chain.
+    matched: Option<u64>,
+    /// Set when no stored checkpoint matched and the window floor was used as the
+    /// conservative rewind point.
+    used_floor: bool,
 }
 
 #[derive(Clone)]
@@ -320,8 +331,9 @@ impl EvmWatcher {
                 delete_from = rewind.delete_from,
                 removed = rewind.removed,
                 rewound_to = rewind.rewound_to,
-                bound_hit = rewind.bound_hit,
-                "EVM reorg detected, dropped stale events and rewound below the deepest mismatch"
+                matched = ?rewind.matched,
+                used_floor = rewind.used_floor,
+                "EVM reorg detected, dropped stale events and rewound to the last matching checkpoint"
             );
             return Ok(());
         }
@@ -421,11 +433,20 @@ impl EvmWatcher {
         Ok(())
     }
 
-    /// Walks the stored block hashes of event-bearing blocks from the cursor down to
-    /// the target's finality window and compares each with the chain. The lowest
-    /// checkpoint whose hash no longer matches is the deepest stale event block; with
-    /// no such checkpoint the cursor block itself is the only known mismatch. If the
-    /// walk reaches the floor while still mismatching, the floor is the bound.
+    /// Finds a rewind point that re-reads the whole region a reorg may have changed.
+    ///
+    /// The cursor block itself is a known mismatch. Walking the stored event block
+    /// hashes newest first, the first checkpoint whose hash still matches proves the
+    /// fork is above it: a chain's ancestors are unchanged once a block matches, so
+    /// every block at or below that checkpoint is canonical. Rewinding there, instead
+    /// of to the lowest stale event block, re-reads the gap between the real fork and
+    /// that stale block, including blocks that never stored a hash.
+    ///
+    /// When no stored checkpoint inside the bound still matches, the window floor is
+    /// used as a conservative margin. If the floor itself is a stored checkpoint that
+    /// no longer matches, the fork is at or below the floor and the bound cannot
+    /// establish a safe rewind point: this returns an error and leaves the cursor and
+    /// the stored events untouched, so a deeper reorg is never silently skipped.
     async fn rewind_after_reorg(&mut self, cursor: &Cursor) -> Result<Rewind, AppError> {
         let bound = match self.target.finality_mode {
             FinalityMode::Depth => self.target.finality_depth.max(1),
@@ -441,31 +462,94 @@ impl EvmWatcher {
         )
         .await?;
 
-        let mut deepest = cursor.block_number;
+        let mut matched = None;
+        let mut lowest_mismatch = cursor.block_number;
+        let mut checked = 0usize;
+
         for (number, hash) in checkpoints {
+            checked += 1;
             let canonical = self
                 .call_endpoints(|client| Box::pin(client.block_by_number(number)))
                 .await?;
             if canonical.hash == hash {
-                // The fork is above this block; a chain's ancestors are unchanged
-                // once a block matches, so there is nothing deeper to compare.
+                matched = Some((number, canonical.hash));
                 break;
             }
-            deepest = number;
+            lowest_mismatch = number;
         }
 
-        let bound_hit = floor < cursor.block_number && deepest <= floor;
-        let delete_from = if bound_hit { floor } else { deepest };
-        let rewound_to = delete_from.saturating_sub(1);
-        let previous = self
-            .call_endpoints(|client| Box::pin(client.block_by_number(rewound_to)))
-            .await?;
+        let (delete_from, rewound_to, rewound_hash, matched_block, used_floor) = match matched {
+            Some((number, hash)) => (number + 1, number, hash, Some(number), false),
+            None if checked == 0 => {
+                // Nothing below the cursor stored a hash, so the cursor block is the
+                // only known stale block. Re-reading it is the whole affected region.
+                if cursor.block_number == 0 {
+                    tracing::error!(
+                        chain = %self.target.slug,
+                        "EVM reorg reported at genesis with no stored checkpoint to rewind to"
+                    );
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "EVM reorg on chain {} was reported at genesis with no stored checkpoint to rewind to",
+                        self.target.slug
+                    )));
+                }
+                let previous = self
+                    .call_endpoints(|client| {
+                        Box::pin(client.block_by_number(cursor.block_number - 1))
+                    })
+                    .await?;
+                (
+                    cursor.block_number,
+                    cursor.block_number - 1,
+                    previous.hash,
+                    None,
+                    false,
+                )
+            }
+            None => {
+                // No stored checkpoint inside the bound still matches. If the floor
+                // is itself stale, the fork is at or below it and a rewind above the
+                // floor would silently skip canonical events below the fork.
+                if floor > 0 && lowest_mismatch <= floor {
+                    tracing::error!(
+                        chain = %self.target.slug,
+                        cursor = cursor.block_number,
+                        lowest_mismatch,
+                        floor,
+                        bound,
+                        "EVM reorg is deeper than the rewind bound, refusing to move the cursor"
+                    );
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "EVM reorg on chain {} is deeper than the {}-block rewind bound: \
+                         the stored block at {} no longer matches and the cursor stays at {}",
+                        self.target.slug,
+                        bound,
+                        lowest_mismatch,
+                        cursor.block_number
+                    )));
+                }
+                // Conservative margin: rewind to the floor of the window and re-read
+                // it. Genesis cannot be replaced, so at floor 0 it is the safe point.
+                if floor == 0 {
+                    let genesis = self
+                        .call_endpoints(|client| Box::pin(client.block_by_number(0)))
+                        .await?;
+                    (1, 0, genesis.hash, None, true)
+                } else {
+                    let previous = self
+                        .call_endpoints(|client| Box::pin(client.block_by_number(floor - 1)))
+                        .await?;
+                    (floor, floor - 1, previous.hash, None, true)
+                }
+            }
+        };
+
         let removed = db::rewind_after_reorg(
             &self.pool,
             self.target.chain_id,
             delete_from,
             rewound_to,
-            &previous.hash,
+            &rewound_hash,
         )
         .await?;
 
@@ -473,7 +557,8 @@ impl EvmWatcher {
             delete_from,
             rewound_to,
             removed,
-            bound_hit,
+            matched: matched_block,
+            used_floor,
         })
     }
 

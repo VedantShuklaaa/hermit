@@ -1425,6 +1425,256 @@ async fn a_one_block_reorg_still_rewinds_one_block() {
     );
 }
 
+/// A reorg with no stored hashes between the real fork and the lowest stale event
+/// block: the walk must land on the last matching checkpoint, so the canonical events
+/// that sit in the unhashed gap are re-read instead of being skipped forever.
+#[tokio::test]
+async fn a_reorg_recovers_canonical_events_from_blocks_with_no_stored_hash() {
+    const FORK: u64 = 18_000_000;
+    const MATCHING: u64 = 17_999_990;
+    const LOWEST_STALE: u64 = 18_000_010;
+    const CURSOR: u64 = 18_000_020;
+    const TARGET: u64 = 18_000_021;
+    const STALE_LOW: &str = "stale-lowest";
+    const STALE_CURSOR: &str = "stale-cursor";
+    const KEPT: &str = "kept-before-fork";
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+
+    // The old chain: an event before the fork (still canonical), the lowest stale
+    // event block, and one at the cursor. Nothing is stored between the fork and
+    // `LOWEST_STALE`, so that range has no stored hashes at all.
+    evm_db::insert_events_and_advance(
+        pool,
+        chain_id,
+        &[
+            stale_event(MATCHING, KEPT),
+            stale_event(LOWEST_STALE, STALE_LOW),
+            stale_event(CURSOR, STALE_CURSOR),
+        ],
+        CURSOR,
+        &hash_for(CURSOR),
+    )
+    .await
+    .expect("old-chain events");
+
+    let state = Arc::new(StubState {
+        logs: captured_logs(),
+        target_block: Some(TARGET),
+        fork_block: Some(FORK),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 100)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Finalized,
+        64,
+        1,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    wait_until("the unhashed gap to be re-read", || {
+        let pool = pool.clone();
+        async move {
+            let hashes = event_tx_hashes(&pool).await;
+            cursor_block(&pool, chain_id).await == Some(TARGET as i64)
+                && hashes.contains(&KEPT.to_string())
+                && hashes.contains(&SEND_TX.to_string())
+                && hashes.contains(&REDEEM_TX.to_string())
+                && !hashes.contains(&STALE_LOW.to_string())
+                && !hashes.contains(&STALE_CURSOR.to_string())
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    // The canonical fixtures at FORK and FORK+1 live inside the gap, so old code
+    // that rewound only to `LOWEST_STALE` would have missed them.
+    let events: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT block_number, tx_hash FROM evm_log_events ORDER BY block_number, log_index",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("events");
+    assert_eq!(
+        events,
+        vec![
+            (MATCHING as i64, KEPT.to_string()),
+            (FORK as i64, SEND_TX.to_string()),
+            ((FORK + 1) as i64, REDEEM_TX.to_string()),
+        ]
+    );
+
+    // Re-reading the region must not duplicate an event already stored.
+    let duplicates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) - COUNT(DISTINCT (chain_id, tx_hash, log_index)) FROM evm_log_events",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("duplicate count");
+    assert_eq!(duplicates, 0);
+}
+
+/// A rewind never goes deeper than the finality bound: with no matching checkpoint
+/// the cursor stops at the floor, not below it.
+#[tokio::test]
+async fn a_rewind_stops_at_the_finality_bound() {
+    const DEPTH: u64 = 16;
+    const STALE: u64 = CURSOR_BLOCK - 2;
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    let floor = CURSOR_BLOCK - DEPTH;
+
+    // The only stored checkpoint is inside the window and stale; there is no
+    // matching checkpoint to land on.
+    evm_db::insert_events_and_advance(
+        pool,
+        chain_id,
+        &[stale_event(STALE, "stale-in-window")],
+        CURSOR_BLOCK,
+        &hash_for(CURSOR_BLOCK),
+    )
+    .await
+    .expect("old-chain events");
+
+    let state = Arc::new(StubState {
+        fork_block: Some(STALE),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 10)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Depth,
+        DEPTH,
+        60,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    wait_until("the rewind to stop at the window floor", || {
+        let pool = pool.clone();
+        async move { cursor_block(&pool, chain_id).await == Some((floor - 1) as i64) }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let cursor: (i64, String) = sqlx::query_as(
+        "SELECT block_number, block_hash FROM evm_watch_cursors WHERE chain_id = $1",
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await
+    .expect("cursor");
+    assert_eq!(cursor.0, (floor - 1) as i64);
+    assert_eq!(cursor.1, hash_for(floor - 1));
+
+    // Events at and above the floor are gone; the re-read starts at the floor.
+    let events: Vec<(i64, String)> =
+        sqlx::query_as("SELECT block_number, tx_hash FROM evm_log_events ORDER BY block_number")
+            .fetch_all(pool)
+            .await
+            .expect("events");
+    assert!(events.is_empty(), "{events:?}");
+}
+
+/// A reorg deeper than the bound cannot be resolved with the stored checkpoints:
+/// the poll must fail without deleting events or moving the cursor, so canonical
+/// events below the floor are never silently skipped.
+#[tokio::test]
+async fn a_reorg_deeper_than_the_bound_leaves_the_cursor_and_events_alone() {
+    const DEPTH: u64 = 16;
+    const STALE_FLOOR_HASH: &str =
+        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    let floor = CURSOR_BLOCK - DEPTH;
+
+    let mut checkpoint = stale_event(floor, "stale-at-floor");
+    checkpoint.block_hash = STALE_FLOOR_HASH.to_string();
+    evm_db::insert_events_and_advance(
+        pool,
+        chain_id,
+        &[checkpoint],
+        CURSOR_BLOCK,
+        &hash_for(CURSOR_BLOCK),
+    )
+    .await
+    .expect("old-chain events");
+
+    // The fork is at the window floor, so the stored checkpoint at the floor no
+    // longer matches and the fork may reach below the bound.
+    let state = Arc::new(StubState {
+        fork_block: Some(floor),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 10)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Depth,
+        DEPTH,
+        1,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    wait_until("the walk to inspect the floor checkpoint", || {
+        let state = state.clone();
+        async move {
+            state
+                .block_tags
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|tag| tag == &format!("0x{floor:x}"))
+        }
+    })
+    .await;
+    // Give any wrongly-accepted rewind time to delete events and move the cursor.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let cursor: (i64, String) = sqlx::query_as(
+        "SELECT block_number, block_hash FROM evm_watch_cursors WHERE chain_id = $1",
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await
+    .expect("cursor");
+    assert_eq!(cursor.0, CURSOR_BLOCK as i64, "the cursor did not move");
+    assert_eq!(cursor.1, hash_for(CURSOR_BLOCK));
+
+    let events: Vec<(i64, String)> =
+        sqlx::query_as("SELECT block_number, tx_hash FROM evm_log_events ORDER BY block_number")
+            .fetch_all(pool)
+            .await
+            .expect("events");
+    assert_eq!(
+        events,
+        vec![(floor as i64, "stale-at-floor".to_string())],
+        "no event was deleted"
+    );
+    assert!(
+        state.spans.lock().unwrap().is_empty(),
+        "an unresolved reorg must not read logs past it"
+    );
+}
+
 /// A `depth` target with no depth has no usable finality target, so loading the
 /// targets (watcher startup) rejects it instead of silently reading the head.
 #[tokio::test]
