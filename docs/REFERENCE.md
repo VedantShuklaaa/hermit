@@ -117,7 +117,11 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     `evm_watch_targets.finality_mode` (`finalized` or `depth`, DB-checked,
     default `finalized`), so each chain chooses its finality rule. Existing
     rows, including Ethereum, keep `finalized`.
-* **EVM log watching (Ethereum only).** One watcher per enabled
+  * `20261113120000_enable_base_arbitrum_avalanche.sql` seeds
+    `evm_watch_targets` for Base, Arbitrum and Avalanche with the verified Core
+    and Token Bridge addresses, `evm_chain_id`, `finality_mode = 'finalized'`
+    and fallback depths 6500, 5000 and 32.
+* **EVM log watching (Ethereum, Base, Arbitrum and Avalanche).** One watcher per enabled
   `evm_watch_targets` row polls `eth_getLogs` over the configured address and
   topic filters and stores events keyed by
   the message identity `(emitter_chain, emitter_address, sequence)` plus tx hash,
@@ -170,6 +174,13 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   WormholeScan, with no age limit, so an event recorded before the row was built
   still matches. WormholeScan stays the fallback for pre-watcher events, unwatched
   destinations and missing metadata.
+
+  The migrations seed Ethereum (Wormhole 2 / EVM 1), Base (30 / 8453),
+  Arbitrum (23 / 42161) and Avalanche (6 / 43114). Base and Arbitrum use dRPC
+  as primary and Alchemy as fallback; Avalanche uses the keyless
+  `api.avax.network` endpoint as primary and Alchemy as fallback. The measured
+  per-endpoint ranges are 101 for dRPC, 10 for Alchemy and 100 for the Avalanche
+  public endpoint.
 
   An endpoint is measured before its chain is enabled. `scripts/probe_evm_range.sh
   <chain>` doubles the `eth_getLogs` block range until the endpoint rejects it and
@@ -1035,10 +1046,16 @@ E4 and E5 are conditional on measured catch-up, not planned work.
   (finalized mode).
   Exit: each target selects its mode; a two-block reorg test removes the stale
   events; Ethereum behaviour is unchanged.
-* \[ ] E3. Enable Base, Arbitrum and Avalanche. One `evm_watch_targets` row per
+* \[x] E3. Enable Base, Arbitrum and Avalanche. One `evm_watch_targets` row per
   chain with Core Bridge and Token Bridge addresses verified against the Wormhole
   docs, `EVM_RPC_<CHAIN>` configured, one real captured fixture per chain and a
   real redeeming tx decoded. Depends on E1 and E2.
+  Done: migration `20261113120000` seeds all three chains with `finalized` and
+  fallback depths 6500/5000/32; addresses were confirmed on-chain
+  (`wormhole()`/`chainId()`); six fixtures (one send and one redeem per chain)
+  decode in `real_captures_decode_for_base_arbitrum_and_avalanche`. The keyless
+  Avalanche public endpoint replaced Ankr as primary, and its 100-block range
+  probe is in the E0 table.
   Exit: one real event decoded per chain, watcher tests pass, `.env.example` and
   this reference updated.
 * \[ ] E4. Pipeline the 10-block chunks. Batch `eth_getLogs` chunks and block

@@ -914,25 +914,35 @@ terminal and the logs.
 | 2026-11-11 | base | base-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 5875 | 1175 | 358 | 72 | Alchemy free plan; 10-block cap; 0.2 s blocks |
 | 2026-11-11 | arbitrum | lb.drpc.live | primary | 101 (102 rejected) | 4338 | 1236 | 3110 | 876 | dRPC free plan; 0.285 s blocks (about 3.5 blocks/s) |
 | 2026-11-11 | arbitrum | arb-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 3791 | 1067 | 2093 | 587 | Alchemy free plan; 10-block cap; 0.281 s blocks |
-| 2026-11-11 | avalanche | rpc.ankr.com | primary | no rejection to 100,000 | 5 | 3 | 6 | 4 | Ankr public; `finalized` one block ahead of `safe` in both samples; about 0.6 s blocks |
+| 2026-11-11 | avalanche | rpc.ankr.com | former primary | no rejection to 100,000 | 5 | 3 | 6 | 4 | Ankr public; `finalized` one block ahead of `safe` in both samples; about 0.6 s blocks. Keyless requests now require an API key, so this endpoint was replaced on 2026-11-13; measurements kept as recorded. |
+| 2026-11-13 | avalanche | api.avax.network | primary | 100 (101 rejected) | 5 | 4 | 6 | 9 | Avalanche public (keyless); `finalized` supported; address-filtered and topic-only probes both stop at 100; rate limits not measured |
 | 2026-11-11 | avalanche | avax-mainnet.g.alchemy.com | fallback | 10 (11 rejected) | 4 | 3 | 5 | 5 | Alchemy free plan; 10-block cap; `finalized` one block ahead of `safe`; 0.75-1.0 s blocks |
 
-**Findings (2026-11-11).**
+**Findings (2026-11-11, updated 2026-11-13).**
 
 - Free-tier `eth_getLogs` caps are plan-level, not chain-level. Alchemy rejected
   11 blocks on all four chains. dRPC rejected 102 on Ethereum, Base and
   Arbitrum, so 101 is the accepted maximum despite its message claiming 10,000.
   The Ankr public Avalanche endpoint rejected no range up to the 100,000 tested.
-- `finalized` is supported on all eight endpoints. The lag is why finality must
-  be per chain: Ethereum 84 blocks (about 17 min), Base about 5,880 blocks
-  (about 19.6 min), Arbitrum 3,791 to 4,338 blocks (about 18 to 21 min),
-  Avalanche 4 to 5 blocks (about 3 to 5 s).
-- Avalanche reports `finalized` one block ahead of `safe` on both Ankr and
-  Alchemy. Do not assume `finalized <= safe` when validating tags.
+- The keyless Avalanche public endpoint (`api.avax.network`) replaced Ankr as
+  the primary on 2026-11-13, because Ankr now rejects keyless requests. It
+  accepts 100 blocks per `eth_getLogs` request (101 rejected) with and without
+  the address filter; its rate limits were not measured.
+- `finalized` is supported on all nine measured endpoints. The lag is why
+  finality must be per chain: Ethereum 84 blocks (about 17 min), Base about
+  5,880 blocks (about 19.6 min), Arbitrum 3,791 to 4,338 blocks (about 18 to
+  21 min), Avalanche 4 to 5 blocks (about 3 to 5 s) on Ankr and Alchemy and
+  5 blocks (about 4 s) on the keyless public endpoint.
+- Avalanche reports `finalized` one block ahead of `safe` on Ankr, Alchemy and
+  the keyless public endpoint. Do not assume `finalized <= safe` when validating
+  tags.
 - dRPC's error text ("ranges over 10000 blocks are not supported on free plan")
   is not matched by `is_range_too_large_error` in `src/evm/client.rs`, which
   looks for "block range" or "eth_getlogs". Configure dRPC chains at 101 or
   lower, and fix the classifier in E1.
-- All range runs used the default filter: the two Wormhole topic0 hashes and no
-  address filter.
-- The Ankr Avalanche endpoint is public; its rate limits were not measured.
+- The 2026-11-11 range runs used the default filter: the two Wormhole topic0
+  hashes and no address filter. The 2026-11-13 Avalanche public endpoint was
+  probed both with the verified address filter and with topics only; both stop
+  at 100.
+- The keyless Avalanche public endpoint's rate limits were not measured. The
+  Ankr row is retained as measured before keyless access was closed.
