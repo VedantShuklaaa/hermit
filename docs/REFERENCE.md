@@ -139,11 +139,19 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   target with `finality_depth = 0` is rejected when targets load at startup.
   The watcher advances a persisted cursor per chain in the same transaction that
   stores a range's events. On a cursor-hash mismatch it walks the stored block
-  hashes of event-bearing blocks back to the deepest one that no longer matches
-  the chain (bounded by `finality_depth` in `depth` mode and 128 blocks in
-  `finalized` mode), deletes every event at or after it and rewinds the cursor
-  below it in one transaction; if the bound is reached, that block is the floor
-  and the cursor also rewinds below it.
+  hashes of event-bearing blocks from the cursor down to the rewind bound
+  (`finality_depth` in `depth` mode, 128 blocks in `finalized` mode) and looks
+  for the newest checkpoint whose hash still matches the chain. A matching
+  checkpoint proves the fork is above it, so the cursor rewinds to that block
+  and every event above it is deleted in one transaction. Rewinding to the
+  matching checkpoint, rather than to the lowest stale event block, re-reads the
+  whole region the reorg may have changed, including blocks between the real
+  fork and the stale block that never stored a hash. If no stored checkpoint
+  inside the bound still matches, the window floor is the conservative rewind
+  point (when the window holds no stored checkpoint at all, only the cursor
+  block itself is known stale, so only it is re-read); if the floor itself is
+  stale, the reorg is deeper than the bound, the poll fails, and the cursor and
+  stored events are left untouched rather than advancing past canonical events.
   A rewind logs a warning and increments `evm_reorgs_total` with the chain and
   endpoint host. A join that an orphaned event already applied is not rolled
   back: `source_tx_hash`, `destination_tx_hash` and a `Completed` status written
@@ -781,7 +789,10 @@ cargo test
   watcher stores logs, advances the cursor and joins an inbound `source_tx_hash`
   and an outbound `destination_tx_hash`/`Completed`; a genuine range-too-large
   answer halves the window (10 -> 5 -> 2); a 429 keeps the window and retries; a
-  cursor-hash mismatch drops events and rewinds; the transfer-side lookup fills
+  cursor-hash mismatch drops events and rewinds; a reorg with no stored hashes
+  between the fork and the lowest stale event block recovers the canonical events
+  in that gap; a rewind never goes past the finality bound and an unresolved
+  deeper reorg leaves the cursor and events alone; the transfer-side lookup fills
   both directions and a later plain re-analysis does not erase the hash. Unit
   tests in `src/evm/decode.rs` (topics equal `keccak256` of their signatures,
   sender/address filters, malformed logs) and `src/evm/client.rs` (429, timeout,
