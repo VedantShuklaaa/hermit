@@ -400,7 +400,8 @@ async fn spawn_evm_watchers(
         Err(error) => {
             tracing::error!(
                 ?error,
-                "could not load EVM watch targets, EVM watching is off"
+                "could not load EVM watch targets (check evm_watch_targets, including \
+                 finality_mode/finality_depth), EVM watching is off"
             );
             return;
         }

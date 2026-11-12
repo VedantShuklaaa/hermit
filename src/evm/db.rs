@@ -2,9 +2,35 @@
 //! the event-side join to `bridge_transfers`.
 
 use super::decode::EventKind;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+
+/// How a target decides that a block is final. `Finalized` uses the node's
+/// `finalized` tag and falls back to `head - finality_depth`; `Depth` always uses
+/// `head - finality_depth` and never asks for the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalityMode {
+    Finalized,
+    Depth,
+}
+
+impl FinalityMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Finalized => "finalized",
+            Self::Depth => "depth",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "finalized" => Some(Self::Finalized),
+            "depth" => Some(Self::Depth),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchTarget {
@@ -14,10 +40,27 @@ pub struct WatchTarget {
     pub wormhole_chain_id: u16,
     pub core_bridge_address: String,
     pub token_bridge_address: String,
+    pub finality_mode: FinalityMode,
     pub finality_depth: u64,
     /// `eth_chainId` the endpoint must answer with. `None` skips the check for a
     /// target whose EVM chain id has not been recorded yet.
     pub evm_chain_id: Option<u64>,
+}
+
+impl WatchTarget {
+    /// A `depth` target without a positive depth has no usable finality target, so
+    /// startup must reject it instead of reading unfinalized blocks. The migration's
+    /// CHECK only constrains the mode name; the depth rule needs this check.
+    pub fn validate(&self) -> Result<()> {
+        if self.finality_mode == FinalityMode::Depth && self.finality_depth == 0 {
+            bail!(
+                "evm_watch_targets row for chain '{}' uses finality_mode='depth' but finality_depth is 0; \
+                 set finality_depth > 0 or use finality_mode='finalized'",
+                self.slug
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +87,16 @@ pub struct JoinStats {
     pub matched: u64,
 }
 
-type TargetRow = (i16, String, String, String, String, i64, Option<i64>);
+type TargetRow = (
+    i16,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+);
 
 /// Enabled targets, joined to the active Wormhole chain mapping. A target whose
 /// mapping is not a u16 is skipped with a warning rather than failing the load.
@@ -56,6 +108,7 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
                m.protocol_chain_id,
                t.core_bridge_address,
                t.token_bridge_address,
+               t.finality_mode,
                t.finality_depth,
                t.evm_chain_id
         FROM evm_watch_targets t
@@ -72,26 +125,35 @@ pub async fn load_targets(pool: &PgPool) -> Result<Vec<WatchTarget>> {
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(
-            |(chain_id, slug, wormhole_id, core, token, finality_depth, evm_chain_id)| {
-                let Ok(wormhole_chain_id) = wormhole_id.parse::<u16>() else {
-                    tracing::warn!(%slug, %wormhole_id, "skipping EVM target with a non-u16 Wormhole chain id");
-                    return None;
-                };
-                Some(WatchTarget {
-                    chain_id,
-                    slug,
-                    wormhole_chain_id,
-                    core_bridge_address: core,
-                    token_bridge_address: token,
-                    finality_depth: u64::try_from(finality_depth).unwrap_or(0),
-                    evm_chain_id: evm_chain_id.and_then(|id| u64::try_from(id).ok()),
-                })
-            },
-        )
-        .collect())
+    let mut targets = Vec::with_capacity(rows.len());
+    for (chain_id, slug, wormhole_id, core, token, finality_mode, finality_depth, evm_chain_id) in
+        rows
+    {
+        let Ok(wormhole_chain_id) = wormhole_id.parse::<u16>() else {
+            tracing::warn!(%slug, %wormhole_id, "skipping EVM target with a non-u16 Wormhole chain id");
+            continue;
+        };
+        let finality_mode = FinalityMode::parse(&finality_mode).ok_or_else(|| {
+            anyhow::anyhow!(
+                "evm_watch_targets row for chain '{slug}' has unknown finality_mode '{finality_mode}'"
+            )
+        })?;
+        let target = WatchTarget {
+            chain_id,
+            slug,
+            wormhole_chain_id,
+            core_bridge_address: core,
+            token_bridge_address: token,
+            finality_mode,
+            finality_depth: u64::try_from(finality_depth).unwrap_or(0),
+            evm_chain_id: evm_chain_id.and_then(|id| u64::try_from(id).ok()),
+        };
+        // Startup validation: a depth target with no depth cannot produce a
+        // finality target, so refuse the configuration instead of reading head.
+        target.validate()?;
+        targets.push(target);
+    }
+    Ok(targets)
 }
 
 pub async fn load_cursor(pool: &PgPool, chain_id: i16) -> Result<Option<Cursor>> {
@@ -134,14 +196,76 @@ pub async fn set_cursor(
     Ok(())
 }
 
-/// Drops every event at or after `block_number` before the cursor is rewound.
-pub async fn delete_events_from(pool: &PgPool, chain_id: i16, block_number: u64) -> Result<u64> {
+/// Stored block hashes of event-bearing blocks in `[floor, below)`, newest first.
+/// Those are the checkpoints a reorg walk can compare against the chain; the cursor
+/// itself is checked separately by the watcher.
+pub async fn event_block_hashes(
+    pool: &PgPool,
+    chain_id: i16,
+    floor: u64,
+    below: u64,
+    limit: u64,
+) -> Result<Vec<(u64, String)>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT block_number, MAX(block_hash)
+        FROM evm_log_events
+        WHERE chain_id = $1
+          AND block_number >= $2
+          AND block_number < $3
+        GROUP BY block_number
+        ORDER BY block_number DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(chain_id)
+    .bind(i64::try_from(floor).unwrap_or(i64::MAX))
+    .bind(i64::try_from(below).unwrap_or(i64::MAX))
+    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(number, hash)| (u64::try_from(number).unwrap_or(0), hash))
+        .collect())
+}
+
+/// Deletes the stale events at or after `delete_from` and moves the cursor to
+/// `cursor_number`/`cursor_hash` in one transaction, so a crash cannot leave the
+/// events of the abandoned chain without a cursor below them.
+pub async fn rewind_after_reorg(
+    pool: &PgPool,
+    chain_id: i16,
+    delete_from: u64,
+    cursor_number: u64,
+    cursor_hash: &str,
+) -> Result<u64> {
+    let mut tx = pool.begin().await?;
     let result =
         sqlx::query("DELETE FROM evm_log_events WHERE chain_id = $1 AND block_number >= $2")
             .bind(chain_id)
-            .bind(i64::try_from(block_number).unwrap_or(i64::MAX))
-            .execute(pool)
+            .bind(i64::try_from(delete_from).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
             .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO evm_watch_cursors (chain_id, block_number, block_hash)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chain_id) DO UPDATE
+        SET block_number = EXCLUDED.block_number,
+            block_hash = EXCLUDED.block_hash,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(chain_id)
+    .bind(i64::try_from(cursor_number).unwrap_or(i64::MAX))
+    .bind(cursor_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 

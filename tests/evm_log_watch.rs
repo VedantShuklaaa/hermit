@@ -18,7 +18,7 @@ use bridge::domain::analysis::DecodedTransfer;
 use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
 use bridge::error::AppError;
 use bridge::evm::client::EvmClient;
-use bridge::evm::db as evm_db;
+use bridge::evm::db::{self as evm_db, FinalityMode};
 use bridge::evm::decode::{self, EventKind};
 use bridge::evm::lookup::EvmEventLookup;
 use bridge::evm::watcher::{EvmWatcher, WatcherEndpoint};
@@ -45,6 +45,9 @@ const REDEEM_TX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const SEQUENCE: u64 = 1234;
 const CURSOR_BLOCK: u64 = 17_999_999;
 const TARGET_BLOCK: u64 = 18_000_001;
+/// The captured fixtures' first block: their two logs sit at 18,000,000 and
+/// 18,000,001 (TARGET_BLOCK).
+const FORK_ONE_BLOCK: u64 = 18_000_000;
 
 /// Alchemy's current free-tier `eth_getLogs` rejection. It arrives with HTTP 400,
 /// which is why the capture script's `curl -f` failed on it.
@@ -74,6 +77,11 @@ fn fixture(name: &str) -> Value {
 
 fn hash_for(block: u64) -> String {
     format!("0x{block:064x}")
+}
+
+/// The canonical hash after a reorg replaced `block` and every later block.
+fn reorged_hash_for(block: u64) -> String {
+    format!("0x{:064x}", block | 0x8000_0000_0000_0000)
 }
 
 fn expected_wormhole_id() -> u16 {
@@ -121,11 +129,23 @@ struct StubState {
     fail_all: AtomicBool,
     /// Delay every `eth_getLogs` answer, to exercise a client timeout.
     get_logs_delay: Option<Duration>,
+    /// Canonical hashes for this block and every later one differ from `hash_for`,
+    /// modelling a reorg that replaced that suffix of the chain.
+    fork_block: Option<u64>,
+    /// The block tag or number of every `eth_getBlockByNumber` request, in order.
+    block_tags: Mutex<Vec<String>>,
 }
 
 impl StubState {
     fn target(&self) -> u64 {
         self.target_block.unwrap_or(TARGET_BLOCK)
+    }
+
+    fn canonical_hash(&self, block: u64) -> String {
+        match self.fork_block {
+            Some(fork) if block >= fork => reorged_hash_for(block),
+            _ => hash_for(block),
+        }
     }
 }
 
@@ -159,6 +179,7 @@ async fn rpc(State(state): State<Arc<StubState>>, Json(body): Json<Value>) -> Re
         .into_response(),
         "eth_getBlockByNumber" => {
             let tag = params.first().and_then(Value::as_str).unwrap_or_default();
+            state.block_tags.lock().unwrap().push(tag.to_string());
             let block = if tag == "finalized" {
                 target
             } else {
@@ -168,7 +189,7 @@ async fn rpc(State(state): State<Arc<StubState>>, Json(body): Json<Value>) -> Re
                 "jsonrpc": "2.0", "id": 1,
                 "result": {
                     "number": format!("0x{block:x}"),
-                    "hash": hash_for(block),
+                    "hash": state.canonical_hash(block),
                     "timestamp": format!("0x{:x}", 1_700_000_000 + block)
                 }
             }))
@@ -448,6 +469,17 @@ fn watcher_with_endpoints(
     pool: PgPool,
     chain_id: i16,
 ) -> EvmWatcher {
+    watcher_with_finality(endpoints, pool, chain_id, FinalityMode::Finalized, 64, 60)
+}
+
+fn watcher_with_finality(
+    endpoints: Vec<WatcherEndpoint>,
+    pool: PgPool,
+    chain_id: i16,
+    finality_mode: FinalityMode,
+    finality_depth: u64,
+    poll_secs: u64,
+) -> EvmWatcher {
     EvmWatcher::new(
         evm_db::WatchTarget {
             chain_id,
@@ -455,15 +487,47 @@ fn watcher_with_endpoints(
             wormhole_chain_id: expected_wormhole_id(),
             core_bridge_address: CORE.to_string(),
             token_bridge_address: TOKEN.to_string(),
-            finality_depth: 64,
+            finality_mode,
+            finality_depth,
             evm_chain_id: Some(1),
         },
         reqwest::Client::new(),
         endpoints,
         pool,
         86_400,
-        60,
+        poll_secs,
     )
+}
+
+/// A stale event left by a chain that was later reorged away.
+fn stale_event(block: u64, tx_hash: &str) -> evm_db::NewEvent {
+    evm_db::NewEvent {
+        event_kind: EventKind::TransferRedeemed,
+        emitter_chain: 1,
+        emitter_address: SEND_EMITTER.to_string(),
+        sequence: 99_999,
+        tx_hash: tx_hash.to_string(),
+        log_index: 0,
+        block_number: block,
+        block_hash: hash_for(block),
+        block_timestamp: None,
+    }
+}
+
+async fn cursor_block(pool: &PgPool, chain_id: i16) -> Option<i64> {
+    sqlx::query_scalar("SELECT block_number FROM evm_watch_cursors WHERE chain_id = $1")
+        .bind(chain_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn event_tx_hashes(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar("SELECT tx_hash FROM evm_log_events ORDER BY block_number, log_index")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -1132,6 +1196,273 @@ async fn a_reorg_drops_events_and_rewinds_the_cursor() {
         .await
         .expect("event count");
     assert_eq!(events, 0, "stale events are dropped");
+}
+
+/// `finalized` mode keeps asking for the tag, as Ethereum did before E2.
+#[tokio::test]
+async fn finalized_mode_reads_the_finalized_tag() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let state = Arc::new(StubState::default());
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(watcher(url, pool.clone(), chain_id, 10).run(shutdown.clone()));
+
+    wait_until("the cursor to reach the finalized target", || {
+        let pool = pool.clone();
+        async move { cursor_block(&pool, chain_id).await == Some(TARGET_BLOCK as i64) }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let tags = state.block_tags.lock().unwrap().clone();
+    assert!(
+        tags.iter().any(|tag| tag == "finalized"),
+        "finalized mode reads the tag: {tags:?}"
+    );
+}
+
+/// `depth` mode never asks for the tag and targets `head - finality_depth`.
+#[tokio::test]
+async fn depth_mode_never_reads_the_finalized_tag() {
+    const DEPTH: u64 = 16;
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+    evm_db::set_cursor(pool, chain_id, CURSOR_BLOCK, &hash_for(CURSOR_BLOCK))
+        .await
+        .expect("cursor");
+
+    let state = Arc::new(StubState::default());
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 10)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Depth,
+        DEPTH,
+        60,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    let expected = TARGET_BLOCK + 64 - DEPTH;
+    wait_until("the cursor to reach head - finality_depth", || {
+        let pool = pool.clone();
+        async move { cursor_block(&pool, chain_id).await == Some(expected as i64) }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let tags = state.block_tags.lock().unwrap().clone();
+    assert!(
+        tags.iter().all(|tag| tag != "finalized"),
+        "depth mode never reads the finalized tag: {tags:?}"
+    );
+    assert!(
+        tags.iter().all(|tag| tag.starts_with("0x")),
+        "depth mode reads only numeric block numbers: {tags:?}"
+    );
+}
+
+/// A reorg two blocks deep: both stored blocks are stale, so both must be deleted
+/// and the cursor must land below the fork before the new chain is read.
+#[tokio::test]
+async fn a_two_block_reorg_drops_both_stale_blocks_and_reingests_the_new_chain() {
+    const FORK: u64 = 18_000_000;
+    const STALE_BELOW_FORK: &str = "stale-below-fork";
+    const STALE_AT_CURSOR: &str = "stale-at-cursor";
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+
+    // The old chain: events at the fork block and at the cursor, whose hash differs
+    // from the node's current canonical hash at both heights.
+    evm_db::insert_events_and_advance(
+        pool,
+        chain_id,
+        &[
+            stale_event(FORK, STALE_BELOW_FORK),
+            stale_event(TARGET_BLOCK, STALE_AT_CURSOR),
+        ],
+        TARGET_BLOCK,
+        &hash_for(TARGET_BLOCK),
+    )
+    .await
+    .expect("old-chain events");
+
+    let state = Arc::new(StubState {
+        logs: captured_logs(),
+        target_block: Some(TARGET_BLOCK + 1),
+        fork_block: Some(FORK),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 10)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Finalized,
+        64,
+        1,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    wait_until("the reorged range to re-ingest", || {
+        let pool = pool.clone();
+        async move {
+            let hashes = event_tx_hashes(&pool).await;
+            cursor_block(&pool, chain_id).await == Some((TARGET_BLOCK + 1) as i64)
+                && hashes.contains(&SEND_TX.to_string())
+                && hashes.contains(&REDEEM_TX.to_string())
+                && !hashes.contains(&STALE_BELOW_FORK.to_string())
+                && !hashes.contains(&STALE_AT_CURSOR.to_string())
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let events: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT block_number, tx_hash, block_hash FROM evm_log_events
+         ORDER BY block_number, log_index",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("events");
+    assert_eq!(events.len(), 2, "{events:?}");
+    // The events came from the fixtures' captured logs, so their block hashes are
+    // the fixture hashes: the re-read is the new chain, not the stored stale rows.
+    let fixture = captured_logs();
+    assert_eq!(events[0].0, FORK as i64);
+    assert_eq!(events[0].1, SEND_TX);
+    assert_eq!(events[0].2, fixture[0]["blockHash"].as_str().unwrap());
+    assert_eq!(events[1].0, TARGET_BLOCK as i64);
+    assert_eq!(events[1].1, REDEEM_TX);
+    assert_eq!(events[1].2, fixture[1]["blockHash"].as_str().unwrap());
+}
+
+/// A one-block reorg deletes only the stale cursor block; the matching block below
+/// it stays and its event is not re-read.
+#[tokio::test]
+async fn a_one_block_reorg_still_rewinds_one_block() {
+    const STALE_KEPT: &str = "stale-kept";
+    const STALE_CURSOR: &str = "stale-cursor";
+
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+
+    // The block below the cursor matches the chain; only the cursor block was
+    // replaced.
+    evm_db::insert_events_and_advance(
+        pool,
+        chain_id,
+        &[
+            stale_event(FORK_ONE_BLOCK, STALE_KEPT),
+            stale_event(TARGET_BLOCK, STALE_CURSOR),
+        ],
+        TARGET_BLOCK,
+        &hash_for(TARGET_BLOCK),
+    )
+    .await
+    .expect("old-chain events");
+
+    let state = Arc::new(StubState {
+        logs: captured_logs(),
+        target_block: Some(TARGET_BLOCK + 1),
+        fork_block: Some(TARGET_BLOCK),
+        ..Default::default()
+    });
+    let url = stub(state.clone()).await;
+    let shutdown = CancellationToken::new();
+    let watcher = watcher_with_finality(
+        vec![endpoint(url, 10)],
+        pool.clone(),
+        chain_id,
+        FinalityMode::Finalized,
+        64,
+        1,
+    );
+    let handle = tokio::spawn(watcher.run(shutdown.clone()));
+
+    wait_until("the replaced cursor block to be re-read", || {
+        let pool = pool.clone();
+        async move {
+            let hashes = event_tx_hashes(&pool).await;
+            cursor_block(&pool, chain_id).await == Some((TARGET_BLOCK + 1) as i64)
+                && hashes.contains(&REDEEM_TX.to_string())
+                && hashes.contains(&STALE_KEPT.to_string())
+                && !hashes.contains(&STALE_CURSOR.to_string())
+        }
+    })
+    .await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let events: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT block_number, tx_hash FROM evm_log_events ORDER BY block_number, log_index",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("events");
+    assert_eq!(
+        events,
+        vec![
+            (FORK_ONE_BLOCK as i64, STALE_KEPT.to_string()),
+            (TARGET_BLOCK as i64, REDEEM_TX.to_string())
+        ]
+    );
+}
+
+/// A `depth` target with no depth has no usable finality target, so loading the
+/// targets (watcher startup) rejects it instead of silently reading the head.
+#[tokio::test]
+async fn a_depth_target_without_a_positive_depth_fails_at_startup() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+    let chain_id = ethereum_chain_id(pool).await;
+
+    sqlx::query(
+        "UPDATE evm_watch_targets SET finality_mode = 'depth', finality_depth = 12
+         WHERE chain_id = $1",
+    )
+    .bind(chain_id)
+    .execute(pool)
+    .await
+    .expect("valid depth target");
+
+    let targets = evm_db::load_targets(pool)
+        .await
+        .expect("valid targets load");
+    let target = targets
+        .iter()
+        .find(|target| target.chain_id == chain_id)
+        .expect("ethereum target");
+    assert_eq!(target.finality_mode, FinalityMode::Depth);
+    assert_eq!(target.finality_depth, 12);
+
+    sqlx::query("UPDATE evm_watch_targets SET finality_depth = 0 WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(pool)
+        .await
+        .expect("invalid depth target");
+
+    let error = evm_db::load_targets(pool)
+        .await
+        .expect_err("depth mode with depth 0 must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("finality_depth"), "{message}");
 }
 
 #[tokio::test]

@@ -7,13 +7,16 @@
 //! next endpoint; only the endpoint that rejected a range has its window halved. A
 //! failed chunk never stores events or advances the cursor.
 //!
-//! Finality: the target is the node's `finalized` block when it answers the tag, else
-//! `head - finality_depth`. Only finalized blocks are read, so a reorg below the target
-//! is not expected. The cursor's block hash is still checked every poll; a mismatch
-//! drops the events at and after the cursor, rewinds one block and re-reads.
+//! Finality: a target in `finalized` mode reads the node's `finalized` block when it
+//! answers the tag, else `head - finality_depth`. A target in `depth` mode always reads
+//! `head - finality_depth` and never asks for the tag. Only blocks at or below the
+//! target are read, so a reorg below it is not expected. The cursor's block hash is
+//! still checked every poll; a mismatch walks stored event block hashes back to the
+//! deepest block that no longer matches, deletes the stale events and rewinds the
+//! cursor below that block in one transaction, bounded by the target's finality window.
 
 use super::client::{Block, EvmClient, Log};
-use super::db::{self, Cursor, NewEvent, WatchTarget};
+use super::db::{self, Cursor, FinalityMode, NewEvent, WatchTarget};
 use super::decode::{self, EventKind};
 use crate::clients::limiter::Limiter;
 use crate::error::AppError;
@@ -48,6 +51,18 @@ struct EndpointState {
 }
 
 type EndpointCall<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+/// How far back a reorg walk may go in `finalized` mode. Finalized blocks should not
+/// reorg at all; this is a safety bound, not an expected depth. `depth` mode uses the
+/// target's own `finality_depth`.
+const FINALIZED_REORG_WALK_BLOCKS: u64 = 128;
+
+struct Rewind {
+    delete_from: u64,
+    rewound_to: u64,
+    removed: u64,
+    bound_hit: bool,
+}
 
 #[derive(Clone)]
 pub struct EvmWatcher {
@@ -114,6 +129,7 @@ impl EvmWatcher {
             endpoints = self.endpoints.len(),
             primary = %self.endpoints[0].client.host(),
             address = %self.target.core_bridge_address,
+            finality_mode = self.target.finality_mode.as_str(),
             finality_depth = self.target.finality_depth,
             "EVM watcher started"
         );
@@ -247,7 +263,7 @@ impl EvmWatcher {
         .set(target.number as f64);
 
         let Some(mut cursor) = db::load_cursor(&self.pool, self.target.chain_id).await? else {
-            // First run: start at the finalized head. Backfill is deliberately not
+            // First run: start at the finality target. Backfill is deliberately not
             // done; the row-level lookup and WormholeScan cover events before this.
             db::set_cursor(
                 &self.pool,
@@ -266,7 +282,7 @@ impl EvmWatcher {
                 chain = %chain,
                 block = target.number,
                 endpoint = %endpoint,
-                "EVM watcher initialised its cursor at the finalized head"
+                "EVM watcher initialised its cursor at the finality target"
             );
             return Ok(());
         };
@@ -282,27 +298,16 @@ impl EvmWatcher {
         }
 
         // Reorg check: the cursor block must still be canonical. A mismatch means
-        // logs at and after it may be stale, so they are dropped and the cursor
-        // rewinds one block. The next poll re-reads the affected range.
+        // logs at and after it may be stale. Walk the stored event block hashes back
+        // to the deepest block that no longer matches the chain, drop every event at
+        // or after it, and rewind the cursor below it in one transaction. The next
+        // poll re-reads the abandoned range from the new canonical chain.
         let cursor_block = cursor.block_number;
         let canonical = self
             .call_endpoints(|client| Box::pin(client.block_by_number(cursor_block)))
             .await?;
         if canonical.hash != cursor.block_hash {
-            let removed =
-                db::delete_events_from(&self.pool, self.target.chain_id, cursor.block_number)
-                    .await?;
-            let previous_number = cursor.block_number.saturating_sub(1);
-            let previous = self
-                .call_endpoints(|client| Box::pin(client.block_by_number(previous_number)))
-                .await?;
-            db::set_cursor(
-                &self.pool,
-                self.target.chain_id,
-                previous.number,
-                &previous.hash,
-            )
-            .await?;
+            let rewind = self.rewind_after_reorg(&cursor).await?;
             counter!(
                 crate::metrics::EVM_REORGS_TOTAL,
                 "chain" => chain.clone(),
@@ -312,9 +317,11 @@ impl EvmWatcher {
             tracing::warn!(
                 chain = %chain,
                 block = cursor.block_number,
-                removed,
-                rewound_to = previous.number,
-                "EVM reorg detected, dropped events after the cursor and rewound"
+                delete_from = rewind.delete_from,
+                removed = rewind.removed,
+                rewound_to = rewind.rewound_to,
+                bound_hit = rewind.bound_hit,
+                "EVM reorg detected, dropped stale events and rewound below the deepest mismatch"
             );
             return Ok(());
         }
@@ -412,6 +419,62 @@ impl EvmWatcher {
             );
         }
         Ok(())
+    }
+
+    /// Walks the stored block hashes of event-bearing blocks from the cursor down to
+    /// the target's finality window and compares each with the chain. The lowest
+    /// checkpoint whose hash no longer matches is the deepest stale event block; with
+    /// no such checkpoint the cursor block itself is the only known mismatch. If the
+    /// walk reaches the floor while still mismatching, the floor is the bound.
+    async fn rewind_after_reorg(&mut self, cursor: &Cursor) -> Result<Rewind, AppError> {
+        let bound = match self.target.finality_mode {
+            FinalityMode::Depth => self.target.finality_depth.max(1),
+            FinalityMode::Finalized => FINALIZED_REORG_WALK_BLOCKS,
+        };
+        let floor = cursor.block_number.saturating_sub(bound);
+        let checkpoints = db::event_block_hashes(
+            &self.pool,
+            self.target.chain_id,
+            floor,
+            cursor.block_number,
+            bound.saturating_add(1),
+        )
+        .await?;
+
+        let mut deepest = cursor.block_number;
+        for (number, hash) in checkpoints {
+            let canonical = self
+                .call_endpoints(|client| Box::pin(client.block_by_number(number)))
+                .await?;
+            if canonical.hash == hash {
+                // The fork is above this block; a chain's ancestors are unchanged
+                // once a block matches, so there is nothing deeper to compare.
+                break;
+            }
+            deepest = number;
+        }
+
+        let bound_hit = floor < cursor.block_number && deepest <= floor;
+        let delete_from = if bound_hit { floor } else { deepest };
+        let rewound_to = delete_from.saturating_sub(1);
+        let previous = self
+            .call_endpoints(|client| Box::pin(client.block_by_number(rewound_to)))
+            .await?;
+        let removed = db::rewind_after_reorg(
+            &self.pool,
+            self.target.chain_id,
+            delete_from,
+            rewound_to,
+            &previous.hash,
+        )
+        .await?;
+
+        Ok(Rewind {
+            delete_from,
+            rewound_to,
+            removed,
+            bound_hit,
+        })
     }
 
     /// One `eth_getLogs` chunk starting at `start`, on the preferred endpoint or the
@@ -519,7 +582,10 @@ impl EvmWatcher {
     }
 
     async fn target_block_on(&mut self, index: usize) -> Result<Block, AppError> {
-        if self.endpoints[index].use_finalized {
+        // `depth` mode never asks for the tag, even if the endpoint would answer it.
+        if self.target.finality_mode == FinalityMode::Finalized
+            && self.endpoints[index].use_finalized
+        {
             match self.endpoints[index].client.finalized_block().await {
                 Ok(block) => return Ok(block),
                 Err(error) if finalized_unsupported(&error) => {

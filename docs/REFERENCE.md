@@ -113,6 +113,10 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   * `20261111120000_evm_watch_target_chain_id.sql` adds
     `evm_watch_targets.evm_chain_id` (the `eth_chainId` the endpoint must answer
     with, checked at watcher startup) and sets Ethereum to 1.
+  * `20261112120000_evm_watch_target_finality_mode.sql` adds
+    `evm_watch_targets.finality_mode` (`finalized` or `depth`, DB-checked,
+    default `finalized`), so each chain chooses its finality rule. Existing
+    rows, including Ethereum, keep `finalized`.
 * **EVM log watching (Ethereum only).** One watcher per enabled
   `evm_watch_targets` row polls `eth_getLogs` over the configured address and
   topic filters and stores events keyed by
@@ -128,11 +132,24 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   hash is the source tx. `TransferRedeemed` on the Token Bridge names the
   original message (`emitterChainId`, `emitterAddress`, `sequence`) and its tx
   hash is the destination tx. Topics are `keccak256` of the ABI signatures, and
-  a test recomputes both. The watcher reads only finalized blocks (the
-  `finalized` tag, or `head - finality_depth` when the provider rejects it),
-  advances a persisted cursor per chain in the same transaction that stores a
-  range's events, and on a cursor-hash mismatch deletes events at or after the
-  cursor and rewinds one block. Ingest is idempotent on
+  a test recomputes both. Each target's `finality_mode` decides what counts as
+  final: `finalized` reads the node's `finalized` tag and falls back to
+  `head - finality_depth` only when the provider rejects it, while `depth`
+  always reads `head - finality_depth` and never asks for the tag. A `depth`
+  target with `finality_depth = 0` is rejected when targets load at startup.
+  The watcher advances a persisted cursor per chain in the same transaction that
+  stores a range's events. On a cursor-hash mismatch it walks the stored block
+  hashes of event-bearing blocks back to the deepest one that no longer matches
+  the chain (bounded by `finality_depth` in `depth` mode and 128 blocks in
+  `finalized` mode), deletes every event at or after it and rewinds the cursor
+  below it in one transaction; if the bound is reached, that block is the floor
+  and the cursor also rewinds below it.
+  A rewind logs a warning and increments `evm_reorgs_total` with the chain and
+  endpoint host. A join that an orphaned event already applied is not rolled
+  back: `source_tx_hash`, `destination_tx_hash` and a `Completed` status written
+  from it stay on the `bridge_transfers` row (the join's `COALESCE` keeps an
+  existing hash, so a later canonical event does not overwrite it). Ingest is
+  idempotent on
   `UNIQUE (chain_id, tx_hash, log_index)`. The event-side join fills
   `source_tx_hash` (inbound) or `destination_tx_hash` + `Completed` (outbound);
   a transfer-side lookup fills the same fields before enrichment falls back to
@@ -985,10 +1002,13 @@ E4 and E5 are conditional on measured catch-up, not planned work.
   `evm_watch_targets.evm_chain_id` is set.
   Exit: a single-URL configuration behaves as today; loopback tests cover
   failover, range shrinking and every endpoint down; existing tests pass.
-* \[ ] E2. Per-chain finality. Migration adds `finality_mode` (`finalized` or
+* \[x] E2. Per-chain finality. Migration adds `finality_mode` (`finalized` or
   `depth`); depth mode reads `head - finality_depth`. A cursor mismatch rewinds
   and deletes the affected window instead of one block, so a reorg deeper than
-  one block cannot leave stale events.
+  one block cannot leave stale events. Done: the mode is per
+  `evm_watch_targets` row, `finality_depth` must be positive in depth mode, and
+  the reorg walk is bounded by `finality_depth` (depth mode) or 128 blocks
+  (finalized mode).
   Exit: each target selects its mode; a two-block reorg test removes the stale
   events; Ethereum behaviour is unchanged.
 * \[ ] E3. Enable Base, Arbitrum and Avalanche. One `evm_watch_targets` row per
