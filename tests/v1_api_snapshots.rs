@@ -158,6 +158,7 @@ fn stored(name: &str, current: &Current) -> StoredTransactionWithTransfers {
         transfers: vec![StoredTransfer {
             program: bridge.program.clone(),
             protocol: "wormhole".to_string(),
+            message_key: detected.message.key(),
             direction: bridge.direction().as_str().to_string(),
             observed_tx_hash: detected.observed_tx.clone(),
             event_index: detected.event_index as i16,

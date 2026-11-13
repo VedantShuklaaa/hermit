@@ -157,6 +157,25 @@ pub fn cctp_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
     }
 }
 
+/// The `bridge_transfers` columns of a deBridge source-side order. The observed
+/// Solana tx is the source, and no destination leg is indexed yet, so the row starts
+/// `Pending`.
+pub fn debridge_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    RowValues {
+        source_tx_hash: Some(d.observed_tx.clone()),
+        source_wallet: d.source_wallet.clone(),
+        source_explorer_url: chains.explorer_tx_url_for(&d.source, &d.observed_tx),
+        destination_wallet: d.destination_wallet.clone(),
+        destination_tx_hash: None,
+        destination_explorer_url: None,
+        token: d.token.as_ref().map(|t| t.address.clone()),
+        token_symbol: d.token_symbol.clone(),
+        amount: d.amount_raw.as_ref().map(|a| a.to_string()),
+        amount_formatted: None,
+        status: BridgeStatus::Pending,
+    }
+}
+
 /// Re-reads a transfer the WormholeScan-driven path built for a Solana redeem. That path
 /// sets `source_tx_hash` to the observed tx, but for a transfer that lands on Solana the
 /// observed tx is the destination side. Only used for a successful Solana tx, which is

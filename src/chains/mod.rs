@@ -20,6 +20,8 @@ pub const NS_WORMHOLE: &str = "wormhole";
 pub const NS_EVM: &str = "evm";
 /// Namespace of Circle CCTP domain IDs (`u32`).
 pub const NS_CCTP: &str = "cctp";
+/// Namespace of deBridge DLN internal chain IDs, as decimal strings.
+pub const NS_DEBRIDGE: &str = "debridge";
 
 /// A chain identifier exactly as a protocol wrote it, plus which namespace it is in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +44,10 @@ impl RawChainRef {
 
     pub fn cctp(id: u32) -> Self {
         Self::new(NS_CCTP, id)
+    }
+
+    pub fn debridge(id: impl ToString) -> Self {
+        Self::new(NS_DEBRIDGE, id)
     }
 }
 

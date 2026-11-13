@@ -139,6 +139,46 @@ async fn insert_cctp_row(pool: &PgPool, seq: i64, created_at: DateTime<Utc>) {
     .expect("insert cctp message");
 }
 
+/// A deBridge row keeps its order id in `message_key` and has no detail table.
+async fn insert_debridge_row(pool: &PgPool, seq: i64, created_at: DateTime<Utc>) {
+    let tx_hash = format!("list-debridge-tx-{seq}");
+    let order_id = format!("{seq:064x}");
+    let (transaction_id,): (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO transactions (hash, chain, status, slot, timestamp, fee_lamports, signer)
+        VALUES ($1, 1, 'Success', 1, NULL, 5000, 'signer')
+        RETURNING id
+        "#,
+    )
+    .bind(&tx_hash)
+    .fetch_one(pool)
+    .await
+    .expect("insert transaction");
+
+    sqlx::query(
+        r#"
+        INSERT INTO bridge_transfers (
+            transaction_id, source_tx_hash,
+            source_ref_protocol, source_ref_id,
+            destination_ref_protocol, destination_ref_id,
+            protocol, message_key, direction, event_index, observed_tx_hash,
+            status, amount, created_at, updated_at
+        )
+        VALUES (
+            $1, $2, 'debridge', '7565164', 'debridge', '1',
+            'debridge', $3, 'Outbound', 0, $2, 'Pending', 1000000, $4, $4
+        )
+        "#,
+    )
+    .bind(transaction_id)
+    .bind(&tx_hash)
+    .bind(&order_id)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert debridge transfer");
+}
+
 fn sequences(response: &TransferListResponse) -> Vec<i64> {
     response
         .items
@@ -410,6 +450,17 @@ async fn filters_select_the_expected_rows() {
         "a known protocol with no rows is an empty page",
     )
     .await;
+    assert_filter(
+        &db.pool,
+        &snapshot,
+        ListQuery {
+            protocol: Some("debridge".to_string()),
+            ..query("50")
+        },
+        &[],
+        "the deBridge filter is accepted with no rows",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -429,9 +480,10 @@ async fn the_protocol_filter_selects_only_that_protocol() {
     )
     .await;
     insert_cctp_row(&db.pool, 2, at(1)).await;
+    insert_debridge_row(&db.pool, 3, at(2)).await;
     let snapshot = load_snapshot(&db.pool).await.expect("snapshot");
 
-    for protocol in ["wormhole", "cctp"] {
+    for protocol in ["wormhole", "cctp", "debridge"] {
         let response = list(
             &db.pool,
             &snapshot,
@@ -581,7 +633,7 @@ async fn validation_errors_are_400s_and_the_last_page_has_no_cursor() {
     .await
     .expect_err("unknown protocol");
     assert!(
-        matches!(&error, AppError::BadRequest(message) if message == "protocol must be wormhole or cctp")
+        matches!(&error, AppError::BadRequest(message) if message == "protocol must be wormhole, cctp or debridge")
     );
 
     let error = list_transfers(

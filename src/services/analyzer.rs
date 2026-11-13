@@ -151,6 +151,10 @@ async fn analyse_tx_inner(
                     // CCTP has no v1 representation and no WormholeScan enrichment: the
                     // chain alone carries everything stored.
                     Protocol::Cctp => (None, detect::cctp_row_values(transfer, &snapshot)),
+                    // deBridge is source-side only for now. The observed tx is the
+                    // Solana source, so the row is Pending until a destination leg is
+                    // indexed.
+                    Protocol::Debridge => (None, detect::debridge_row_values(transfer, &snapshot)),
                 };
                 decoded.push(DecodedTransfer {
                     detected: transfer.clone(),

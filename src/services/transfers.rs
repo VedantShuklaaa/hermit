@@ -104,7 +104,7 @@ pub fn parse_query(raw: ListQuery, chains: &Snapshot) -> Result<ListParams, AppE
         Some(value) if Protocol::parse(&value).is_some() => Some(value),
         Some(_) => {
             return Err(AppError::BadRequest(
-                "protocol must be wormhole or cctp".to_string(),
+                "protocol must be wormhole, cctp or debridge".to_string(),
             ));
         }
     };

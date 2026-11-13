@@ -26,6 +26,20 @@ const EVM_SEED: [(u64, &str); 8] = [
     (8453, "base"),
 ];
 
+const DEBRIDGE_SEED: [(&str, &str); 11] = [
+    ("7565164", "solana"),
+    ("1", "ethereum"),
+    ("56", "bsc"),
+    ("137", "polygon"),
+    ("43114", "avalanche"),
+    ("42161", "arbitrum"),
+    ("10", "optimism"),
+    ("8453", "base"),
+    ("5042", "arc"),
+    ("100000022", "hyperevm"),
+    ("100000030", "monad"),
+];
+
 fn key_of(reg: &ChainRegistry, raw: &RawChainRef) -> ChainKey {
     reg.resolve(raw)
         .key()
@@ -66,6 +80,21 @@ async fn migration_seeds_the_ten_known_chains() {
         snap.slug(key_of(&reg, &RawChainRef::cctp(26))),
         Some("arc"),
         "cctp domain 26"
+    );
+
+    for (id, slug) in DEBRIDGE_SEED {
+        assert_eq!(
+            snap.slug(key_of(&reg, &RawChainRef::debridge(id))),
+            Some(slug),
+            "debridge chain {id}"
+        );
+    }
+    assert!(
+        matches!(
+            reg.resolve(&RawChainRef::debridge("999999999")),
+            ChainRef::Unresolved { .. }
+        ),
+        "an unseeded deBridge chain stays unresolved"
     );
 }
 

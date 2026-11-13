@@ -305,6 +305,10 @@ async fn write_transfer(
             .execute(&mut **db_tx)
             .await?;
         }
+        MessageId::Debridge { .. } => {
+            // The order id is already the row's `message_key`; DLN has no separate
+            // detail table to fill.
+        }
     }
 
     Ok(())
@@ -765,6 +769,7 @@ pub struct StoredTransaction {
 pub struct StoredTransfer {
     pub program: String,
     pub protocol: String,
+    pub message_key: String,
     pub direction: String,
     pub observed_tx_hash: String,
     pub event_index: i16,
@@ -809,7 +814,7 @@ pub async fn get_transaction_with_transfers(
         r#"
         SELECT t.hash, t.chain, t.status AS tx_status, t.slot, t.timestamp,
                t.fee_lamports, t.signer,
-               b.program, b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+               b.program, b.protocol, b.message_key, b.direction, b.observed_tx_hash, b.event_index,
                b.via, b.via_ref,
                b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
                b.source_wallet, b.source_explorer_url,
@@ -854,6 +859,7 @@ pub async fn get_transaction_with_transfers(
         transfers.push(StoredTransfer {
             program: row.try_get("program")?,
             protocol,
+            message_key: row.try_get("message_key")?,
             direction: row.try_get("direction")?,
             observed_tx_hash: row.try_get("observed_tx_hash")?,
             event_index: row.try_get("event_index")?,
@@ -918,7 +924,7 @@ pub struct ListedTransfer {
 
 const LIST_SELECT: &str = r#"
 SELECT b.id, b.created_at,
-       b.program, b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+       b.program, b.protocol, b.message_key, b.direction, b.observed_tx_hash, b.event_index,
        b.via, b.via_ref,
        b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
        b.source_wallet, b.source_explorer_url,
@@ -986,6 +992,7 @@ pub async fn list_transfers(
         let transfer = StoredTransfer {
             program: row.try_get("program")?,
             protocol: row.try_get("protocol")?,
+            message_key: row.try_get("message_key")?,
             direction: row.try_get("direction")?,
             observed_tx_hash: row.try_get("observed_tx_hash")?,
             event_index: row.try_get("event_index")?,
