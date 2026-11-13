@@ -11,6 +11,10 @@ pub async fn get_operation_by_tx_hash(
     let url = format!("{base_url}/api/v1/operations?txHash={hash}");
     let resp = client.get(&url).send().await?;
 
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::UpstreamRateLimited("wormhole"));
+    }
+
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
             provider: "wormhole",
@@ -42,6 +46,9 @@ pub async fn get_destination_tx(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::UpstreamRateLimited("wormhole"));
+    }
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
             provider: "wormhole",
@@ -70,6 +77,9 @@ pub async fn get_vaa_source_tx(
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::UpstreamRateLimited("wormhole"));
     }
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
@@ -109,7 +119,62 @@ pub fn destination_tx_from_global_tx(payload: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::get;
     use serde_json::json;
+
+    /// A loopback WormholeScan whose every route answers 429, like the real API does
+    /// when the caller is over its budget.
+    async fn serve_429() -> String {
+        async fn too_many() -> (StatusCode, axum::Json<Value>) {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({"status": 429, "message": "Too many requests"})),
+            )
+        }
+
+        let app = Router::new().fallback(get(too_many));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve stub");
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_429_is_a_transient_rate_limit() {
+        let base = serve_429().await;
+        let client = Client::new();
+        let id = BridgeMessageId {
+            emitter_chain: 2,
+            emitter_address: "09".repeat(32),
+            sequence: 42,
+        };
+
+        let errors = [
+            get_operation_by_tx_hash(&client, &base, "sig")
+                .await
+                .expect_err("a 429 is not an operation"),
+            get_destination_tx(&client, &base, &id)
+                .await
+                .expect_err("a 429 is not a destination tx"),
+            get_vaa_source_tx(&client, &base, &id)
+                .await
+                .expect_err("a 429 is not a source tx"),
+        ];
+
+        for error in errors {
+            assert!(
+                matches!(error, AppError::UpstreamRateLimited("wormhole")),
+                "{error:?}"
+            );
+            assert!(error.is_transient(), "{error:?} should be transient");
+        }
+    }
 
     #[test]
     fn reads_the_destination_tx() {

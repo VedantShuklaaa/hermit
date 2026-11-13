@@ -289,6 +289,27 @@ pub async fn start_fake_upstream_with(envs: &[(&str, &str)]) -> FakeUpstream {
     panic!("fake_upstream did not answer on {}", fake.base_url);
 }
 
+/// A signature the fake upstream replays as `fixture`. Any signature maps to a
+/// fixture by hash, so probing finds one for the fixture a test needs.
+pub async fn signature_for_fixture(base_url: &str, fixture: &str) -> String {
+    let client = Client::new();
+    for i in 0..500 {
+        let hash = format!("fixture-lookup-{i}");
+        let body: Value = client
+            .get(format!("{base_url}/debug/fixture/{hash}"))
+            .send()
+            .await
+            .expect("debug fixture request")
+            .json()
+            .await
+            .expect("debug fixture body");
+        if body["fixture"].as_str() == Some(fixture) {
+            return hash;
+        }
+    }
+    panic!("no signature maps to fixture {fixture}");
+}
+
 /// Signatures whose fixture makes the classifier produce a transfer, so a test
 /// exercises the path that decodes and persists rather than a no-transfer tx.
 pub async fn transfer_signatures(base_url: &str, count: usize) -> Vec<String> {
