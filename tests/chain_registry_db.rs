@@ -46,6 +46,12 @@ async fn migration_seeds_the_ten_known_chains() {
         let key = key_of(&reg, &RawChainRef::new(NS_EVM, id));
         assert_eq!(snap.slug(key), Some(slug), "evm {id}");
     }
+
+    assert_eq!(
+        snap.slug(key_of(&reg, &RawChainRef::cctp(19))),
+        Some("hyperevm"),
+        "cctp domain 19"
+    );
 }
 
 #[tokio::test]

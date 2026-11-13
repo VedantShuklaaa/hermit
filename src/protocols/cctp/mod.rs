@@ -269,7 +269,7 @@ fn word_at(data: &[u8], at: usize) -> Option<[u8; 32]> {
 fn domain_address(domain: u32, word: &[u8; 32]) -> Option<String> {
     match domain {
         SOLANA_DOMAIN => Some(bs58::encode(word).into_string()),
-        0 | 1 | 3 | 6 => Some(format!("0x{}", hex::encode(&word[12..]))),
+        0 | 1 | 3 | 6 | 19 => Some(format!("0x{}", hex::encode(&word[12..]))),
         _ => None,
     }
 }
@@ -399,6 +399,10 @@ mod tests {
         let token = t.token.expect("token");
         assert_eq!(token.chain, RawChainRef::cctp(0));
         assert_eq!(token.address, format!("0x{}", "22".repeat(20)));
+        assert_eq!(
+            domain_address(19, &[0x22; 32]),
+            Some(format!("0x{}", "22".repeat(20)))
+        );
         assert_eq!(t.amount_raw.unwrap().as_str(), "1000000");
         assert_eq!(t.event_index, 0);
     }
