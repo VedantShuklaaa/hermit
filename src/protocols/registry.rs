@@ -186,7 +186,7 @@ pub fn parse_program_overrides(csv: &str) -> Result<Vec<(Protocol, String)>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::debridge::DLN_SOURCE;
+    use crate::protocols::debridge::{DLN_DESTINATION, DLN_SOURCE};
     use crate::protocols::{Reject, solana_tx::Instruction};
 
     struct Fake {
@@ -341,14 +341,19 @@ mod tests {
                 "ProgramA".to_string(),
                 "ProgramB".to_string(),
                 "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
                 DLN_SOURCE.to_string(),
             ],
-            "the configured Token Bridge and the fixed DLN source are always registered"
+            "the configured Token Bridge and the fixed DLN programs are always registered"
         );
 
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
+            vec![
+                "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
+                DLN_SOURCE.to_string(),
+            ],
             "with no override the configured Token Bridge and DLN are the whole set"
         );
     }
@@ -357,7 +362,11 @@ mod tests {
     fn the_nft_bridge_is_registered_only_when_configured() {
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
+            vec![
+                "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
+                DLN_SOURCE.to_string(),
+            ],
             "unset means the NFT adapter adds nothing"
         );
 
@@ -372,6 +381,7 @@ mod tests {
             vec![
                 "NftBridge".to_string(),
                 "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
                 DLN_SOURCE.to_string(),
             ]
         );
@@ -385,8 +395,12 @@ mod tests {
     fn the_cctp_programs_are_registered_only_when_configured() {
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
-            "unset CCTP is no behaviour change beyond the fixed DLN source"
+            vec![
+                "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
+                DLN_SOURCE.to_string(),
+            ],
+            "unset CCTP is no behaviour change beyond the fixed DLN programs"
         );
 
         let registry = configured_registry(
@@ -401,6 +415,7 @@ mod tests {
                 "MessageTransmitter".to_string(),
                 "TokenBridge".to_string(),
                 "TokenMessenger".to_string(),
+                DLN_DESTINATION.to_string(),
                 DLN_SOURCE.to_string(),
             ]
         );
@@ -420,9 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn the_debridge_source_is_always_registered() {
+    fn the_debridge_programs_are_always_registered() {
         let registry = configured_registry(&[], "TokenBridge", None, None);
         assert_eq!(registry.protocols_for(DLN_SOURCE), vec![Protocol::Debridge]);
+        assert_eq!(
+            registry.protocols_for(DLN_DESTINATION),
+            vec![Protocol::Debridge]
+        );
     }
 
     #[test]
