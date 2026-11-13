@@ -1,32 +1,40 @@
-//! deBridge DLN source side on Solana. Pure: no IO, no clock, no database.
+//! deBridge DLN on Solana: source-side order creation and destination-side
+//! fulfillment. Pure: no IO, no clock, no database.
 //!
 //! Verification sources:
 //!
 //! * program IDs — <https://docs.debridge.com/dln-details/overview/deployed-contracts>
-//!   (`DlnSource`)
-//! * instruction and event layouts — the official IDL linked from those docs,
-//!   <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/src.ts>
+//!   (`DlnSource`, `DlnDestination`)
+//! * instruction and event layouts — the official IDLs linked from those docs,
+//!   <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/src.ts> and
+//!   <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/dst.ts>
 //! * chain IDs — <https://docs.debridge.com/home/architecture/supported-chains>
 //! * discriminators — Anchor's `sha256("global:<snake_case>")[..8]` for instructions
 //!   and `sha256("event:<EventName>")[..8]` for events. The `create_order_with_nonce`
-//!   value and both event values are confirmed against mainnet tx
+//!   value and both source event values are confirmed against mainnet tx
 //!   `3ggTVbZvk38HfKTQ8fcTYkvTeDc1uw75KTGUzpm1MVHFJWHhFSbQBALshBmszepZDULTqTqxnMJhAPiT6UgXMUK5d`.
+//!   The `fulfill_order` and `Fulfilled` values are confirmed against mainnet tx
+//!   `4V5XFQ8ViuWi4VxHWb7bCZtWGzyPgZnKTf6ABnC1VUXd2y5wgfrn8EGmzwst1iP19ySPA7jwx87KWX3S2GYUh8Lr`.
 //!
-//! Only order creation is indexed. The order id is read from the `CreatedOrderId`
-//! event emitted in the same successful transaction, so no hashing dependency is
-//! needed. Every other `DlnSource` instruction is not a transfer.
+//! Source-side `createOrder`/`createOrderWithNonce` are outbound. Destination-side
+//! `fulfillOrder` is inbound. Both read the 32-byte order id from an event emitted in
+//! the same successful transaction (`CreatedOrderId`, `Fulfilled`), so a fill and its
+//! source order share one `(protocol, message_key)` row. Cancel, claim and unlock
+//! instructions are not transfers and are not indexed.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::chains::RawChainRef;
 use crate::protocols::amount::RawAmount;
 use crate::protocols::{
-    BridgeAdapter, Classification, DEBRIDGE_PROGRAM, DetectedTransfer, Direction, MessageId,
-    Protocol, Reject, SolanaTx, TokenRef,
+    BridgeAdapter, Classification, DEBRIDGE_PROGRAM, DetectedTransfer, Direction, Instruction,
+    MessageId, Protocol, Reject, SolanaTx, TokenRef,
 };
 
 /// Verified mainnet `DlnSource` program.
 pub const DLN_SOURCE: &str = "src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4";
+/// Verified mainnet `DlnDestination` program.
+pub const DLN_DESTINATION: &str = "dst5MGcFPoBeREFAA5E3tU5ij8m5uVYwkzkSAbsLbNo";
 
 /// Solana's deBridge DLN internal chain ID.
 const SOLANA_CHAIN: &str = "7565164";
@@ -34,12 +42,14 @@ const SOLANA_CHAIN: &str = "7565164";
 // Anchor instruction discriminators (`sha256("global:<snake_case>")[..8]`).
 const CREATE_ORDER: [u8; 8] = [0x8d, 0x36, 0x25, 0xcf, 0xed, 0xd2, 0xfa, 0xd7];
 const CREATE_ORDER_WITH_NONCE: [u8; 8] = [0x82, 0x83, 0x62, 0xbe, 0x28, 0xce, 0x44, 0x32];
+const FULFILL_ORDER: [u8; 8] = [0x3d, 0xd6, 0x27, 0xf8, 0x41, 0xd4, 0x99, 0x24];
 
 // Anchor event discriminators (`sha256("event:<EventName>")[..8]`).
 const CREATED_ORDER: [u8; 8] = [0x6a, 0x57, 0x4a, 0xe6, 0x20, 0x78, 0x47, 0xd2];
 const CREATED_ORDER_ID: [u8; 8] = [0xbb, 0x29, 0x1b, 0x49, 0x0c, 0x3f, 0x0d, 0x54];
+const FULFILLED: [u8; 8] = [0xd2, 0xae, 0x83, 0xd5, 0x28, 0xb6, 0x53, 0x6e];
 
-/// deBridge DLN source adapter. The program ID is fixed, so the adapter is always
+/// deBridge DLN adapter. Both program IDs are fixed, so the adapter is always
 /// registered.
 pub struct DebridgeAdapter;
 
@@ -49,7 +59,7 @@ impl BridgeAdapter for DebridgeAdapter {
     }
 
     fn default_program_ids(&self) -> &'static [&'static str] {
-        &[DLN_SOURCE]
+        &[DLN_SOURCE, DLN_DESTINATION]
     }
 
     fn classify(&self, tx: &SolanaTx) -> Classification {
@@ -57,12 +67,13 @@ impl BridgeAdapter for DebridgeAdapter {
             return Classification::Rejected(Reject::NotTransfer("transaction failed"));
         }
 
-        let mut creates = 0usize;
+        let mut creates = Vec::new();
+        let mut fills = Vec::new();
         let mut saw_dln = false;
         for ix in tx
             .instructions
             .iter()
-            .filter(|ix| ix.program_id == DLN_SOURCE)
+            .filter(|ix| ix.program_id == DLN_SOURCE || ix.program_id == DLN_DESTINATION)
         {
             saw_dln = true;
             let Some(discriminator) = ix.data.get(..8) else {
@@ -70,14 +81,18 @@ impl BridgeAdapter for DebridgeAdapter {
                     "debridge instruction without discriminator",
                 ));
             };
-            if discriminator == CREATE_ORDER || discriminator == CREATE_ORDER_WITH_NONCE {
-                creates += 1;
+            if ix.program_id == DLN_SOURCE
+                && (discriminator == CREATE_ORDER || discriminator == CREATE_ORDER_WITH_NONCE)
+            {
+                creates.push(ix);
+            } else if ix.program_id == DLN_DESTINATION && discriminator == FULFILL_ORDER {
+                fills.push(ix);
             }
-            // Everything else on DlnSource is admin, configuration or another order
-            // action. None of those is a transfer.
+            // Everything else on either DLN program is admin, configuration, cancel,
+            // claim or unlock. None of those is a transfer.
         }
 
-        if creates == 0 {
+        if creates.is_empty() && fills.is_empty() {
             return Classification::Rejected(Reject::NotTransfer(if saw_dln {
                 "debridge admin instruction"
             } else {
@@ -85,33 +100,57 @@ impl BridgeAdapter for DebridgeAdapter {
             }));
         }
 
-        let mut orders = Vec::new();
-        let mut order_ids = Vec::new();
-        for event in dln_events(&tx.logs) {
-            match event {
-                Event::Order(payload) => orders.push(payload),
-                Event::OrderId(payload) => {
-                    if payload.len() != 40 {
-                        return Classification::Rejected(Reject::Malformed(
-                            "debridge CreatedOrderId event is truncated",
-                        ));
-                    }
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(&payload[8..40]);
-                    order_ids.push(id);
-                }
-            }
-        }
+        let source_events = events_under(&tx.logs, DLN_SOURCE);
+        let orders: Vec<&Vec<u8>> = source_events
+            .iter()
+            .filter(|payload| payload.starts_with(&CREATED_ORDER))
+            .collect();
+        let order_ids: Vec<&[u8]> = source_events
+            .iter()
+            .filter(|payload| payload.starts_with(&CREATED_ORDER_ID))
+            .map(Vec::as_slice)
+            .collect();
+        let destination_events = events_under(&tx.logs, DLN_DESTINATION);
+        let fulfilled: Vec<&Vec<u8>> = destination_events
+            .iter()
+            .filter(|payload| payload.starts_with(&FULFILLED))
+            .collect();
 
-        if orders.len() != creates || order_ids.len() != creates {
+        if orders.len() != creates.len() || order_ids.len() != creates.len() {
             return Classification::Rejected(Reject::Malformed(
                 "debridge events do not match order instructions",
             ));
         }
+        if fulfilled.len() != fills.len() {
+            return Classification::Rejected(Reject::Malformed(
+                "debridge Fulfilled events do not match fulfill instructions",
+            ));
+        }
 
-        let mut transfers = Vec::with_capacity(creates);
+        let mut transfers = Vec::with_capacity(creates.len() + fills.len());
         for (index, (order, id)) in orders.iter().zip(order_ids.iter()).enumerate() {
-            match build_transfer(tx, order, id, index as u16) {
+            if id.len() != 40 {
+                return Classification::Rejected(Reject::Malformed(
+                    "debridge CreatedOrderId event is truncated",
+                ));
+            }
+            let mut order_id = [0u8; 32];
+            order_id.copy_from_slice(&id[8..40]);
+            match build_transfer(tx, order, &order_id, index as u16) {
+                Ok(transfer) => transfers.push(transfer),
+                Err(reject) => return Classification::Rejected(reject),
+            }
+        }
+        for (index, (ix, event)) in fills.iter().zip(fulfilled.iter()).enumerate() {
+            if event.len() < 40 {
+                return Classification::Rejected(Reject::Malformed(
+                    "debridge Fulfilled event is truncated",
+                ));
+            }
+            let mut order_id = [0u8; 32];
+            order_id.copy_from_slice(&event[8..40]);
+            let event_index = creates.len() + index;
+            match build_fill(tx, ix, &order_id, event_index as u16) {
                 Ok(transfer) => transfers.push(transfer),
                 Err(reject) => return Classification::Rejected(reject),
             }
@@ -166,6 +205,55 @@ fn build_transfer(
     })
 }
 
+fn build_fill(
+    tx: &SolanaTx,
+    ix: &Instruction,
+    order_id: &[u8; 32],
+    event_index: u16,
+) -> Result<DetectedTransfer, Reject> {
+    let body = ix.data.get(8..).ok_or(Reject::Malformed(
+        "debridge fulfill_order data is truncated",
+    ))?;
+    let order = parse_order_body(body)?;
+    let give_chain = decimal(&order.give.chain);
+    let take_chain = decimal(&order.take.chain);
+    if take_chain != SOLANA_CHAIN {
+        return Err(Reject::Malformed("debridge fill take chain is not Solana"));
+    }
+
+    let source = RawChainRef::debridge(give_chain.as_str());
+    let destination = RawChainRef::debridge(SOLANA_CHAIN);
+    // The source-side amount and token are stored on both legs of one order. The take
+    // offer is what the taker delivers on Solana and can differ (fees, patch).
+    let amount = RawAmount::from_be_bytes(&order.give.amount).ok_or(Reject::Malformed(
+        "debridge order give amount is not a u256",
+    ))?;
+    let token = decode_address(&give_chain, &order.give.token).map(|address| TokenRef {
+        chain: source.clone(),
+        address,
+    });
+
+    Ok(DetectedTransfer {
+        program: DEBRIDGE_PROGRAM.to_string(),
+        message: MessageId::Debridge {
+            order_id: hex::encode(order_id),
+        },
+        direction: Direction::Inbound,
+        observed_tx: tx.signature.clone(),
+        event_index,
+        source,
+        destination,
+        // The maker is in the order; the fee payer is only a fallback.
+        source_wallet: decode_address(&give_chain, &order.maker).or_else(|| tx.signer.clone()),
+        // An unknown destination chain is stored unresolved, never an error.
+        destination_wallet: decode_address(SOLANA_CHAIN, &order.receiver),
+        token,
+        token_symbol: None,
+        amount_raw: Some(amount),
+        via: None,
+    })
+}
+
 struct Order {
     maker: Vec<u8>,
     give: Offer,
@@ -188,8 +276,15 @@ fn parse_order(payload: &[u8]) -> Result<Order, Reject> {
             "debridge CreatedOrder event discriminator",
         ));
     }
-    let mut reader = Reader::new(&payload[8..]);
-    let truncated = || Reject::Malformed("debridge CreatedOrder event is truncated");
+    parse_order_body(&payload[8..])
+}
+
+/// The `Order` struct as it appears at the start of a `CreatedOrder` event and after
+/// the discriminator of a `fulfill_order` instruction. Reading stops at the receiver:
+/// the order id and the remaining authority fields follow it and are not needed.
+fn parse_order_body(data: &[u8]) -> Result<Order, Reject> {
+    let mut reader = Reader::new(data);
+    let truncated = || Reject::Malformed("debridge order is truncated");
 
     let _maker_order_nonce = reader.u64().ok_or_else(truncated)?;
     let maker = reader.vec().ok_or_else(truncated)?.to_vec();
@@ -206,7 +301,7 @@ fn parse_order(payload: &[u8]) -> Result<Order, Reject> {
 }
 
 fn parse_offer(reader: &mut Reader<'_>) -> Result<Offer, Reject> {
-    let truncated = || Reject::Malformed("debridge CreatedOrder event is truncated");
+    let truncated = || Reject::Malformed("debridge order is truncated");
     Ok(Offer {
         chain: reader.array32().ok_or_else(truncated)?,
         token: reader.vec().ok_or_else(truncated)?.to_vec(),
@@ -249,14 +344,9 @@ impl<'a> Reader<'a> {
     }
 }
 
-enum Event {
-    Order(Vec<u8>),
-    OrderId(Vec<u8>),
-}
-
-/// `CreatedOrder` and `CreatedOrderId` events printed while `DlnSource` is the
-/// running program, in log order. Events from inner programs are ignored.
-fn dln_events(logs: &[String]) -> Vec<Event> {
+/// Event payloads printed while `program` is the running program, in log order.
+/// Events from inner programs are ignored.
+fn events_under(logs: &[String], program: &str) -> Vec<Vec<u8>> {
     let mut stack: Vec<&str> = Vec::new();
     let mut out = Vec::new();
 
@@ -265,16 +355,11 @@ fn dln_events(logs: &[String]) -> Vec<Event> {
             continue;
         };
         if let Some(encoded) = rest.strip_prefix("data: ") {
-            if stack.last() != Some(&DLN_SOURCE) {
+            if stack.last() != Some(&program) {
                 continue;
             }
-            let Ok(bytes) = STANDARD.decode(encoded) else {
-                continue;
-            };
-            if bytes.starts_with(&CREATED_ORDER) {
-                out.push(Event::Order(bytes));
-            } else if bytes.starts_with(&CREATED_ORDER_ID) {
-                out.push(Event::OrderId(bytes));
+            if let Ok(bytes) = STANDARD.decode(encoded) {
+                out.push(bytes);
             }
         } else if let Some((id, tail)) = rest.split_once(' ') {
             if tail.starts_with("invoke [") {
@@ -390,6 +475,48 @@ mod tests {
             parsed: None,
             inner_of: None,
         }
+    }
+
+    const FILL_MAKER: [u8; 20] = [0x09; 20];
+    const FILL_TOKEN: [u8; 20] = [0x07; 20];
+    const FILL_RECEIVER: [u8; 32] = [0x08; 32];
+
+    /// A `fulfill_order` instruction: the discriminator, then the leading `Order`
+    /// fields the adapter reads. The order id and authority fields after the receiver
+    /// are deliberately omitted.
+    fn fill_instruction(give_chain: [u8; 32], take_chain: [u8; 32]) -> Instruction {
+        let mut data = FULFILL_ORDER.to_vec();
+        data.extend(0u64.to_le_bytes());
+        put_vec(&mut data, &FILL_MAKER);
+        data.extend(give_chain);
+        put_vec(&mut data, &FILL_TOKEN);
+        data.extend(be32(3_000_000));
+        data.extend(take_chain);
+        put_vec(&mut data, &[]);
+        data.extend(be32(2_000_000));
+        put_vec(&mut data, &FILL_RECEIVER);
+        Instruction {
+            program_id: DLN_DESTINATION.to_string(),
+            accounts: Vec::new(),
+            data,
+            parsed: None,
+            inner_of: None,
+        }
+    }
+
+    fn fulfilled_event(id: &[u8; 32]) -> Vec<u8> {
+        let mut out = FULFILLED.to_vec();
+        out.extend(id);
+        out.extend([0u8; 32]); // taker
+        out
+    }
+
+    fn fill_logs(event: &[u8]) -> Vec<String> {
+        vec![
+            format!("Program {DLN_DESTINATION} invoke [1]"),
+            format!("Program data: {}", STANDARD.encode(event)),
+            format!("Program {DLN_DESTINATION} success"),
+        ]
     }
 
     fn tx_with(instructions: Vec<Instruction>, logs: Vec<String>) -> SolanaTx {
@@ -522,6 +649,107 @@ mod tests {
             vec![
                 format!("Program {DLN_SOURCE} invoke [1]"),
                 format!("Program {DLN_SOURCE} success"),
+            ],
+        );
+        assert_eq!(
+            DebridgeAdapter.classify(&tx),
+            Classification::Rejected(Reject::NotTransfer("debridge admin instruction"))
+        );
+    }
+
+    #[test]
+    fn decodes_a_fill_from_the_fulfilled_event() {
+        let tx = tx_with(
+            vec![fill_instruction(be32(8453), be32(7_565_164))],
+            fill_logs(&fulfilled_event(&ORDER_ID)),
+        );
+
+        let transfer = only_transfer(DebridgeAdapter.classify(&tx));
+        assert_eq!(transfer.program, DEBRIDGE_PROGRAM);
+        assert_eq!(
+            transfer.message,
+            MessageId::Debridge {
+                order_id: hex::encode(ORDER_ID),
+            }
+        );
+        assert_eq!(transfer.message.key(), hex::encode(ORDER_ID));
+        assert_eq!(transfer.direction, Direction::Inbound);
+        assert_eq!(transfer.event_index, 0);
+        assert_eq!(transfer.observed_tx, "sig");
+        assert_eq!(transfer.source, RawChainRef::debridge("8453"));
+        assert_eq!(transfer.destination, RawChainRef::debridge("7565164"));
+        assert_eq!(
+            transfer.amount_raw.as_ref().map(|a| a.as_str()),
+            Some("3000000")
+        );
+        let token = transfer.token.expect("token");
+        assert_eq!(token.chain, RawChainRef::debridge("8453"));
+        assert_eq!(token.address, format!("0x{}", hex::encode(FILL_TOKEN)));
+        assert_eq!(
+            transfer.source_wallet.as_deref(),
+            Some(format!("0x{}", hex::encode(FILL_MAKER)).as_str())
+        );
+        assert_eq!(
+            transfer.destination_wallet.as_deref(),
+            Some(bs58::encode(FILL_RECEIVER).into_string().as_str())
+        );
+    }
+
+    #[test]
+    fn a_fill_without_a_fulfilled_event_is_malformed() {
+        let tx = tx_with(
+            vec![fill_instruction(be32(8453), be32(7_565_164))],
+            vec![
+                format!("Program {DLN_DESTINATION} invoke [1]"),
+                format!("Program {DLN_DESTINATION} success"),
+            ],
+        );
+        assert_eq!(
+            DebridgeAdapter.classify(&tx),
+            Classification::Rejected(Reject::Malformed(
+                "debridge Fulfilled events do not match fulfill instructions"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_fill_whose_take_chain_is_not_solana_is_malformed() {
+        let tx = tx_with(
+            vec![fill_instruction(be32(8453), be32(1))],
+            fill_logs(&fulfilled_event(&ORDER_ID)),
+        );
+        assert_eq!(
+            DebridgeAdapter.classify(&tx),
+            Classification::Rejected(Reject::Malformed("debridge fill take chain is not Solana"))
+        );
+    }
+
+    #[test]
+    fn a_failed_fill_is_never_a_transfer() {
+        let mut tx = tx_with(
+            vec![fill_instruction(be32(8453), be32(7_565_164))],
+            fill_logs(&fulfilled_event(&ORDER_ID)),
+        );
+        tx.failed = true;
+        assert_eq!(
+            DebridgeAdapter.classify(&tx),
+            Classification::Rejected(Reject::NotTransfer("transaction failed"))
+        );
+    }
+
+    #[test]
+    fn cancel_claim_and_unlock_are_not_transfers() {
+        let tx = tx_with(
+            vec![Instruction {
+                program_id: DLN_DESTINATION.to_string(),
+                accounts: Vec::new(),
+                data: [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0].to_vec(),
+                parsed: None,
+                inner_of: None,
+            }],
+            vec![
+                format!("Program {DLN_DESTINATION} invoke [1]"),
+                format!("Program {DLN_DESTINATION} success"),
             ],
         );
         assert_eq!(

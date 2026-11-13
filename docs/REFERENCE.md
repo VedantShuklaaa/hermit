@@ -193,35 +193,51 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   adapter off. When set, both IDs are registered to the CCTP adapter and
   removed from the Wormhole adapter's program set, so no transaction is
   classified twice and an unset deployment sees exactly the old behaviour.
-* **deBridge DLN source side.** `protocols/debridge/mod.rs` implements the same
-  `BridgeAdapter` for DLN on Solana. Only the source-side order creation is
-  indexed; the destination-side fill is a follow-up.
+* **deBridge DLN.** `protocols/debridge/mod.rs` implements the same `BridgeAdapter`
+  for DLN on Solana. It indexes the source-side order creation and the
+  destination-side fill. Cancel, claim and unlock instructions are out of scope.
 
   | Program | ID | Verified against |
   | --- | --- | --- |
   | DlnSource | `src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4` | <https://docs.debridge.com/dln-details/overview/deployed-contracts> |
+  | DlnDestination | `dst5MGcFPoBeREFAA5E3tU5ij8m5uVYwkzkSAbsLbNo` | <https://docs.debridge.com/dln-details/overview/deployed-contracts> |
 
-  The IDL is <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/src.ts>.
+  The IDLs are
+  <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/src.ts> and
+  <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/dst.ts>.
   Instruction discriminators are Anchor's `sha256("global:<snake_case>")[..8]`:
   `create_order = 8d3625cfedd2fad7`,
-  `create_order_with_nonce = 828362be28ce4432`.
+  `create_order_with_nonce = 828362be28ce4432`,
+  `fulfill_order = 3dd627f841d49924`.
   Event discriminators are `sha256("event:<EventName>")[..8]`:
   `CreatedOrder = 6a574ae6207847d2`,
-  `CreatedOrderId = bb291b490c3f0d54`.
-  The `create_order_with_nonce` instruction and both event values were checked
-  against mainnet transaction
+  `CreatedOrderId = bb291b490c3f0d54`,
+  `Fulfilled = d2ae83d528b6536e`.
+  The source values were checked against mainnet transaction
   `3ggTVbZvk38HfKTQ8fcTYkvTeDc1uw75KTGUzpm1MVHFJWHhFSbQBALshBmszepZDULTqTqxnMJhAPiT6UgXMUK5d`
-  (the official parser's create test). Failed transactions, every other
-  `DlnSource` instruction and any transaction whose events do not match its
-  order instructions are rejected, never stored.
+  (the official parser's create test). The destination values were checked
+  against mainnet transaction
+  `4V5XFQ8ViuWi4VxHWb7bCZtWGzyPgZnKTf6ABnC1VUXd2y5wgfrn8EGmzwst1iP19ySPA7jwx87KWX3S2GYUh8Lr`
+  (the official parser's destination test). Failed transactions, every other
+  instruction on either program, and any transaction whose events do not match
+  its order instructions are rejected, never stored.
 
   **Identity.** `MessageId::Debridge { order_id }`, key = the order id as
-  lowercase hex (64 characters). The order id is the 32 bytes after the 8-byte
-  `CreatedOrderId` event discriminator in a `Program data:` log printed while
-  `DlnSource` is the running program. No client-side hashing is needed. The
-  `CreatedOrder` event carries the final `Order`, from which the adapter reads the
-  give amount, the Solana mint, the take chain and the receiver. A `give` chain
-  other than Solana 7565164 is rejected `malformed`.
+  lowercase hex (64 characters). For a source order the id is the 32 bytes after
+  the 8-byte `CreatedOrderId` event discriminator. For a fill it is the 32 bytes
+  after the 8-byte `Fulfilled` event discriminator (the event is
+  `orderId` then `taker`; the `fulfill_order` args are
+  `unvalidatedOrder: Order`, `orderId: [u8; 32]`, `unlockAuthority:
+  Option<publicKey>`). No client-side hashing is needed. Because both legs use
+  the same order id, they share one `(protocol, message_key)` row.
+
+  The `Order` struct is the same on both sides: `makerOrderNonce: u64`,
+  `makerSrc: bytes`, `give: Offer`, `take: Offer`, `receiverDst: bytes`
+  followed by authority and optional-call fields. `Offer` is
+  `chainId: [u8; 32]`, `tokenAddress: bytes`, `amount: [u8; 32]`. The adapter
+  reads only up to `receiverDst`. On the source side the `give` chain must be
+  Solana 7565164; on the destination side the `take` chain must be, and the
+  `give` chain is the origin.
 
   **Chains.** The migration `20261115130000_debridge_chain_ids.sql` seeds the
   DLN internal IDs checked against
@@ -244,17 +260,21 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   HyperEVM and Monad use DLN's internal IDs, not their EVM chain IDs. Gnosis is
   not on DLN's supported list; Linea and the other listed chains are not in this
   registry yet. Any other ID is stored as an unresolved `debridge` reference.
-  Destination addresses are decoded for the seeded chains: 32-byte Solana
-  addresses as base58, 20-byte EVM addresses as `0x` + hex. An unknown chain
-  leaves the wallet absent, never an error. The source amount and token come from
-  the order's `give` side, so they are read for Solana.
+  Addresses are decoded for the seeded chains: 32-byte Solana addresses as
+  base58, 20-byte EVM addresses as `0x` + hex. An unknown chain leaves the
+  wallet absent, never an error. The amount and token come from the order's
+  `give` side on both legs, so a source row and its fill agree.
 
   **Read path.** A source-side row starts `Pending`: the observed Solana tx is
-  the source and no destination leg is indexed yet. `/api/v1` does not represent
-  it; `/api/v2` returns
+  the source and the destination leg may not be indexed yet. A destination fill
+  is `Completed`: the observed Solana tx is the destination, so `destination_tx_hash`
+  is set and `source_tx_hash` is absent until the source is indexed or enriched.
+  When both legs are written, the upsert merges the tx hashes and the status is
+  `Completed`; a later source observation never moves it back to `Pending`.
+  `/api/v1` does not represent DLN; `/api/v2` returns
   `message_id: { protocol: "debridge", order_id }` and
-  `program: "debridge"`. The adapter is always registered under the fixed
-  `DlnSource` program; there is no `SOLANA_DEBRIDGE_*` configuration.
+  `program: "debridge"`. The adapter is always registered under the two fixed
+  programs; there is no `SOLANA_DEBRIDGE_*` configuration.
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -510,7 +530,7 @@ hermit/
 │   │   ├── cctp/
 │   │   │   └── mod.rs                  # CCTP V2 inbound completion adapter, opt-in
 │   │   └── debridge/
-│   │       └── mod.rs                  # DLN source-side createOrder adapter
+│   │       └── mod.rs                  # DLN source createOrder + destination fulfillOrder
 │   ├── chains/
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve
 │   │   └── db.rs                       # load_snapshot
@@ -562,6 +582,7 @@ hermit/
 │   ├── cctp_persistence.rs
 │   ├── common/
 │   ├── debridge_fixtures.rs
+│   ├── debridge_persistence.rs
 │   ├── decode_unit.rs
 │   ├── evm_log_watch.rs
 │   ├── fixtures_decode.rs
@@ -710,7 +731,7 @@ and the miss is not cached, so a later request retries.
 
 * **An orphaned join stays.** A hash or `Completed` status written from an event that a reorg later deletes is never cleared; a generous `finality_depth` is the mitigation.
 * **Outbound NFT transfers never leave `Pending`.** The NFT side of a transfer on an EVM chain emits no event the watcher can join: the EVM watcher is Token Bridge and Core Bridge only, and an NFT destination tx is not confirmed by watching. WormholeScan's destination tx hash is still recorded as a hint, but the status deliberately stays `Pending` rather than advancing on an unverified hint. An inbound redeem on Solana is decoded from the posted VAA and is `Completed`.
-* **deBridge source-side orders stay `Pending`.** Only `DlnSource` on Solana is indexed. The destination fill is not decoded, so nothing advances the row and no destination tx hash is set. No enrichment provider covers DLN either, so the background re-enrichment leaves these rows untouched.
+* **deBridge DLN cancel, claim and unlock are not indexed.** `createOrder`/`createOrderWithNonce` and `fulfillOrder` are decoded, but `cancelOrder`, `sendOrderCancel`, `sendUnlock` and `sendBatchUnlock` are not, so a cancelled or unlocked order keeps whatever row its create or fill produced. DLN has no enrichment provider: a source order that is never filled stays `Pending`, and a fill seen before its source keeps `source_tx_hash` NULL until the source leg is indexed.
 
 ***
 
@@ -1078,14 +1099,22 @@ cargo test
   Unit tests in `src/protocols/wormhole/nft_bridge.rs` cover the instruction
   table, both send variants, both completions from synthetic posted VAAs,
   admin/metadata rejection, malformed and short payloads, and outbound pairing.
-* `tests/debridge_fixtures.rs`: golden test over a captured mainnet
-  `createOrderWithNonce` transaction. The decoded order id (from `CreatedOrderId`),
-  amount, Solana mint, destination chain (1) and destination wallet are checked
-  against the on-chain events. No network. Unit tests in
-  `src/protocols/debridge/mod.rs` cover a plain `createOrder`, the same decoding
-  for both instructions from synthetic Borsh data and logs, an unknown
-  destination chain, admin/other instructions, a failed transaction, a create
-  without an order-id event, and an event printed by an inner program.
+* `tests/debridge_fixtures.rs`: golden tests over captured mainnet
+  `createOrderWithNonce` and `fulfillOrder` transactions. The source test checks
+  the order id (from `CreatedOrderId`), amount, Solana mint, destination chain
+  (1) and destination wallet against the on-chain events. The fill test checks the
+  order id (from `Fulfilled`), the origin chain (8453), the Solana destination,
+  the source token/amount and both wallets, and that the row values are
+  `Completed` with the observed tx as `destination_tx_hash`. No network.
+  `tests/debridge_persistence.rs` (Postgres) persists a source order and its fill
+  and shows they converge on one row with both tx hashes and `Completed`, in
+  either arrival order. Unit tests in `src/protocols/debridge/mod.rs` cover a
+  plain `createOrder`, the same decoding for both source instructions from
+  synthetic Borsh data and logs, a fill from a synthetic `fulfill_order`
+  instruction and `Fulfilled` event, an unknown destination chain, admin/other
+  instructions (including cancel/claim/unlock discriminators), a failed
+  transaction, a create without an order-id event or a fill without its event, a
+  fill whose take chain is not Solana, and an event printed by an inner program.
 * `tests/multi_program_ingestion.rs`: the real ingester against a loopback
   WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
   get one `logsSubscribe` each, their notifications advance separate checkpoints
@@ -1204,7 +1233,8 @@ Each phase adds one protocol, in descending order of Solana bridge volume:
 
 Candidates: Mayan (Swift, MCTP), LayerZero/Stargate, Allbridge, Hyperlane,
 Chainlink CCIP, Across. Circle CCTP (inbound completions) and deBridge DLN
-(source-side orders) are indexed; their remaining directions are follow-ups.
+(source orders and destination fills) are indexed; CCTP's send side and DLN's
+cancel/claim/unlock instructions remain follow-ups.
 
 #### Later upgrade: unknown-chain resolution
 

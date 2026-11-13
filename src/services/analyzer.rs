@@ -8,7 +8,7 @@ use crate::domain::transaction::{NormalisedTransaction, TxStatus};
 use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
 use crate::error::AppError;
 use crate::normaliser;
-use crate::protocols::{Protocol, SolanaTx};
+use crate::protocols::{Direction, Protocol, SolanaTx};
 use crate::services::correlator;
 use crate::services::detect;
 use crate::services::token_metadata::resolve_token_metadata;
@@ -151,10 +151,16 @@ async fn analyse_tx_inner(
                     // CCTP has no v1 representation and no WormholeScan enrichment: the
                     // chain alone carries everything stored.
                     Protocol::Cctp => (None, detect::cctp_row_values(transfer, &snapshot)),
-                    // deBridge is source-side only for now. The observed tx is the
-                    // Solana source, so the row is Pending until a destination leg is
-                    // indexed.
-                    Protocol::Debridge => (None, detect::debridge_row_values(transfer, &snapshot)),
+                    // deBridge: the observed tx is the source for a create and the
+                    // destination for a fill, so the row's status follows direction.
+                    Protocol::Debridge => (
+                        None,
+                        if transfer.direction == Direction::Inbound {
+                            detect::debridge_destination_row_values(transfer, &snapshot)
+                        } else {
+                            detect::debridge_row_values(transfer, &snapshot)
+                        },
+                    ),
                 };
                 decoded.push(DecodedTransfer {
                     detected: transfer.clone(),
