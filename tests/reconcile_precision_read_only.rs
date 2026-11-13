@@ -84,6 +84,7 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             bridge::protocols::Protocol::Wormhole,
             bridge::protocols::wormhole::TOKEN_BRIDGE.to_string(),
         )],
+        solana_nft_bridge_program: None,
         solana_ws_url: "ws://127.0.0.1:0".to_string(),
         allowed_origins: Vec::new(),
         ingest: IngestConfig {

@@ -91,6 +91,38 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   `source_tx_hash` is nullable, null only for a redeem whose origin tx is not
   known yet. A redeem that still goes through the WormholeScan-driven path is
   turned around the same way (`detect::as_inbound_observation`).
+* **Wormhole NFT Bridge (opt-in).** `protocols/wormhole/nft_bridge.rs` implements
+  the same `BridgeAdapter` for the NFT Bridge program
+  `WnFt12ZrnzZrFZkt2xsNsaNWoQribnuQ5B5FrDbwDhD`, verified against
+  `sdk/js/src/utils/consts.ts` (`MAINNET.solana.nft_bridge`),
+  `solana/modules/nft_bridge/program/src/lib.rs` (instruction order) and
+  `whitepapers/0006_nft_bridge.md` plus `messages.rs` (payload). The instruction
+  indexes are `initialize=0`, `complete_native=1`, `complete_wrapped=2`,
+  `complete_wrapped_meta=3`, `transfer_wrapped=4`, `transfer_native=5`,
+  `register_chain=6`, `upgrade_contract=7`. Sends (`4`, `5`) are outbound
+  `Pending`, paced against the core `PostMessage` CPI exactly as the Token
+  Bridge adapter pairs them (same parent, later execution, core emitter account
+  among the instruction's accounts, k-th `Sequence:` log for the k-th
+  `PostMessage`). Completions (`1`, `2`) are inbound `Completed`, decoded from
+  the posted VAA account at index 2 (preloaded, core-bridge owned); without it
+  the redeem is `Unsupported`. `initialize`, `register_chain` and
+  `upgrade_contract` are rejected `not_transfer` ("nft bridge admin
+  instruction"), and `complete_wrapped_meta` is rejected `not_transfer` too —
+  it only attaches SPL metadata to an already redeemed NFT, it does not move
+  one. The transfer payload is payload ID `1`: token address (32), token chain
+  (u16 BE), symbol (32, NUL-padded), name (32), token id (32), URI length (u8),
+  URI, recipient (32), recipient chain (u16 BE). Representation on
+  `BridgeTransfer`: `amount = 1` (one NFT is one unit; the payload has no
+  amount), `token_symbol` is the payload's symbol (chain data, so it wins over
+  token metadata), and `token` is the mint for a Solana-origin NFT
+  (`token_chain == 1`, `token_id` is the mint) and otherwise the
+  collection/contract on the origin chain (`token_chain`, `token_address`).
+  Name, URI and raw `token_id` are not persisted: no column, and no new table.
+  Rows use the existing `MessageId::Wormhole` key, so an NFT message never
+  collides with a Token Bridge one. The program ID is opt-in: the adapter is
+  registered only when `SOLANA_NFT_BRIDGE_PROGRAM` is set, and that program is
+  never also registered to the Token Bridge adapter, so an unset variable keeps
+  an existing deployment exact (same subscriptions, same registry, same rows).
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -128,7 +160,11 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     `token_bridge` rows and `/api/v2` exposes the field additively.
 * **Per-program Solana ingestion (A4, ingestion plumbing).** The configured set
   is `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV), or the single
-  `SOLANA_TOKEN_BRIDGE_PROGRAM` when the list is unset. Every entry gets its own
+  `SOLANA_TOKEN_BRIDGE_PROGRAM` when the list is unset. A second, separately
+  configured Wormhole program can be added with `SOLANA_NFT_BRIDGE_PROGRAM`:
+  when set it is registered to the NFT Bridge adapter and subscribed like any
+  other program, and when unset the NFT Bridge is not subscribed to at all.
+  Every entry gets its own
   `logsSubscribe` (`mentions` takes one address), checkpoint
   (`solana:<program>_last_ingested_slot`), backfill, reconnect/watchdog loop and
   reconciliation-poll stream. A rejected subscription, a dead connection or a
@@ -328,6 +364,7 @@ hermit/
 │   │   ├── amount.rs                   # RawAmount
 │   │   └── wormhole/
 │   │       ├── mod.rs                  # Token Bridge adapter, outbound and inbound
+│   │       ├── nft_bridge.rs           # NFT Bridge adapter, opt-in via SOLANA_NFT_BRIDGE_PROGRAM
 │   │       └── posted_vaa.rs           # core bridge posted VAA account parser
 │   ├── chains/
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve
@@ -523,6 +560,7 @@ and the miss is not cached, so a later request retries.
 ## Known limitations
 
 * **An orphaned join stays.** A hash or `Completed` status written from an event that a reorg later deletes is never cleared; a generous `finality_depth` is the mitigation.
+* **Outbound NFT transfers never leave `Pending`.** The NFT side of a transfer on an EVM chain emits no event the watcher can join: the EVM watcher is Token Bridge and Core Bridge only, and an NFT destination tx is not confirmed by watching. WormholeScan's destination tx hash is still recorded as a hint, but the status deliberately stays `Pending` rather than advancing on an unverified hint. An inbound redeem on Solana is decoded from the posted VAA and is `Completed`.
 
 ***
 
@@ -542,9 +580,10 @@ and the miss is not cached, so a later request retries.
 ### `/api/v1` and programs other than the Token Bridge
 
 `/api/v1` keeps the frozen Wormhole Token Bridge shape. Every `bridge_transfers`
-row records the sub-program that decoded it in `program` (`token_bridge` today).
-The v1 compatibility mapper returns only a row whose `program = 'token_bridge'`;
-a transaction whose transfers all come from another program is rejected with
+row records the sub-program that decoded it in `program` (`token_bridge`, or
+`nft_bridge` for the NFT Bridge). The v1 compatibility mapper returns only a row
+whose `program = 'token_bridge'`; a transaction whose transfers all come from
+another program (for example `nft_bridge`) is rejected with
 `422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
 carries `program` on every transfer, and the field is additive: v1 response
 bodies are byte for byte unchanged.
@@ -777,7 +816,11 @@ scrape_configs:
   fails startup naming the variable. One `logsSubscribe`, checkpoint and
   backfill run per entry, and the Token Bridge address from
   `SOLANA_TOKEN_BRIDGE_PROGRAM` is always part of the set (so `/health` has a
-  checkpoint to read).
+  checkpoint to read). `SOLANA_NFT_BRIDGE_PROGRAM` is optional and opt-in: when
+  set to the NFT Bridge program address it is validated the same way, registered
+  to the NFT Bridge adapter (never to the Token Bridge adapter, even if it also
+  appears in `SOLANA_BRIDGE_PROGRAMS`) and subscribed to with its own
+  checkpoint. When unset, nothing about an existing deployment changes.
 * **Chain registry:** `CHAIN_REGISTRY_REFRESH_SECS` (default 60, min 5).
 * **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
   per chain (suffix is the lowercased `chains.slug`, e.g.
@@ -863,11 +906,26 @@ cargo test
   unknown error and the Alchemy free-tier range error). Capture logs with
   `scripts/capture_evm_fixtures.sh` and an `EVM_RPC_ETHEREUM` from the
   environment; the key is never written.
+* `tests/nft_bridge_fixtures.rs`: golden tests over captured mainnet NFT Bridge
+  transactions. Each send pairs the Helius transaction with WormholeScan's
+  operation, and the adapter is checked against the signed VAA inside that
+  operation (payload ID, token, symbol, recipient), not WormholeScan's summary.
+  A native send, a wrapped send, both completion variants (from a posted VAA
+  account reconstructed because the core bridge closes it after redemption), an
+  outbound row that keeps `Pending` after WormholeScan names a destination, a
+  completion without its account (`Unsupported`) and a failed transaction
+  (`not_transfer`). `tests/nft_bridge_persistence.rs` (Postgres) covers the
+  `program = 'nft_bridge'` discriminator, one row per message key, a status that
+  never moves backwards, and an unknown destination chain stored unresolved.
+  Unit tests in `src/protocols/wormhole/nft_bridge.rs` cover the instruction
+  table, both send variants, both completions from synthetic posted VAAs,
+  admin/metadata rejection, malformed and short payloads, and outbound pairing.
 * `tests/multi_program_ingestion.rs`: the real ingester against a loopback
   WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
   get one `logsSubscribe` each, their notifications advance separate checkpoints
   and publish their own signature, and a rejected subscription for one program
-  does not stop the other. `tests/indexer_state_checkpoint.rs` covers the
+  does not stop the other; the Token Bridge and the NFT Bridge ingest side by
+  side the same way. `tests/indexer_state_checkpoint.rs` covers the
   monotonic checkpoint and the one-time move of the legacy
   `solana_last_ingested_slot` to the Token Bridge's per-program key (value and
   heartbeat copied, a later legacy write cannot rewind it).
@@ -957,7 +1015,7 @@ only real adapter.
 * \[x] A1. Adapter trait and registry. `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx`, Wormhole Token Bridge outbound decode, wiring into `analyse_tx`, and A1b inbound redeems via `required_accounts` + `getMultipleAccounts` + in-house posted-VAA parser
 * \[x] A2. Generalised domain model and schema (`protocol`, `via`, `direction`, chain refs, per-protocol message key, `NUMERIC` amounts). `bridge_transfers` split from `wormhole_messages`. Existing rows migrated in place, tested on staged legacy data
 * \[x] A3. DB-backed chain registry seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs stored as `unresolved(protocol, id)`. Registry carries status and provenance for the later LLM-proposal upgrade (not built in this phase). Done: tables, seed, `load_snapshot`, DB tests, SQL `resolve_chain`, unresolved IDs persisted, callers moved off `ChainId` (kept only as the frozen `/api/v1` type), refresh task wired
-* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist; the NTT and other adapters remain
+* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist. NFT Bridge adapter done (opt-in via `SOLANA_NFT_BRIDGE_PROGRAM`): program ID, instruction order and payload verified against `consts.ts`, `nft_bridge/program/src/lib.rs` and whitepaper 0006; sends and completions decoded, admin/metadata rejected. NTT and the other adapters remain, so the item stays open
 * \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share

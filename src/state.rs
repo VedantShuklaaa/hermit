@@ -123,6 +123,7 @@ impl AppState {
         let protocols = Arc::new(configured_registry(
             &config.solana_bridge_programs,
             &config.solana_token_bridge_program,
+            config.solana_nft_bridge_program.as_deref(),
         ));
 
         Ok(Self {
@@ -185,6 +186,7 @@ impl AppState {
         let protocols = Arc::new(configured_registry(
             &config.solana_bridge_programs,
             &config.solana_token_bridge_program,
+            config.solana_nft_bridge_program.as_deref(),
         ));
 
         Ok(Self {

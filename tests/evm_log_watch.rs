@@ -565,6 +565,7 @@ fn decoded(
             chain: bridge::chains::RawChainRef::wormhole(1),
             address: "TokenMint".to_string(),
         }),
+        token_symbol: None,
         amount_raw: RawAmount::parse("1000000"),
         via: None,
     };

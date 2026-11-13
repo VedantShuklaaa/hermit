@@ -8,8 +8,9 @@ watched EVM logs, falling back to protocol APIs, and streamed live to clients
 over WebSocket.
 
 The product is moving from a Wormhole transfer indexer to a protocol-agnostic
-core with one adapter per bridge protocol. Today only the Wormhole Token Bridge
-is decoded.
+core with one adapter per bridge protocol. The Wormhole Token Bridge is decoded
+by default; the Wormhole NFT Bridge is decoded when its program is configured
+(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in).
 
 Full details (implementation notes, read path, reliability, config, metrics,
 roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
@@ -19,6 +20,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Area | State |
 | --- | --- |
 | Wormhole Token Bridge | Outbound sends indexed chain-first and start `Pending` (Solana data alone; EVM logs and WormholeScan enrich). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
+| Wormhole NFT Bridge (opt-in) | `transfer_native`/`transfer_wrapped` sends and `complete_native`/`complete_wrapped` redeems decoded when `SOLANA_NFT_BRIDGE_PROGRAM` is set; admin and metadata instructions rejected. Outbound NFT rows stay `Pending`: no watched EVM event confirms the NFT side |
 | EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan. A bad chain row or RPC URL is skipped and logged, leaving the other chains watching |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
@@ -48,7 +50,8 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Protocol | State |
 | --- | --- |
 | Wormhole Token Bridge | Sends and redeems indexed |
-| Wormhole NTT and other Wormhole programs | Phase A (A4). Multi-program ingestion, per-program checkpoints and the `program` discriminator are in place; the adapters are not |
+| Wormhole NFT Bridge | Sends and redeems indexed when `SOLANA_NFT_BRIDGE_PROGRAM` is set |
+| Wormhole NTT and other Wormhole programs | Phase A (A4). Multi-program ingestion, per-program checkpoints, the `program` discriminator and the NFT Bridge adapter are in place; NTT and the remaining adapters are not |
 | Mayan, CCTP, LayerZero/Stargate, deBridge, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
 
 ## Architecture

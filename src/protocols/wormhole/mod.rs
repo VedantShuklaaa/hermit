@@ -19,6 +19,7 @@
 //! [`BridgeAdapter::required_accounts`], and the identity and transfer payload are
 //! decoded from it here. Without the account an inbound redeem is `Unsupported`.
 
+pub mod nft_bridge;
 pub mod posted_vaa;
 
 use super::amount::RawAmount;
@@ -257,6 +258,7 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
                     address,
                 }
             }),
+            token_symbol: None,
             // The VAA amount: normalised to at most 8 decimals, as the VAA carries it.
             amount_raw: Some(decoded.amount),
             via: None,
@@ -346,6 +348,7 @@ fn decode_inbound(
                     address,
                 }
             }),
+            token_symbol: None,
             amount_raw: Some(decoded.amount),
             via: None,
         });

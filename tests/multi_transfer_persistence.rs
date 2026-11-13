@@ -39,6 +39,7 @@ fn transfer(sequence: u64, event_index: u16, destination: ChainId) -> DecodedTra
                 chain: RawChainRef::wormhole(1),
                 address: "token-mint-address".to_string(),
             }),
+            token_symbol: None,
             amount_raw: RawAmount::parse("1000000"),
             via: Some(Via {
                 name: "cctp".to_string(),

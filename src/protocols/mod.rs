@@ -18,6 +18,10 @@ pub use solana_tx::{AccountData, Instruction, SolanaTx};
 /// written before the discriminator existed mean exactly this.
 pub const TOKEN_BRIDGE_PROGRAM: &str = "token_bridge";
 
+/// The NFT Bridge sub-program. It shares Wormhole's core bridge and message namespace
+/// with the Token Bridge, but is a different Solana program with its own payloads.
+pub const NFT_BRIDGE_PROGRAM: &str = "nft_bridge";
+
 /// The serde default for a transfer that predates the discriminator.
 pub fn default_program() -> String {
     TOKEN_BRIDGE_PROGRAM.to_string()
@@ -112,8 +116,9 @@ pub struct TokenRef {
 /// One bridge transfer decoded from a Solana transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedTransfer {
-    /// Which program inside the protocol decoded this: `token_bridge` today. It is
-    /// what `/api/v1` can represent and what `/api/v2` exposes additively.
+    /// Which program inside the protocol decoded this: `token_bridge` or
+    /// `nft_bridge`. It is what `/api/v1` can represent and what `/api/v2` exposes
+    /// additively.
     pub program: String,
     pub message: MessageId,
     pub direction: Direction,
@@ -126,6 +131,9 @@ pub struct DetectedTransfer {
     pub source_wallet: Option<String>,
     pub destination_wallet: Option<String>,
     pub token: Option<TokenRef>,
+    /// Symbol carried by the bridge payload itself, when it has one. Chain data, so
+    /// it wins over token metadata from an indexer.
+    pub token_symbol: Option<String>,
     pub amount_raw: Option<RawAmount>,
     pub via: Option<Via>,
 }

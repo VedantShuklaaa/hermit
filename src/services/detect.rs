@@ -9,8 +9,8 @@ use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
 use crate::protocols::{
-    Classification, DetectedTransfer, Direction, MessageId, SolanaTx, compose::compose,
-    registry::ProtocolRegistry,
+    Classification, DetectedTransfer, Direction, MessageId, NFT_BRIDGE_PROGRAM, SolanaTx,
+    compose::compose, registry::ProtocolRegistry,
 };
 use crate::services::token_metadata::TokenMetadata;
 use crate::vaa::decode::{decode_vaa, format_amount};
@@ -94,7 +94,11 @@ pub fn to_bridge_transfer(
             .then(|| chains.explorer_tx_url_for(&d.destination, &d.observed_tx))
             .flatten(),
         token: d.token.as_ref().map(|t| t.address.clone()),
-        token_symbol: metadata.and_then(|m| m.symbol),
+        // The payload's own symbol is chain data; token metadata is only a fallback.
+        token_symbol: d
+            .token_symbol
+            .clone()
+            .or_else(|| metadata.and_then(|m| m.symbol)),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
         amount_formatted: raw_amount.map(|r| format_amount(r, decimals)),
         message_id: BridgeMessageId {
@@ -249,7 +253,9 @@ pub fn destination_tx_from_operation(raw: &Value) -> Option<String> {
 }
 
 /// Completes a `Pending` transfer once its destination tx is known. Never touches
-/// `Detected` (no matched VAA) and never rewrites a `Completed` transfer.
+/// `Detected` (no matched VAA) and never rewrites a `Completed` transfer. An outbound
+/// NFT Bridge transfer records the tx but stays `Pending`: there is no watched chain
+/// event confirming its destination.
 pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str, chains: &Snapshot) -> bool {
     let hash = hash.trim();
     if hash.is_empty() || !matches!(transfer.status, BridgeStatus::Pending) {
@@ -261,7 +267,15 @@ pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str, chains: &
     );
 
     transfer.destination_tx_hash = Some(hash.to_string());
-    transfer.status = BridgeStatus::Completed;
+    // An outbound NFT Bridge transfer has no chain event in the watcher set: the
+    // destination is a call to the NFT bridge contract, not `TransferRedeemed` or
+    // `LogMessagePublished`. WormholeScan can name that tx, but without a watched
+    // chain event the row stays Pending. Known limitation, documented in REFERENCE.
+    let unconfirmed_nft =
+        transfer.program == NFT_BRIDGE_PROGRAM && transfer.direction() == Direction::Outbound;
+    if !unconfirmed_nft {
+        transfer.status = BridgeStatus::Completed;
+    }
     true
 }
 
@@ -319,6 +333,7 @@ mod tests {
                 chain: RawChainRef::wormhole(1),
                 address: "TokenMint".into(),
             }),
+            token_symbol: None,
             amount_raw: RawAmount::parse("5000000"),
             via: None,
         }
@@ -508,6 +523,20 @@ mod tests {
         assert!(apply_destination_tx(&mut pending, "0xdest", &snap()));
         assert!(matches!(pending.status, BridgeStatus::Completed));
         assert_eq!(pending.destination_tx_hash.as_deref(), Some("0xdest"));
+    }
+
+    #[test]
+    fn an_outbound_nft_records_the_hint_but_stays_pending() {
+        let mut t = transfer();
+        t.program = crate::protocols::NFT_BRIDGE_PROGRAM.to_string();
+        t.status = BridgeStatus::Pending;
+
+        assert!(apply_destination_tx(&mut t, "0xdest", &snap()));
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("0xdest"));
+        assert!(
+            matches!(t.status, BridgeStatus::Pending),
+            "no watched chain event confirms an NFT destination"
+        );
     }
 
     #[test]

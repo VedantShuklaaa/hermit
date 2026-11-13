@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::wormhole::WormholeAdapter;
+use super::wormhole::nft_bridge::NftBridgeAdapter;
 use super::{BridgeAdapter, Classification, Protocol, SolanaTx};
 
 /// Routes a transaction to every adapter whose program appears anywhere in it,
@@ -111,21 +112,30 @@ pub fn default_registry() -> ProtocolRegistry {
 /// An adapter with no configured entry keeps its verified defaults. The configured
 /// Token Bridge program is always registered too, so a list that names only other
 /// programs still decodes and polls the Token Bridge that `/health` watches.
+///
+/// The NFT Bridge is opt-in: `nft_bridge` is `None` unless the deployment names its
+/// program, and when it is set that program belongs to the NFT adapter rather than
+/// to the Token Bridge, which the override list would otherwise claim it for.
 pub fn configured_registry(
     overrides: &[(Protocol, String)],
     token_bridge: &str,
+    nft_bridge: Option<&str>,
 ) -> ProtocolRegistry {
     let mut registry = ProtocolRegistry::new();
 
     let mut ids: Vec<String> = overrides
         .iter()
-        .filter(|(protocol, _)| *protocol == Protocol::Wormhole)
+        .filter(|(protocol, id)| *protocol == Protocol::Wormhole && nft_bridge != Some(id.as_str()))
         .map(|(_, id)| id.clone())
         .collect();
     ids.push(token_bridge.to_string());
     ids.sort();
     ids.dedup();
     registry.register_with_programs(Arc::new(WormholeAdapter), ids);
+
+    if let Some(id) = nft_bridge {
+        registry.register_with_programs(Arc::new(NftBridgeAdapter), vec![id.to_string()]);
+    }
 
     registry
 }
@@ -300,7 +310,7 @@ mod tests {
             (Protocol::Wormhole, "ProgramB".to_string()),
         ];
         assert_eq!(
-            configured_registry(&ids, "TokenBridge").program_ids(),
+            configured_registry(&ids, "TokenBridge", None).program_ids(),
             vec![
                 "ProgramA".to_string(),
                 "ProgramB".to_string(),
@@ -310,9 +320,32 @@ mod tests {
         );
 
         assert_eq!(
-            configured_registry(&[], "TokenBridge").program_ids(),
+            configured_registry(&[], "TokenBridge", None).program_ids(),
             vec!["TokenBridge".to_string()],
             "with no override the configured Token Bridge is the whole set"
+        );
+    }
+
+    #[test]
+    fn the_nft_bridge_is_registered_only_when_configured() {
+        assert_eq!(
+            configured_registry(&[], "TokenBridge", None).program_ids(),
+            vec!["TokenBridge".to_string()],
+            "unset means existing deployments see exactly the old set"
+        );
+
+        let registry = configured_registry(
+            &[(Protocol::Wormhole, "NftBridge".to_string())],
+            "TokenBridge",
+            Some("NftBridge"),
+        );
+        assert_eq!(
+            registry.program_ids(),
+            vec!["NftBridge".to_string(), "TokenBridge".to_string()]
+        );
+        assert_eq!(
+            registry.protocols_for("NftBridge"),
+            vec![Protocol::Wormhole]
         );
     }
 

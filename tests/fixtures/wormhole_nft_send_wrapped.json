@@ -1,0 +1,44 @@
+{
+  "id": "1/0def15a24423e1edd1a5ab16f557b9060303ddbab8c803d2ee48f4b78a1cfd6b/29163",
+  "emitterChain": 1,
+  "emitterAddress": {
+    "hex": "0def15a24423e1edd1a5ab16f557b9060303ddbab8c803d2ee48f4b78a1cfd6b",
+    "native": "wPkMzrFNdXFtATPFYDMh9EMJNZyAd4un7TCezG7AgY2"
+  },
+  "sequence": "29163",
+  "vaa": {
+    "raw": "AQAAAAQNAHJf5Fedt5PGbkOIe2uVzsdpUDwskEpOdENRV1vy7t1hOzo3+mjDlOoK747a7GSgRTlz7DaySlN28/bN8FVlqGUBAaRu7HMBwtKuMJ2RH80B8QPXdR8r7ckPgbZ8ehWKJ+HnFMKL8m89fASJXCIt82Av8iG8g7VGFGhor4Vxwe+ZKHYAAoNYuW6RSOSPWNR/XO+uKCJ6F3NFu041kRVdcb9PeRloJnc/GVp645PhlJxkbB3T38XqWuZzbJT30F+tOcA0iFIBAx0Lr/vxjjYJ0devPXdf7G8N+PmxtppzdhqARZ4k5CszF8OXSGqSP3OeqDBiiTJOQm//4dkadO3qkO5FCeBCui8BBLOu0Rcf0W6VY6HVhFHRX0n9VbdZgBzInos2Ef22RqtuUiK+lhcbKmqRib1G0cmUV/uaeufUGct4CTlI4uhbsoUABjDCNNORtKVoll2N+QjTkvYowwjUGXFGU1ZeYYNuQ+yNbnfH2tMarme0IvVBr6rOYNdkVMtSuVu8Ny8J0HTICbcAB5JmnZnwMLWIUGOflfhbaf1Ok6BuG5w9iJ6Jr6UKxJcaeE8fVMEruCJiVike8jmntNqFRTppakfKjcgrKC4TVmQACIaAOM8jJI25lOraStukK3CRtGLhhRQgJtLF771+2vPdJmNNJmZwQGeqWrC/ZvezZpchCJ7ZPbvnZmX01dCmv6YACgqCW3Pjzq1onhAIpnCqV+FM1xoQYrfgiMsOzPKfAskpIf6BGnTOohtY96otOq7rPKtJG/SyqV1nlCrydSfuxTQBDLmuH4ejLSzR+Lh7YEKzcoOa/uJGPly6DZ9OQ2j+EsyNa42u+gBazXdrtg3x2gqSPoYvrNhYmd/5jADCWGfSEVEBDTMaFgrCRhfnF6y5tKQt4yDeybxO3aP11Tu/kyAwPrebMCI93y+3oHtZlEPb5TipW14nmwazCnMBcvdW6iLS8DQBESrEIz25BKZPUVMpu3MbrpvKlyoNlOgsqVYJwX3FgDG5OZ9m95DTe1iBYxBUh83GFIUX5uosEZ8NFaPjL6ylAqABEuk5LWEhRRc5I5foBnNbgWSZXpYs1S2I5OFkLQBOC1l6TI9m93Sy5AN9DFO9DFmmVxg/lKewKO5qAYYwvDPvuFQBZ3Zb+AAALv8AAQ3vFaJEI+Ht0aWrFvVXuQYDA926uMgD0u5I9LeKHP1rAAAAAAAAcesgAZH+z3VbeHQL6YnRg/0aqLkQESbSq/11Sw7gPShQLx/0ABYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEFwdG9zIGFwZXMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAOmKj2ns2g6gY5Cqkq0sv42wbenu7+dItgq9pUXHmux3IaHR0cHM6Ly9uZnRzdG9yYWdlLmxpbmsvaXBmcy9iYWZ5YmVpZWtjd3Z5MzJyYjZ6dmZvbWplcGx5NWZzZWtraHFocWZwYXFybGlvNDN6Yndibmt1cnMyZS80NgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQFG8B7frq7K8JD+p32vvIe4L3LJsZRHzPSUnr5eo8SgAW",
+    "guardianSetIndex": 4,
+    "isDuplicated": false
+  },
+  "content": {
+    "standarizedProperties": {
+      "appIds": null,
+      "fromChain": 0,
+      "fromAddress": "",
+      "toChain": 0,
+      "toAddress": "",
+      "tokenChain": 0,
+      "tokenAddress": "",
+      "amount": "",
+      "feeAddress": "",
+      "feeChain": 0,
+      "fee": "",
+      "normalizedDecimals": null
+    },
+    "executorRequest": null
+  },
+  "sourceChain": {
+    "chainId": 1,
+    "timestamp": "2025-01-02T09:27:20Z",
+    "transaction": {
+      "txHash": "SkpAfyhGwx7KY7ehXK4pXjGzmrNwBTu5UJfpEB1u3edwmEwZFnzFidqctwyoWFuRakUgAu6EReZrU68ijfJLy76"
+    },
+    "from": "AQwDaYQA9eQWZu7JcVrjKoXdY4GKQCaQXbfaQz8EZP4k",
+    "status": "confirmed",
+    "fee": "0.00001",
+    "gasTokenNotional": "206.74",
+    "feeUSD": "0.0020674",
+    "isSolanaShim": false
+  }
+}
