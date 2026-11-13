@@ -1,4 +1,6 @@
 use crate::clients::limiter::API_TOKEN_WAIT;
+use crate::protocols::Protocol;
+use crate::protocols::registry::parse_program_overrides;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -226,6 +228,10 @@ pub struct AppConfig {
     pub failed_cache_ttl_secs: u64,
     pub port: u16,
     pub solana_token_bridge_program: String,
+    /// Every program the Solana ingester subscribes to. `SOLANA_BRIDGE_PROGRAMS`
+    /// (`protocol:program_id` CSV) when set, otherwise the single
+    /// `SOLANA_TOKEN_BRIDGE_PROGRAM`. One subscription and checkpoint per entry.
+    pub solana_bridge_programs: Vec<(Protocol, String)>,
     pub solana_ws_url: String,
     pub allowed_origins: Vec<String>,
     pub ingest: IngestConfig,
@@ -326,6 +332,16 @@ impl AppConfig {
             anyhow::bail!("EVM_WATCH_ENABLED is set but no EVM_RPC_<CHAIN> is configured");
         }
 
+        // The Token Bridge program is always known: it is the health signal and the
+        // program the legacy single-program configuration names. The list either
+        // replaces it as the subscription set or falls back to it.
+        let solana_token_bridge_program = required("SOLANA_TOKEN_BRIDGE_PROGRAM")?;
+        validate_program_id("SOLANA_TOKEN_BRIDGE_PROGRAM", &solana_token_bridge_program)?;
+        let solana_bridge_programs = configured_programs(
+            non_empty("SOLANA_BRIDGE_PROGRAMS"),
+            &solana_token_bridge_program,
+        )?;
+
         Ok(Self {
             role,
             pubsub_channel: optional("TX_EVENTS_CHANNEL", "bridge:tx_events"),
@@ -359,7 +375,8 @@ impl AppConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
-            solana_token_bridge_program: required("SOLANA_TOKEN_BRIDGE_PROGRAM")?,
+            solana_token_bridge_program,
+            solana_bridge_programs,
             solana_ws_url: required("SOLANA_WS_URL")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
             ingest: IngestConfig {
@@ -507,6 +524,10 @@ impl AppConfig {
             failed_cache_ttl_secs: 10,
             port: 0,
             solana_token_bridge_program: "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+            solana_bridge_programs: vec![(
+                Protocol::Wormhole,
+                "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+            )],
             solana_ws_url: "ws://127.0.0.1:1".to_string(),
             allowed_origins: Vec::new(),
             ingest: IngestConfig {
@@ -666,6 +687,41 @@ fn parse_override<T: std::str::FromStr>(value: &str) -> Option<T> {
 /// The boolean convention the other switches use: `1` or `true`, case-insensitive.
 fn flag(value: Option<&str>) -> bool {
     value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The subscription set: the configured list when present, otherwise the legacy
+/// single Token Bridge program.
+fn configured_programs(
+    configured: Option<String>,
+    token_bridge: &str,
+) -> anyhow::Result<Vec<(Protocol, String)>> {
+    match configured {
+        Some(csv) => parse_bridge_programs(&csv),
+        None => Ok(vec![(Protocol::Wormhole, token_bridge.to_string())]),
+    }
+}
+
+/// Parses `SOLANA_BRIDGE_PROGRAMS`: a `protocol:program_id` CSV. Every program ID
+/// must be base58 for a 32-byte Solana address, so a typo fails startup rather than
+/// silently subscribing to nothing.
+fn parse_bridge_programs(csv: &str) -> anyhow::Result<Vec<(Protocol, String)>> {
+    let programs = parse_program_overrides(csv)
+        .map_err(|error| anyhow::anyhow!("invalid SOLANA_BRIDGE_PROGRAMS: {error}"))?;
+    for (_, id) in &programs {
+        validate_program_id("SOLANA_BRIDGE_PROGRAMS", id)?;
+    }
+    Ok(programs)
+}
+
+/// A Solana program ID is a base58-encoded 32-byte public key.
+fn validate_program_id(variable: &str, id: &str) -> anyhow::Result<()> {
+    let bytes = bs58::decode(id)
+        .into_vec()
+        .map_err(|_| anyhow::anyhow!("invalid {variable}: {id:?} is not valid base58"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("invalid {variable}: {id:?} does not decode to a 32-byte program id");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -853,6 +909,59 @@ mod tests {
         assert_eq!(
             config.helius_token_wait(Lane::Ingest),
             config.helius_live_token_wait
+        );
+    }
+
+    #[test]
+    fn the_program_list_parses_and_keeps_every_entry() {
+        use crate::protocols::wormhole::{CORE_BRIDGE, TOKEN_BRIDGE};
+
+        assert_eq!(
+            parse_bridge_programs(&format!("wormhole:{TOKEN_BRIDGE}, wormhole:{CORE_BRIDGE}"))
+                .unwrap(),
+            vec![
+                (Protocol::Wormhole, TOKEN_BRIDGE.to_string()),
+                (Protocol::Wormhole, CORE_BRIDGE.to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_invalid_program_address_names_the_variable() {
+        let error = parse_bridge_programs("wormhole:not-base58!").unwrap_err();
+        assert!(
+            error.to_string().contains("SOLANA_BRIDGE_PROGRAMS"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("not-base58!"), "{error}");
+    }
+
+    #[test]
+    fn a_program_id_must_decode_to_32_bytes() {
+        // Valid base58, but not a 32-byte public key.
+        let error = parse_bridge_programs("wormhole:abc").unwrap_err();
+        assert!(error.to_string().contains("32-byte"), "{error}");
+    }
+
+    #[test]
+    fn the_legacy_single_program_is_the_fallback() {
+        use crate::protocols::wormhole::{CORE_BRIDGE, TOKEN_BRIDGE};
+
+        assert_eq!(
+            configured_programs(None, TOKEN_BRIDGE).unwrap(),
+            vec![(Protocol::Wormhole, TOKEN_BRIDGE.to_string())]
+        );
+
+        assert_eq!(
+            configured_programs(
+                Some(format!("wormhole:{TOKEN_BRIDGE},wormhole:{}", CORE_BRIDGE)),
+                "ignored-because-the-list-wins",
+            )
+            .unwrap(),
+            vec![
+                (Protocol::Wormhole, TOKEN_BRIDGE.to_string()),
+                (Protocol::Wormhole, CORE_BRIDGE.to_string())
+            ]
         );
     }
 }

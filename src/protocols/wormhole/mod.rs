@@ -24,7 +24,7 @@ pub mod posted_vaa;
 use super::amount::RawAmount;
 use super::{
     BridgeAdapter, Classification, DetectedTransfer, Direction, MessageId, Protocol, Reject,
-    SolanaTx, TokenRef,
+    SolanaTx, TOKEN_BRIDGE_PROGRAM, TokenRef,
 };
 use crate::chains::RawChainRef;
 use crate::vaa::decode::decode_destination_address;
@@ -238,6 +238,7 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
         let token_hex = hex::encode(decoded.token_address);
 
         transfers.push(DetectedTransfer {
+            program: TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: SOLANA,
                 emitter_address,
@@ -324,6 +325,7 @@ fn decode_inbound(
         let token_hex = hex::encode(decoded.token_address);
 
         transfers.push(DetectedTransfer {
+            program: TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: vaa.emitter_chain,
                 emitter_address: hex::encode(vaa.emitter_address),

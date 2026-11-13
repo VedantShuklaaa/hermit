@@ -80,6 +80,7 @@ pub fn to_bridge_transfer(
     let inbound = d.direction == Direction::Inbound;
 
     Ok(BridgeTransfer {
+        program: d.program.clone(),
         source_chain: ChainId::from_wormhole_id(source_id),
         source_tx_hash: (!inbound).then(|| d.observed_tx.clone()),
         source_wallet: d.source_wallet.clone(),
@@ -301,6 +302,7 @@ mod tests {
 
     fn detected() -> DetectedTransfer {
         DetectedTransfer {
+            program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: 1,
                 emitter_address: EMITTER_HEX.into(),

@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-const PROGRAM: &str = "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth";
+const PROGRAM: &str = bridge::protocols::wormhole::TOKEN_BRIDGE;
 const STREAM: &str = "bridge:transactions";
 
 fn bridge_command(role: &str) -> Command {

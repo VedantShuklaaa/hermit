@@ -548,6 +548,7 @@ fn decoded(
     registry: &ChainRegistry,
 ) -> DecodedTransfer {
     let detected = DetectedTransfer {
+        program: bridge::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
         message: MessageId::Wormhole {
             emitter_chain,
             emitter_address: emitter_address.to_string(),

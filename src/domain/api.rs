@@ -35,6 +35,8 @@ impl TransactionResponse {
 pub struct TransferView {
     /// The bridge protocol, for example `wormhole`.
     pub protocol: String,
+    /// The protocol sub-program that decoded this transfer, e.g. `token_bridge`.
+    pub program: String,
     pub direction: Direction,
     /// The router or outer protocol, when there is one.
     pub via: Option<Via>,

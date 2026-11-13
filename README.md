@@ -24,7 +24,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
 | Chains | DB-backed registry, refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Unknown chains stored as unresolved |
 | Enrichment | `EnrichmentProvider` trait; background worker re-enriches open rows and backfills missing inbound origin txs |
-| Ingestion | Always on, supervised. Reconnect rewind, watchdog, concurrent backfill, periodic reconciliation poll |
+| Ingestion | Always on, supervised. One `logsSubscribe` and checkpoint per configured program ID. Reconnect rewind, watchdog, concurrent backfill, periodic reconciliation poll |
 | Read path | `/analyse` with memory cache, Postgres, single-flight, stale-while-revalidate |
 | CI | `fmt --check`, `clippy -D warnings`, `cargo test` on every PR and `main` |
 | Deploy | Two systemd units (`bridge-api`, `bridge-stream`) on EC2, Postgres on RDS, Caddy for TLS |
@@ -48,7 +48,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Protocol | State |
 | --- | --- |
 | Wormhole Token Bridge | Sends and redeems indexed |
-| Wormhole NTT and other Wormhole programs | Phase A (A4) |
+| Wormhole NTT and other Wormhole programs | Phase A (A4). Multi-program ingestion, per-program checkpoints and the `program` discriminator are in place; the adapters are not |
 | Mayan, CCTP, LayerZero/Stargate, deBridge, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
 
 ## Architecture

@@ -51,6 +51,14 @@ impl ProtocolRegistry {
         ids
     }
 
+    /// Every program the ingestion pipeline subscribes to and polls, sorted and
+    /// deduplicated. The Token Bridge is always registered by
+    /// [`configured_registry`], so `/health` has a checkpoint to read even when the
+    /// override list names other programs.
+    pub fn ingestion_programs(&self) -> Vec<String> {
+        self.program_ids()
+    }
+
     pub fn protocols_for(&self, program_id: &str) -> Vec<Protocol> {
         self.by_program
             .get(program_id)
@@ -96,6 +104,29 @@ impl ProtocolRegistry {
 pub fn default_registry() -> ProtocolRegistry {
     let mut registry = ProtocolRegistry::new();
     registry.register(Arc::new(WormholeAdapter));
+    registry
+}
+
+/// The production registry: every adapter under the program IDs configured for it.
+/// An adapter with no configured entry keeps its verified defaults. The configured
+/// Token Bridge program is always registered too, so a list that names only other
+/// programs still decodes and polls the Token Bridge that `/health` watches.
+pub fn configured_registry(
+    overrides: &[(Protocol, String)],
+    token_bridge: &str,
+) -> ProtocolRegistry {
+    let mut registry = ProtocolRegistry::new();
+
+    let mut ids: Vec<String> = overrides
+        .iter()
+        .filter(|(protocol, _)| *protocol == Protocol::Wormhole)
+        .map(|(_, id)| id.clone())
+        .collect();
+    ids.push(token_bridge.to_string());
+    ids.sort();
+    ids.dedup();
+    registry.register_with_programs(Arc::new(WormholeAdapter), ids);
+
     registry
 }
 
@@ -259,6 +290,73 @@ mod tests {
         assert_eq!(
             default_registry().program_ids(),
             vec![crate::protocols::wormhole::TOKEN_BRIDGE.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_configured_registry_uses_the_configured_programs() {
+        let ids = vec![
+            (Protocol::Wormhole, "ProgramA".to_string()),
+            (Protocol::Wormhole, "ProgramB".to_string()),
+        ];
+        assert_eq!(
+            configured_registry(&ids, "TokenBridge").program_ids(),
+            vec![
+                "ProgramA".to_string(),
+                "ProgramB".to_string(),
+                "TokenBridge".to_string(),
+            ],
+            "the configured Token Bridge is always registered as well"
+        );
+
+        assert_eq!(
+            configured_registry(&[], "TokenBridge").program_ids(),
+            vec!["TokenBridge".to_string()],
+            "with no override the configured Token Bridge is the whole set"
+        );
+    }
+
+    #[test]
+    fn two_programs_route_to_their_own_adapters() {
+        let mut r = ProtocolRegistry::new();
+        r.register(Arc::new(Fake {
+            protocol: Protocol::Wormhole,
+            programs: &["ProgramA"],
+            accounts: &["accountA"],
+        }));
+        r.register(Arc::new(Fake {
+            protocol: Protocol::Wormhole,
+            programs: &["ProgramB"],
+            accounts: &["accountB"],
+        }));
+
+        assert_eq!(
+            r.required_accounts(&tx_calling(&[("ProgramA", None)])),
+            vec!["accountA"]
+        );
+        assert_eq!(
+            r.required_accounts(&tx_calling(&[("ProgramB", None)])),
+            vec!["accountB"]
+        );
+    }
+
+    #[test]
+    fn the_ingestion_set_is_the_registered_program_set() {
+        let mut r = ProtocolRegistry::new();
+        r.register(Arc::new(Fake {
+            protocol: Protocol::Wormhole,
+            programs: &["Other"],
+            accounts: &[],
+        }));
+        r.register(Arc::new(Fake {
+            protocol: Protocol::Wormhole,
+            programs: &["TokenBridge"],
+            accounts: &[],
+        }));
+
+        assert_eq!(
+            r.ingestion_programs(),
+            vec!["Other".to_string(), "TokenBridge".to_string()]
         );
     }
 }

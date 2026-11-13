@@ -7,7 +7,7 @@ use crate::domain::bridge::BridgeEvent;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::domain::transaction::{Chain, NormalisedTransaction};
 use crate::error::AppError;
-use crate::protocols::MessageId;
+use crate::protocols::{MessageId, TOKEN_BRIDGE_PROGRAM};
 
 /// `/api/v2` -> the frozen `/api/v1` body. The first transfer (lowest `event_index`) is
 /// the one v1 can represent.
@@ -18,10 +18,25 @@ pub fn to_v1(
     response: &TransactionResponse,
     bridge_event: Option<BridgeEvent>,
 ) -> Result<NormalisedTransaction, AppError> {
-    let (bridge_transfer, bridge_event) = match response.transfers.first() {
-        Some(transfer) => (Some(transfer_to_v1(transfer)?), bridge_event),
-        None => (None, None),
+    // v1 can only represent the Token Bridge. A transaction with rows from another
+    // program is rejected explicitly rather than mapped as a Token Bridge transfer.
+    let bridge_transfer = match response
+        .transfers
+        .iter()
+        .find(|transfer| transfer.program == TOKEN_BRIDGE_PROGRAM)
+    {
+        Some(transfer) => Some(transfer_to_v1(transfer)?),
+        None => match response.transfers.first() {
+            Some(other) => {
+                return Err(AppError::Normalisation(format!(
+                    "program {} has no /api/v1 representation",
+                    other.program
+                )));
+            }
+            None => None,
+        },
     };
+    let bridge_event = bridge_transfer.as_ref().and(bridge_event);
 
     Ok(NormalisedTransaction {
         hash: response.hash.clone(),
@@ -41,6 +56,12 @@ fn transfer_to_v1(transfer: &TransferView) -> Result<BridgeTransfer, AppError> {
         return Err(AppError::Normalisation(format!(
             "protocol {} has no /api/v1 representation",
             transfer.protocol
+        )));
+    }
+    if transfer.program != TOKEN_BRIDGE_PROGRAM {
+        return Err(AppError::Normalisation(format!(
+            "program {} has no /api/v1 representation",
+            transfer.program
         )));
     }
 
@@ -63,6 +84,7 @@ fn transfer_to_v1(transfer: &TransferView) -> Result<BridgeTransfer, AppError> {
     };
 
     Ok(BridgeTransfer {
+        program: transfer.program.clone(),
         source_chain: chain_id(&transfer.source)?,
         source_tx_hash: transfer.source_tx_hash.clone(),
         source_wallet: transfer.source_wallet.clone(),
@@ -132,6 +154,7 @@ mod tests {
     fn transfer(sequence: u64, source: ChainView) -> TransferView {
         TransferView {
             protocol: "wormhole".to_string(),
+            program: TOKEN_BRIDGE_PROGRAM.to_string(),
             direction: crate::protocols::Direction::Outbound,
             via: None,
             observed_tx_hash: "sig".to_string(),

@@ -58,7 +58,11 @@ fn test_config(
         upstream_permits: 4,
         failed_cache_ttl_secs: 10,
         port: 0,
-        solana_token_bridge_program: "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+        solana_token_bridge_program: bridge::protocols::wormhole::TOKEN_BRIDGE.to_string(),
+        solana_bridge_programs: vec![(
+            bridge::protocols::Protocol::Wormhole,
+            bridge::protocols::wormhole::TOKEN_BRIDGE.to_string(),
+        )],
         solana_ws_url: "ws://127.0.0.1:0".to_string(),
         allowed_origins: Vec::new(),
         ingest: IngestConfig {

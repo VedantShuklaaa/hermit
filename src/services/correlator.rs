@@ -82,6 +82,7 @@ pub async fn correlate(
         .and_then(|h| chains.explorer_tx_url_for(&RawChainRef::wormhole(destination_chain_id), h));
 
     Ok(BridgeTransfer {
+        program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
         source_chain: ChainId::from_wormhole_id(message_id.emitter_chain),
         source_tx_hash: Some(source_tx_hash),
         source_wallet,

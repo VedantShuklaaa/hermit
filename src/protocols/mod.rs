@@ -14,6 +14,15 @@ use amount::RawAmount;
 use serde::{Deserialize, Serialize};
 pub use solana_tx::{AccountData, Instruction, SolanaTx};
 
+/// The Token Bridge sub-program. It is the default `program` discriminator, so rows
+/// written before the discriminator existed mean exactly this.
+pub const TOKEN_BRIDGE_PROGRAM: &str = "token_bridge";
+
+/// The serde default for a transfer that predates the discriminator.
+pub fn default_program() -> String {
+    TOKEN_BRIDGE_PROGRAM.to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -103,6 +112,9 @@ pub struct TokenRef {
 /// One bridge transfer decoded from a Solana transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedTransfer {
+    /// Which program inside the protocol decoded this: `token_bridge` today. It is
+    /// what `/api/v1` can represent and what `/api/v2` exposes additively.
+    pub program: String,
     pub message: MessageId,
     pub direction: Direction,
     /// The Solana signature this was decoded from.

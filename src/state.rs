@@ -6,7 +6,7 @@ use crate::enrichment::evm_first::EvmFirstProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
 use crate::evm::lookup::EvmEventLookup;
 use crate::live_feed::LiveFeed;
-use crate::protocols::registry::{ProtocolRegistry, default_registry};
+use crate::protocols::registry::{ProtocolRegistry, configured_registry};
 use crate::redis::broadcast::BroadcastSink;
 use crate::services::read_through::ReadThrough;
 use governor::{
@@ -120,6 +120,11 @@ impl AppState {
         );
         let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
+        let protocols = Arc::new(configured_registry(
+            &config.solana_bridge_programs,
+            &config.solana_token_bridge_program,
+        ));
+
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -127,7 +132,7 @@ impl AppState {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
                 chains,
-                protocols: Arc::new(default_registry()),
+                protocols,
                 broadcast: BroadcastSink::Local(tx_broadcast.clone()),
                 tx_broadcast,
                 read_through: Some(read_through),
@@ -177,6 +182,11 @@ impl AppState {
         );
         let live_feed = Arc::new(LiveFeed::new(config.live_feed.clone(), &config.redis_url));
 
+        let protocols = Arc::new(configured_registry(
+            &config.solana_bridge_programs,
+            &config.solana_token_bridge_program,
+        ));
+
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -184,7 +194,7 @@ impl AppState {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
                 chains,
-                protocols: Arc::new(default_registry()),
+                protocols,
                 broadcast,
                 tx_broadcast,
                 read_through: None,

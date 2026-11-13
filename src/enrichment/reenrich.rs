@@ -288,6 +288,7 @@ mod tests {
 
     fn transfer(status: BridgeStatus) -> BridgeTransfer {
         BridgeTransfer {
+            program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             source_chain: ChainId::Solana,
             source_tx_hash: Some("sig".into()),
             source_wallet: None,

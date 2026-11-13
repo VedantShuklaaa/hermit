@@ -80,6 +80,13 @@ async fn main() -> anyhow::Result<()> {
 async fn connect_database(config: &AppConfig) -> anyhow::Result<sqlx::PgPool> {
     let db = db::connection::connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+    // A single-program deployment's checkpoint moves to the Token Bridge's
+    // per-program key, so the first subscription resumes exactly where it stopped.
+    bridge::db::repository::migrate_legacy_ingest_checkpoint(
+        &db,
+        &config.solana_token_bridge_program,
+    )
+    .await?;
     Ok(db)
 }
 
@@ -140,6 +147,7 @@ async fn run_all(config: AppConfig) -> anyhow::Result<()> {
 
     spawn_ingester(
         &config,
+        state.protocols.clone(),
         redis.clone(),
         db.clone(),
         http_client.clone(),
@@ -259,6 +267,7 @@ async fn run_stream(config: AppConfig) -> anyhow::Result<()> {
 
     spawn_ingester(
         &config,
+        poll_programs.clone(),
         redis.clone(),
         db.clone(),
         http_client.clone(),
@@ -349,6 +358,7 @@ fn spawn_reenrichment(state: AppState, config: &AppConfig, shutdown: Cancellatio
 
 fn spawn_ingester(
     config: &AppConfig,
+    protocols: Arc<ProtocolRegistry>,
     redis: RedisProducer,
     db: sqlx::PgPool,
     http_client: Client,
@@ -359,9 +369,12 @@ fn spawn_ingester(
         return;
     }
 
+    // One subscription per configured program ID. The configured Token Bridge is
+    // always in the registry, so /health keeps a checkpoint to read.
+    let programs = protocols.ingestion_programs();
     let solana_ingester = Arc::new(SolanaIngester::new(
         config.solana_ws_url.clone(),
-        config.solana_token_bridge_program.clone(),
+        programs,
         redis,
         db,
         http_client,
