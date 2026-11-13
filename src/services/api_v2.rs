@@ -184,6 +184,19 @@ fn message_id(row: &StoredTransfer) -> Result<MessageId, AppError> {
                 sequence,
             })
         }
+        "cctp" => {
+            let source_domain = row
+                .cctp_source_domain
+                .ok_or_else(|| missing("source_domain"))?;
+            let source_domain = u32::try_from(source_domain).map_err(|_| {
+                AppError::Normalisation(format!("bad source domain: {source_domain}"))
+            })?;
+            let nonce = row.cctp_nonce.clone().ok_or_else(|| missing("nonce"))?;
+            Ok(MessageId::Cctp {
+                source_domain,
+                nonce,
+            })
+        }
         other => Err(AppError::Normalisation(format!(
             "unsupported protocol: {other}"
         ))),

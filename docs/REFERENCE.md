@@ -123,6 +123,73 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   registered only when `SOLANA_NFT_BRIDGE_PROGRAM` is set, and that program is
   never also registered to the Token Bridge adapter, so an unset variable keeps
   an existing deployment exact (same subscriptions, same registry, same rows).
+* **Circle CCTP V2 on Solana (opt-in).** `protocols/cctp/mod.rs` implements the
+  same `BridgeAdapter` for Circle's V2 programs:
+
+  | Program | ID | Verified against |
+  | --- | --- | --- |
+  | MessageTransmitterV2 | `CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC` | <https://developers.circle.com/cctp/references/solana-programs> |
+  | TokenMessengerMinterV2 | `CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe` | <https://developers.circle.com/cctp/references/solana-programs> |
+
+  Instruction discriminators are Anchor's `sha256("global:<name>")[..8]`, checked
+  against the published `initialize` value `afaf6d1f0d989bed`:
+  `deposit_for_burn = d73c3d2e723780b0`,
+  `deposit_for_burn_with_hook = 6ff53e83cc6cdf9b`,
+  `receive_message = 26907fe11fe1ee19`,
+  `send_message = 392822b2bd0a411a`,
+  `handle_receive_finalized_message = bafcef4656b46e5f`,
+  `handle_receive_unfinalized_message = c8a9af14c83ab63d`.
+  Message and burn-body layouts are from `message.rs` and `burn_message.rs` in
+  <https://github.com/circlefin/solana-cctp-contracts>.
+
+  **Identity.** `MessageId::Cctp { source_domain, nonce }`, key
+  `<source_domain>/<nonce>`, where the nonce is the 32-byte value from the
+  attested message (lowercase hex). The V2 header is 148 bytes: version `u32`
+  BE at 0, source domain at 4, destination domain at 8, nonce at 12..44, sender
+  and recipient programs next. The burn body is 228 bytes: version at 148,
+  burn token at 152..184, mint recipient at 184..216, amount (`u256` BE, the
+  Solana side reads its low 8 bytes) at 216..248, message sender at 248..280.
+  Only version `1` is decoded; version `0` is rejected `unsupported`
+  ("cctp v1 message").
+
+  **Only inbound completions are indexed.** `receive_message` carries
+  `{ message: Vec<u8>, attestation: Vec<u8> }` (Borsh, with 4-byte LE length
+  prefixes) and is decoded from the attested message itself, so the nonce is
+  canonical. A Solana send (`deposit_for_burn`,
+  `deposit_for_burn_with_hook`) writes an all-zero nonce placeholder; Circle
+  assigns the real nonce off-chain. Without Iris there is no chain-derived
+  message identity for a send, so it is rejected
+  `unsupported` ("cctp send: nonce is assigned offchain") and **not stored**.
+  Indexing outbound sends needs a follow-up that resolves the nonce through
+  Circle's Iris API (or reads a later message that carries it); the event
+  account pubkey must never be used as a nonce. Admin and utility instructions
+  (for example `reclaim_event_account`, `update_attester_manager`,
+  `set_min_fee`) are rejected `not_transfer` ("cctp admin instruction").
+
+  **Domains seeded** by `20261115120000_cctp_messages.sql`, checked against
+  <https://developers.circle.com/cctp/concepts/supported-chains-and-domains>:
+
+  | Domain | Chain |
+  | --- | --- |
+  | 0 | Ethereum |
+  | 1 | Avalanche |
+  | 3 | Arbitrum |
+  | 5 | Solana |
+  | 6 | Base |
+
+  Any other domain is stored as an unresolved `cctp` reference, never an
+  error. The origin sender and token are decoded only for Solana (base58) and
+  the seeded EVM domains (`0x` + the last 20 bytes); an unseeded origin keeps
+  the raw reference and leaves the wallet/token absent. CCTP has no `/api/v1`
+  representation (v1 is frozen to the Wormhole Token Bridge); `/api/v2`
+  returns `message_id: { protocol: "cctp", source_domain, nonce }`.
+
+  **Config.** Both `SOLANA_CCTP_MESSAGE_TRANSMITTER_PROGRAM` and
+  `SOLANA_CCTP_TOKEN_MESSENGER_MINTER_PROGRAM` are required together: setting
+  one without the other is a startup error, and setting neither leaves the
+  adapter off. When set, both IDs are registered to the CCTP adapter and
+  removed from the Wormhole adapter's program set, so no transaction is
+  classified twice and an unset deployment sees exactly the old behaviour.
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -158,6 +225,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     backfills every existing row to `token_bridge`. The column records which
     protocol sub-program decoded the transfer; `/api/v1` only serves
     `token_bridge` rows and `/api/v2` exposes the field additively.
+  * `20261115120000_cctp_messages.sql` adds `cctp_messages` (`transfer_id` PK,
+    `source_domain`, `nonce`, message `version`, unique on
+    `(source_domain, nonce)`) and seeds CCTP domains 0, 1, 3, 5 and 6.
 * **Per-program Solana ingestion (A4, ingestion plumbing).** The configured set
   is `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV), or the single
   `SOLANA_TOKEN_BRIDGE_PROGRAM` when the list is unset. A second, separately

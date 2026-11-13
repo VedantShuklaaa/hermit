@@ -10,7 +10,8 @@ over WebSocket.
 The product is moving from a Wormhole transfer indexer to a protocol-agnostic
 core with one adapter per bridge protocol. The Wormhole Token Bridge is decoded
 by default; the Wormhole NFT Bridge is decoded when its program is configured
-(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in).
+(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), and Circle CCTP V2 inbound completions
+when both `SOLANA_CCTP_*` programs are configured.
 
 Full details (implementation notes, read path, reliability, config, metrics,
 roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).

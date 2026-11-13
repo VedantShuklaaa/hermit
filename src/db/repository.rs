@@ -1,7 +1,8 @@
 use crate::chains::{NS_WORMHOLE, RawChainRef};
-use crate::domain::analysis::DecodedTransfer;
+use crate::domain::analysis::{DecodedTransfer, RowValues};
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::domain::transaction::{Chain, NormalisedTransaction, TxStatus};
+use crate::error::AppError;
 use crate::protocols::{MessageId, amount::RawAmount};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ pub async fn persist_analysis(
             // The cached v1 analysis follows the row it belongs to. Only the first
             // transfer carries the WormholeScan event `/api/v1` exposes.
             let mut row_tx = tx.clone();
-            row_tx.bridge_transfer = Some(decoded.bridge.clone());
+            row_tx.bridge_transfer = decoded.bridge.clone();
             row_tx.bridge_event = if position == 0 {
                 tx.bridge_event.clone()
             } else {
@@ -66,7 +67,7 @@ pub async fn persist_analysis(
                         .token
                         .as_ref()
                         .map(|token| token.chain.clone()),
-                    bridge: &decoded.bridge,
+                    values: decoded.row.clone(),
                     analysis,
                 },
             )
@@ -115,7 +116,7 @@ async fn upsert_transaction(
 }
 
 /// One `bridge_transfers` row to write, generalised across protocols.
-struct TransferRow<'a> {
+struct TransferRow {
     program: String,
     protocol: String,
     direction: String,
@@ -127,18 +128,18 @@ struct TransferRow<'a> {
     source: RawChainRef,
     destination: RawChainRef,
     token_ref: Option<RawChainRef>,
-    bridge: &'a BridgeTransfer,
+    values: RowValues,
     analysis: serde_json::Value,
 }
 
 /// The single transfer the v1 body carries, for the WormholeScan-driven path and
 /// re-enrichment. Raw chain references are the protocol's own (`wormhole`), and the
 /// token chain is unknown to the v1 shape.
-fn legacy_row<'a>(
+fn legacy_row(
     tx: &NormalisedTransaction,
-    bridge: &'a BridgeTransfer,
+    bridge: &BridgeTransfer,
     analysis: serde_json::Value,
-) -> TransferRow<'a> {
+) -> TransferRow {
     TransferRow {
         program: bridge.program.clone(),
         protocol: NS_WORMHOLE.to_string(),
@@ -155,7 +156,7 @@ fn legacy_row<'a>(
         source: RawChainRef::wormhole(bridge.source_chain.wormhole_id()),
         destination: RawChainRef::wormhole(bridge.destination_chain.wormhole_id()),
         token_ref: None,
-        bridge,
+        values: crate::services::detect::row_values(bridge),
         analysis,
     }
 }
@@ -163,11 +164,11 @@ fn legacy_row<'a>(
 async fn write_transfer(
     db_tx: &mut Transaction<'_, Postgres>,
     transaction_id: i64,
-    row: TransferRow<'_>,
+    row: TransferRow,
 ) -> anyhow::Result<()> {
-    let bridge = row.bridge;
     // An amount that is not a plain integer is stored as NULL. The analysis JSON keeps it.
-    let amount = bridge
+    let amount = row
+        .values
         .amount
         .as_deref()
         .and_then(RawAmount::parse)
@@ -239,23 +240,23 @@ async fn write_transfer(
     .bind(&row.direction)
     .bind(&row.observed_tx_hash)
     .bind(row.event_index)
-    .bind(&bridge.source_tx_hash)
+    .bind(&row.values.source_tx_hash)
     .bind(&row.source.protocol)
     .bind(&row.source.id)
-    .bind(&bridge.source_wallet)
-    .bind(&bridge.source_explorer_url)
+    .bind(&row.values.source_wallet)
+    .bind(&row.values.source_explorer_url)
     .bind(&row.destination.protocol)
     .bind(&row.destination.id)
-    .bind(&bridge.destination_wallet)
-    .bind(&bridge.destination_tx_hash)
-    .bind(&bridge.destination_explorer_url)
+    .bind(&row.values.destination_wallet)
+    .bind(&row.values.destination_tx_hash)
+    .bind(&row.values.destination_explorer_url)
     .bind(row.token_ref.as_ref().map(|r| r.protocol.as_str()))
     .bind(row.token_ref.as_ref().map(|r| r.id.as_str()))
-    .bind(&bridge.token)
-    .bind(&bridge.token_symbol)
+    .bind(&row.values.token)
+    .bind(&row.values.token_symbol)
     .bind(amount)
-    .bind(&bridge.amount_formatted)
-    .bind(format!("{:?}", bridge.status))
+    .bind(&row.values.amount_formatted)
+    .bind(format!("{:?}", row.values.status))
     .bind(row.analysis)
     .bind(row.via)
     .bind(row.via_ref)
@@ -263,26 +264,48 @@ async fn write_transfer(
     .fetch_one(&mut **db_tx)
     .await?;
 
-    // One message identity per row today; other protocols will add their own detail.
-    let MessageId::Wormhole {
-        emitter_chain,
-        emitter_address,
-        sequence,
-    } = &row.message;
-
-    sqlx::query(
-        r#"
-        INSERT INTO wormhole_messages (transfer_id, emitter_chain, emitter_address, sequence)
-        VALUES ($1, $2, $3, $4::numeric)
-        ON CONFLICT (transfer_id) DO NOTHING
-        "#,
-    )
-    .bind(transfer_id)
-    .bind(i32::from(*emitter_chain))
-    .bind(emitter_address)
-    .bind(sequence.to_string())
-    .execute(&mut **db_tx)
-    .await?;
+    // One message identity per row, stored in the detail table for its protocol.
+    match &row.message {
+        MessageId::Wormhole {
+            emitter_chain,
+            emitter_address,
+            sequence,
+        } => {
+            sqlx::query(
+                r#"
+                INSERT INTO wormhole_messages (transfer_id, emitter_chain, emitter_address, sequence)
+                VALUES ($1, $2, $3, $4::numeric)
+                ON CONFLICT (transfer_id) DO NOTHING
+                "#,
+            )
+            .bind(transfer_id)
+            .bind(i32::from(*emitter_chain))
+            .bind(emitter_address)
+            .bind(sequence.to_string())
+            .execute(&mut **db_tx)
+            .await?;
+        }
+        MessageId::Cctp {
+            source_domain,
+            nonce,
+        } => {
+            let source_domain = i32::try_from(*source_domain).map_err(|_| {
+                AppError::Normalisation(format!("cctp source domain out of range: {source_domain}"))
+            })?;
+            sqlx::query(
+                r#"
+                INSERT INTO cctp_messages (transfer_id, source_domain, nonce, version)
+                VALUES ($1, $2, $3, 1)
+                ON CONFLICT (transfer_id) DO NOTHING
+                "#,
+            )
+            .bind(transfer_id)
+            .bind(source_domain)
+            .bind(nonce)
+            .execute(&mut **db_tx)
+            .await?;
+        }
+    }
 
     Ok(())
 }
@@ -767,6 +790,8 @@ pub struct StoredTransfer {
     pub emitter_chain: Option<i32>,
     pub emitter_address: Option<String>,
     pub sequence: Option<String>,
+    pub cctp_source_domain: Option<i32>,
+    pub cctp_nonce: Option<String>,
 }
 
 pub struct StoredTransactionWithTransfers {
@@ -793,10 +818,12 @@ pub async fn get_transaction_with_transfers(
                b.token_ref_protocol, b.token_ref_id, b.token, b.token_symbol,
                b.amount::text AS amount, b.amount_formatted,
                b.status AS transfer_status,
-               w.emitter_chain, w.emitter_address, w.sequence::text AS sequence
+               w.emitter_chain, w.emitter_address, w.sequence::text AS sequence,
+               c.source_domain AS cctp_source_domain, c.nonce AS cctp_nonce
         FROM transactions t
         LEFT JOIN bridge_transfers b ON b.transaction_id = t.id
         LEFT JOIN wormhole_messages w ON w.transfer_id = b.id
+        LEFT JOIN cctp_messages c ON c.transfer_id = b.id
         WHERE t.hash = $1
         ORDER BY b.event_index
         "#,
@@ -852,6 +879,8 @@ pub async fn get_transaction_with_transfers(
             emitter_chain: row.try_get("emitter_chain")?,
             emitter_address: row.try_get("emitter_address")?,
             sequence: row.try_get("sequence")?,
+            cctp_source_domain: row.try_get("cctp_source_domain")?,
+            cctp_nonce: row.try_get("cctp_nonce")?,
         });
     }
 
@@ -898,9 +927,11 @@ SELECT b.id, b.created_at,
        b.token_ref_protocol, b.token_ref_id, b.token, b.token_symbol,
        b.amount::text AS amount, b.amount_formatted,
        b.status AS transfer_status,
-       w.emitter_chain, w.emitter_address, w.sequence::text AS sequence
+       w.emitter_chain, w.emitter_address, w.sequence::text AS sequence,
+       c.source_domain AS cctp_source_domain, c.nonce AS cctp_nonce
 FROM bridge_transfers b
 LEFT JOIN wormhole_messages w ON w.transfer_id = b.id
+LEFT JOIN cctp_messages c ON c.transfer_id = b.id
 WHERE TRUE
 "#;
 
@@ -980,6 +1011,8 @@ pub async fn list_transfers(
             emitter_chain: row.try_get("emitter_chain")?,
             emitter_address: row.try_get("emitter_address")?,
             sequence: row.try_get("sequence")?,
+            cctp_source_domain: row.try_get("cctp_source_domain")?,
+            cctp_nonce: row.try_get("cctp_nonce")?,
         };
         listed.push(ListedTransfer {
             id: row.try_get("id")?,

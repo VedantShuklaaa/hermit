@@ -812,6 +812,7 @@ mod tests {
         assert_eq!(v.len(), 2);
         let seq = |t: &DetectedTransfer| match &t.message {
             MessageId::Wormhole { sequence, .. } => *sequence,
+            other => panic!("unexpected message id: {other:?}"),
         };
         assert_eq!((seq(&v[0]), seq(&v[1])), (100, 101));
         assert_eq!(v[0].destination, RawChainRef::wormhole(2));

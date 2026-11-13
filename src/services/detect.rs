@@ -6,6 +6,7 @@
 //! when the VAA matches the message decoded on chain.
 
 use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
+use crate::domain::analysis::RowValues;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
 use crate::protocols::{
@@ -70,7 +71,13 @@ pub fn to_bridge_transfer(
         emitter_chain,
         emitter_address,
         sequence,
-    } = &d.message;
+    } = &d.message
+    else {
+        return Err(AppError::Normalisation(format!(
+            "protocol {:?} has no v1 bridge transfer",
+            d.message.protocol()
+        )));
+    };
 
     let source_id = wormhole_id(&d.source)?;
     let destination_id = wormhole_id(&d.destination)?;
@@ -112,6 +119,42 @@ pub fn to_bridge_transfer(
             BridgeStatus::Pending
         },
     })
+}
+
+/// The `bridge_transfers` columns of a v1-representable transfer. Kept separate from the
+/// body so persistence never has to read it.
+pub fn row_values(bridge: &BridgeTransfer) -> RowValues {
+    RowValues {
+        source_tx_hash: bridge.source_tx_hash.clone(),
+        source_wallet: bridge.source_wallet.clone(),
+        source_explorer_url: bridge.source_explorer_url.clone(),
+        destination_wallet: bridge.destination_wallet.clone(),
+        destination_tx_hash: bridge.destination_tx_hash.clone(),
+        destination_explorer_url: bridge.destination_explorer_url.clone(),
+        token: bridge.token.clone(),
+        token_symbol: bridge.token_symbol.clone(),
+        amount: bridge.amount.clone(),
+        amount_formatted: bridge.amount_formatted.clone(),
+        status: bridge.status.clone(),
+    }
+}
+
+/// The `bridge_transfers` columns of a protocol v1 cannot represent. CCTP only reaches
+/// this path as an inbound completion, whose observed Solana tx is the destination side.
+pub fn cctp_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    RowValues {
+        source_tx_hash: None,
+        source_wallet: d.source_wallet.clone(),
+        source_explorer_url: None,
+        destination_wallet: d.destination_wallet.clone(),
+        destination_tx_hash: Some(d.observed_tx.clone()),
+        destination_explorer_url: chains.explorer_tx_url_for(&d.destination, &d.observed_tx),
+        token: d.token.as_ref().map(|t| t.address.clone()),
+        token_symbol: d.token_symbol.clone(),
+        amount: d.amount_raw.as_ref().map(|a| a.to_string()),
+        amount_formatted: None,
+        status: BridgeStatus::Completed,
+    }
 }
 
 /// Re-reads a transfer the WormholeScan-driven path built for a Solana redeem. That path
