@@ -68,6 +68,11 @@ fn test_config(
         solana_cctp_token_messenger_minter_program: None,
         solana_ws_url: "ws://127.0.0.1:0".to_string(),
         allowed_origins: Vec::new(),
+        api_rate_limit: bridge::config::ApiRateLimitConfig {
+            rps: 10,
+            burst: 20,
+            trust_forwarded_for: false,
+        },
         ingest: IngestConfig {
             enabled: false,
             backfill: false,

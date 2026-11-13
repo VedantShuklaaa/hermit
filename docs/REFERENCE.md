@@ -642,7 +642,7 @@ and the miss is not cached, so a later request retries.
 | 400 | `INVALID_TX_HASH`, `BAD_REQUEST` | Malformed hash or request |
 | 404 | `TX_NOT_FOUND`, `VAA_NOT_AVAILABLE` | Tx doesn't exist, or its VAA isn't available yet. Cached briefly |
 | 422 | `NORMALISATION_FAILED` | Data couldn't be normalised, including unsupported chains |
-| 429 | `UPSTREAM_RATE_LIMITED` | Provider rate-limited after retries. `Retry-After: 1` |
+| 429 | `UPSTREAM_RATE_LIMITED`, `RATE_LIMITED` | Provider rate-limited after retries, or the public API's per-client limit was exceeded. `Retry-After: 1` for an upstream limit, otherwise the limiter's wait |
 | 502 / 504 | `UPSTREAM_ERROR`, `UPSTREAM_TIMEOUT` | Provider failed or timed out after retries |
 | 503 | `OVERLOADED` | Limiter or permit wait exceeded 2 s. `Retry-After: 1` |
 | 500 | `INTERNAL_ERROR` | Unexpected error |
@@ -849,6 +849,13 @@ scrape_configs:
   `ZADD NX`) and `bridge:live:frames` (HASH), trimmed to `LIVE_FEED_MAX`.
   Enrichment advances and inbound origin-tx resolution publish an update frame.
   A Redis failure only logs.
+* **Public API rate limit:** `API_RATE_LIMIT_RPS` (10) and
+  `API_RATE_LIMIT_BURST` (20), an in-process keyed limiter applied to `/api/**`
+  only. `/health` and the separate metrics listener are exempt. The client key is
+  the peer IP; `API_TRUST_FORWARDED_FOR` (default off) uses the leftmost
+  `X-Forwarded-For` entry and is only safe behind a proxy that overwrites it. A
+  rejected request gets `429`, `Retry-After` and error code `RATE_LIMITED`. Each
+  replica keeps its own counters.
 * **Helius lanes (1c):** `HELIUS_API_URL` (API lane) and `HELIUS_STREAM_URL`
   (ingester backfill, workers, recovery, re-enrichment); each falls back to
   `HELIUS_URL`. Limiters: `HELIUS_API_RPS` (6), `HELIUS_LIVE_RPS` (4). While both
