@@ -166,7 +166,7 @@ impl ReconcilePoller {
     /// cancelled. A failed cycle or program is logged and retried on the next cycle;
     /// nothing here panics.
     pub async fn run(self, stop: CancellationToken) -> Result<()> {
-        let programs = self.programs.program_ids();
+        let programs = self.programs.ingestion_programs();
         if programs.is_empty() {
             warn!("no registered programs, the reconciliation poll has nothing to scan");
             return Ok(());

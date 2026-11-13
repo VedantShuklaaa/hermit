@@ -50,6 +50,7 @@ pub fn from_v1(tx: &NormalisedTransaction, chains: &Snapshot) -> TransactionResp
         .iter()
         .map(|t| TransferView {
             protocol: "wormhole".to_string(),
+            program: t.program.clone(),
             direction: t.direction(),
             via: None,
             observed_tx_hash: tx.hash.clone(),
@@ -134,6 +135,7 @@ pub(crate) fn transfer_view(
 
     Ok(TransferView {
         protocol: row.protocol.clone(),
+        program: row.program.clone(),
         direction,
         via,
         observed_tx_hash: row.observed_tx_hash.clone(),

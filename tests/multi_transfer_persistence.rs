@@ -22,6 +22,7 @@ fn transfer(sequence: u64, event_index: u16, destination: ChainId) -> DecodedTra
 
     DecodedTransfer {
         detected: DetectedTransfer {
+            program: bridge::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: 1,
                 emitter_address: "emitter-addr".to_string(),

@@ -26,9 +26,8 @@ const BRIDGE_TX_STREAM: &str = "bridge:transactions";
 const FAILED_TX_STREAM: &str = "bridge:transactions:failed";
 const CONSUMER_GROUP: &str = "bridge-workers";
 
-/// The checkpoint the ingester bumps for every parsed notification, not only the
-/// ones that store a transfer. Same key as `db::repository::get_last_ingested_slot`.
-const CHECKPOINT_KEY: &str = "solana_last_ingested_slot";
+// `/health` measures the Token Bridge's checkpoint only: the service is "advancing"
+// when the Token Bridge is, never because some other configured program is.
 
 const CACHE_TTL: Duration = Duration::from_secs(15);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
@@ -184,7 +183,8 @@ fn publish_gauges(report: &HealthReport) {
 }
 
 async fn measure(state: &AppState) -> Measurements {
-    let (postgres_ok, ingest_age_secs) = measure_postgres(&state.db).await;
+    let (postgres_ok, ingest_age_secs) =
+        measure_postgres(&state.db, &state.config.solana_token_bridge_program).await;
     let (redis_ok, stream_lag, stream_pending, dead_letter_len) =
         measure_redis(&state.config.redis_url).await;
 
@@ -198,7 +198,7 @@ async fn measure(state: &AppState) -> Measurements {
     }
 }
 
-async fn measure_postgres(pool: &PgPool) -> (bool, Option<i64>) {
+async fn measure_postgres(pool: &PgPool, token_bridge_program: &str) -> (bool, Option<i64>) {
     let ping = tokio::time::timeout(
         PING_TIMEOUT,
         sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
@@ -219,7 +219,9 @@ async fn measure_postgres(pool: &PgPool) -> (bool, Option<i64>) {
             WHERE key = $1
             "#,
         )
-        .bind(CHECKPOINT_KEY)
+        .bind(crate::db::repository::ingest_checkpoint_key(
+            token_bridge_program,
+        ))
         .fetch_optional(pool),
     )
     .await;

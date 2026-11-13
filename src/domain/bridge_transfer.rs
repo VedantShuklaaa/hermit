@@ -69,6 +69,11 @@ pub struct BridgeMessageId {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BridgeTransfer {
+    /// The protocol sub-program that produced this transfer (`token_bridge` today).
+    /// It is skipped when serialising, so the frozen `/api/v1` analysis stays byte for
+    /// byte identical and older analyses deserialize with the Token Bridge default.
+    #[serde(default = "crate::protocols::default_program", skip_serializing)]
+    pub program: String,
     pub source_chain: ChainId,
     /// `None` for an inbound redeem until the origin chain's tx is learned from enrichment.
     pub source_tx_hash: Option<String>,
@@ -106,6 +111,7 @@ mod tests {
 
     fn transfer(source: ChainId, destination: ChainId) -> BridgeTransfer {
         BridgeTransfer {
+            program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             source_chain: source,
             source_tx_hash: None,
             source_wallet: None,

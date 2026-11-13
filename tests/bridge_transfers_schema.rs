@@ -114,6 +114,14 @@ async fn existing_rows_survive_the_migration() {
     assert_eq!(rows[0].1, "1/aa/1");
     assert_eq!(rows[3].1, "1/aa/4");
 
+    // Rows that predate the discriminator are backfilled to the Token Bridge.
+    let programs: Vec<String> =
+        sqlx::query_scalar("SELECT program FROM bridge_transfers ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(programs, vec!["token_bridge"; 4]);
+
     // Known destination resolves; an unknown one keeps its raw reference.
     assert_eq!(rows[0].6, eth);
     assert_eq!(rows[1].4, "9999");
@@ -196,6 +204,24 @@ async fn persisting_writes_the_protocol_agnostic_shape() {
         (emitter_chain, emitter.as_str(), sequence.as_str()),
         (1, "emitter-addr", "42")
     );
+}
+
+#[tokio::test]
+async fn the_program_discriminator_is_persisted() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    let mut tx = common::sample_tx("sig-ntt", 43, ChainId::Ethereum, Some("7"));
+    tx.bridge_transfer.as_mut().unwrap().program = "ntt".to_string();
+    persist_transaction(pool, &tx).await.unwrap();
+
+    let program: String = sqlx::query_scalar(
+        "SELECT program FROM bridge_transfers WHERE observed_tx_hash = 'sig-ntt'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(program, "ntt");
 }
 
 #[tokio::test]

@@ -47,6 +47,7 @@ pub async fn persist_analysis(
                 &mut db_tx,
                 transaction_id,
                 TransferRow {
+                    program: decoded.detected.program.clone(),
                     protocol: decoded.detected.message.protocol().as_str().to_string(),
                     direction: decoded.detected.direction.as_str().to_string(),
                     message: decoded.detected.message.clone(),
@@ -115,6 +116,7 @@ async fn upsert_transaction(
 
 /// One `bridge_transfers` row to write, generalised across protocols.
 struct TransferRow<'a> {
+    program: String,
     protocol: String,
     direction: String,
     message: MessageId,
@@ -138,6 +140,7 @@ fn legacy_row<'a>(
     analysis: serde_json::Value,
 ) -> TransferRow<'a> {
     TransferRow {
+        program: bridge.program.clone(),
         protocol: NS_WORMHOLE.to_string(),
         direction: bridge.direction().as_str().to_string(),
         message: MessageId::Wormhole {
@@ -181,7 +184,7 @@ async fn write_transfer(
             destination_wallet, destination_tx_hash, destination_explorer_url,
             token_ref_protocol, token_ref_id, token_chain_id,
             token, token_symbol, amount, amount_formatted, status, analysis,
-            via, via_ref
+            via, via_ref, program
         )
         VALUES (
             $1, $2, $3, $4, $5,
@@ -192,7 +195,7 @@ async fn write_transfer(
             $14, $15, $16,
             $17, $18, resolve_chain($17, $18),
             $19, $20, $21::numeric, $22, $23, $24,
-            $25, $26
+            $25, $26, $27
         )
         ON CONFLICT (protocol, message_key)
         DO UPDATE SET
@@ -256,6 +259,7 @@ async fn write_transfer(
     .bind(row.analysis)
     .bind(row.via)
     .bind(row.via_ref)
+    .bind(row.program)
     .fetch_one(&mut **db_tx)
     .await?;
 
@@ -281,6 +285,17 @@ async fn write_transfer(
     .await?;
 
     Ok(())
+}
+
+/// The checkpoint namespace for one program: `solana:<program>`. Checkpoint helpers
+/// append `_last_ingested_slot` to it.
+pub fn ingest_checkpoint_subject(program: &str) -> String {
+    format!("solana:{program}")
+}
+
+/// The full `indexer_state` key for one program's ingest checkpoint.
+pub fn ingest_checkpoint_key(program: &str) -> String {
+    format!("{}_last_ingested_slot", ingest_checkpoint_subject(program))
 }
 
 pub async fn get_last_ingested_slot(pool: &PgPool, chain: &str) -> Result<u64> {
@@ -326,6 +341,29 @@ pub async fn touch_last_ingested_slot(pool: &PgPool, chain: &str) -> Result<()> 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Seeds a program's per-program checkpoint from the legacy `solana_last_ingested_slot`
+/// row, once. Copies the value and `updated_at`, so the Token Bridge resumes at exactly
+/// the slot the single-program ingester left off (nothing re-ingested or skipped) and
+/// `/health` does not read a falsely young heartbeat. An existing per-program row is
+/// never overwritten. Returns whether a row was created.
+pub async fn migrate_legacy_ingest_checkpoint(pool: &PgPool, program: &str) -> Result<bool> {
+    let inserted: Option<i64> = sqlx::query_scalar(
+        r#"
+        INSERT INTO indexer_state (key, value, updated_at)
+        SELECT $1, value, updated_at
+        FROM indexer_state
+        WHERE key = 'solana_last_ingested_slot'
+        ON CONFLICT (key) DO NOTHING
+        RETURNING 1::bigint
+        "#,
+    )
+    .bind(ingest_checkpoint_key(program))
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(inserted.is_some())
 }
 
 /// The end of the last successful reconciliation-poll window for `program`.
@@ -585,6 +623,7 @@ fn rebuild_missing_origin(row: &MissingOriginRow) -> Option<NormalisedTransactio
         signer: row.signer.clone(),
         bridge_event: None,
         bridge_transfer: Some(BridgeTransfer {
+            program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             source_chain,
             source_tx_hash: row.source_tx_hash.clone(),
             source_wallet: row.source_wallet.clone(),
@@ -701,6 +740,7 @@ pub struct StoredTransaction {
 /// One `bridge_transfers` row, with its protocol detail. A row can exist for a protocol
 /// whose detail table is not `wormhole_messages`; the message columns are then `None`.
 pub struct StoredTransfer {
+    pub program: String,
     pub protocol: String,
     pub direction: String,
     pub observed_tx_hash: String,
@@ -744,7 +784,7 @@ pub async fn get_transaction_with_transfers(
         r#"
         SELECT t.hash, t.chain, t.status AS tx_status, t.slot, t.timestamp,
                t.fee_lamports, t.signer,
-               b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+               b.program, b.protocol, b.direction, b.observed_tx_hash, b.event_index,
                b.via, b.via_ref,
                b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
                b.source_wallet, b.source_explorer_url,
@@ -785,6 +825,7 @@ pub async fn get_transaction_with_transfers(
             continue;
         };
         transfers.push(StoredTransfer {
+            program: row.try_get("program")?,
             protocol,
             direction: row.try_get("direction")?,
             observed_tx_hash: row.try_get("observed_tx_hash")?,
@@ -848,7 +889,7 @@ pub struct ListedTransfer {
 
 const LIST_SELECT: &str = r#"
 SELECT b.id, b.created_at,
-       b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+       b.program, b.protocol, b.direction, b.observed_tx_hash, b.event_index,
        b.via, b.via_ref,
        b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
        b.source_wallet, b.source_explorer_url,
@@ -912,6 +953,7 @@ pub async fn list_transfers(
     let mut listed = Vec::with_capacity(rows.len());
     for row in &rows {
         let transfer = StoredTransfer {
+            program: row.try_get("program")?,
             protocol: row.try_get("protocol")?,
             direction: row.try_get("direction")?,
             observed_tx_hash: row.try_get("observed_tx_hash")?,

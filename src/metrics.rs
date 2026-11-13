@@ -95,20 +95,20 @@ fn describe() {
     );
     metrics::describe_counter!(
         INGEST_RECONNECTS_TOTAL,
-        "Solana WebSocket reconnects by reason (watchdog, subscribe_failed, closed, error)"
+        "Solana WebSocket reconnects by program and reason (watchdog, subscribe_failed, closed, error)"
     );
     metrics::describe_gauge!(
         INGEST_BACKFILL_INFLIGHT,
-        "Backfill tasks currently running next to a live ingestion connection (0 or 1)"
+        "Backfill tasks currently running next to a live ingestion connection, by program"
     );
     metrics::describe_histogram!(
         INGEST_BACKFILL_DURATION_SECONDS,
         metrics::Unit::Seconds,
-        "Duration of one backfill run for a connection, including paced publishes and cancellation"
+        "Duration of one backfill run for a connection, including paced publishes and cancellation, by program"
     );
     metrics::describe_counter!(
         INGEST_BACKFILL_PUBLISHED_TOTAL,
-        "Signatures a backfill published to the bridge stream, dedupe suppressions excluded"
+        "Signatures a backfill published to the bridge stream, dedupe suppressions excluded, by program"
     );
     metrics::describe_counter!(
         POLL_CYCLES_TOTAL,

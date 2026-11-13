@@ -112,6 +112,7 @@ pub fn sample_tx(
         signer: Some("SomeSignerPubkey".to_string()),
         bridge_event: None,
         bridge_transfer: Some(BridgeTransfer {
+            program: bridge::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             source_chain: ChainId::Solana,
             source_tx_hash: Some(hash.to_string()),
             source_wallet: Some("SomeSignerPubkey".to_string()),

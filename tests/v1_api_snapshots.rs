@@ -156,6 +156,7 @@ fn stored(name: &str, current: &Current) -> StoredTransactionWithTransfers {
             signer: tx.signer.clone(),
         },
         transfers: vec![StoredTransfer {
+            program: bridge.program.clone(),
             protocol: "wormhole".to_string(),
             direction: bridge.direction().as_str().to_string(),
             observed_tx_hash: detected.observed_tx.clone(),
@@ -205,6 +206,24 @@ fn pretty(tx: &NormalisedTransaction) -> String {
     let mut s = serde_json::to_string_pretty(tx).expect("serialise v1 response");
     s.push('\n');
     s
+}
+
+/// A row from another program is present in `/api/v2` and explicitly rejected by
+/// `/api/v1`, never mapped as if it were a Token Bridge transfer.
+#[test]
+fn a_non_token_bridge_row_is_only_in_v2() {
+    let current = current_v1("completed_outbound");
+    let mut stored = stored("completed_outbound", &current);
+    stored.transfers[0].program = "ntt".to_string();
+
+    let response = api_v2::assemble(stored, &chains()).expect("v2 assemble");
+    assert_eq!(response.transfers.len(), 1);
+    assert_eq!(response.transfers[0].program, "ntt");
+
+    assert!(matches!(
+        compat::to_v1(&response, current.tx.bridge_event.clone()),
+        Err(bridge::error::AppError::Normalisation(_))
+    ));
 }
 
 #[test]

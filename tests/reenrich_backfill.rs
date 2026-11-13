@@ -40,6 +40,10 @@ fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppC
         failed_cache_ttl_secs: 10,
         port: 0,
         solana_token_bridge_program: "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+        solana_bridge_programs: vec![(
+            bridge::protocols::Protocol::Wormhole,
+            "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+        )],
         solana_ws_url: "ws://127.0.0.1:0".to_string(),
         allowed_origins: Vec::new(),
         ingest: IngestConfig {

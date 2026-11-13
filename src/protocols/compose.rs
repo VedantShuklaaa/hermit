@@ -54,6 +54,7 @@ mod tests {
 
     fn transfer(seq: u64) -> DetectedTransfer {
         DetectedTransfer {
+            program: crate::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: 1,
                 emitter_address: "aa".into(),

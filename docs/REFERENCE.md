@@ -121,6 +121,24 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     `evm_watch_targets` for Base, Arbitrum and Avalanche with the verified Core
     and Token Bridge addresses, `evm_chain_id`, `finality_mode = 'finalized'`
     and fallback depths 6500, 5000 and 32.
+  * `20261114120000_bridge_transfer_program.sql` adds
+    `bridge_transfers.program` (`TEXT NOT NULL DEFAULT 'token_bridge'`) and
+    backfills every existing row to `token_bridge`. The column records which
+    protocol sub-program decoded the transfer; `/api/v1` only serves
+    `token_bridge` rows and `/api/v2` exposes the field additively.
+* **Per-program Solana ingestion (A4, ingestion plumbing).** The configured set
+  is `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV), or the single
+  `SOLANA_TOKEN_BRIDGE_PROGRAM` when the list is unset. Every entry gets its own
+  `logsSubscribe` (`mentions` takes one address), checkpoint
+  (`solana:<program>_last_ingested_slot`), backfill, reconnect/watchdog loop and
+  reconciliation-poll stream. A rejected subscription, a dead connection or a
+  panic is restarted for that program only, so one program never stops the
+  others. On startup `solana_last_ingested_slot` is copied once to the Token
+  Bridge's per-program key (value and `updated_at`, `ON CONFLICT DO NOTHING`), so
+  a single-program deployment resumes exactly where it stopped without a gap or
+  a replay. `/health` reads only the Token Bridge checkpoint: the service counts
+  as advancing when the Token Bridge advances, never because another configured
+  program is.
 * **EVM log watching (Ethereum, Base, Arbitrum and Avalanche).** One watcher per enabled
   `evm_watch_targets` row polls `eth_getLogs` over the configured address and
   topic filters and stores events keyed by
@@ -257,7 +275,12 @@ hermit/
 │   ├── 20261030120000_repair_inbound_source_wallet.sql
 │   ├── 20261030130000_index_missing_origin.sql
 │   ├── 20261030140000_origin_attempt_marker.sql
-│   └── 20261031120000_list_endpoint_token_index.sql
+│   ├── 20261031120000_list_endpoint_token_index.sql
+│   ├── 20261110120000_evm_log_watching.sql
+│   ├── 20261111120000_evm_watch_target_chain_id.sql
+│   ├── 20261112120000_evm_watch_target_finality_mode.sql
+│   ├── 20261113120000_enable_base_arbitrum_avalanche.sql
+│   └── 20261114120000_bridge_transfer_program.sql
 ├── docs/
 │   ├── REFERENCE.md                     # this file
 │   ├── 3e-worker-patience.md
@@ -516,6 +539,16 @@ and the miss is not cached, so a later request retries.
 | 503 | `OVERLOADED` | Limiter or permit wait exceeded 2 s. `Retry-After: 1` |
 | 500 | `INTERNAL_ERROR` | Unexpected error |
 
+### `/api/v1` and programs other than the Token Bridge
+
+`/api/v1` keeps the frozen Wormhole Token Bridge shape. Every `bridge_transfers`
+row records the sub-program that decoded it in `program` (`token_bridge` today).
+The v1 compatibility mapper returns only a row whose `program = 'token_bridge'`;
+a transaction whose transfers all come from another program is rejected with
+`422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
+carries `program` on every transfer, and the field is additive: v1 response
+bodies are byte for byte unchanged.
+
 ### List transfers (`GET /api/v2/transfers`)
 
 Lists stored transfers newest first, one page per request. `items` uses the same
@@ -676,10 +709,10 @@ must keep `9100` closed.
 | `stream_pending` | gauge | none |
 | `dead_letter_depth` | gauge | none |
 | `ingest_age_seconds` | gauge | none |
-| `ingest_reconnects_total` | counter | `reason`: `watchdog`, `subscribe_failed`, `closed`, `error` |
-| `ingest_backfill_inflight` | gauge | none |
-| `ingest_backfill_duration_seconds` | histogram | none |
-| `ingest_backfill_published_total` | counter | none |
+| `ingest_reconnects_total` | counter | `program`; `reason`: `watchdog`, `subscribe_failed`, `closed`, `error` |
+| `ingest_backfill_inflight` | gauge | `program` |
+| `ingest_backfill_duration_seconds` | histogram | `program` |
+| `ingest_backfill_published_total` | counter | `program` |
 | `poll_cycles_total` | counter | `program`; `result`: `ok`, `error` |
 | `poll_missed_total` | counter | `program` |
 | `poll_last_success_timestamp_seconds` | gauge | `program` |
@@ -737,10 +770,14 @@ scrape_configs:
   `CONSUMER_COUNT` (5), `CONSUMER_READ_COUNT` (10), `DB_POOL_MAX` (20). The 3f
   sweep found no gain above these defaults; raise only with a measurement
   ([3f-write-path.md](3f-write-path.md)).
-* **Programs:** `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address and the only
-  program setting `config.rs` reads. `protocols::registry` already parses
-  `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV) but nothing reads it
-  yet. A4 wires it and retires the single-address setting.
+* **Programs:** `SOLANA_TOKEN_BRIDGE_PROGRAM` is the single Token Bridge address
+  and the fallback. `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV, e.g.
+  `wormhole:wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb`) takes precedence when
+  set. Every address must be valid base58 decoding to 32 bytes; an invalid one
+  fails startup naming the variable. One `logsSubscribe`, checkpoint and
+  backfill run per entry, and the Token Bridge address from
+  `SOLANA_TOKEN_BRIDGE_PROGRAM` is always part of the set (so `/health` has a
+  checkpoint to read).
 * **Chain registry:** `CHAIN_REGISTRY_REFRESH_SECS` (default 60, min 5).
 * **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
   per chain (suffix is the lowercased `chains.slug`, e.g.
@@ -763,7 +800,10 @@ scrape_configs:
   `redis_ok`, `ingest_age_secs`, `stream_lag`, `stream_pending` (from
   `XINFO GROUPS bridge:transactions`) and `dead_letter_len`. It never calls
   Helius or WormholeScan. `ingest_age_secs` is the age of `indexer_state.updated_at`
-  for `solana_last_ingested_slot`, bumped on every parsed notification. Cached
+  for the Token Bridge's per-program key
+  (`solana:<SOLANA_TOKEN_BRIDGE_PROGRAM>_last_ingested_slot`), bumped on every
+  parsed Token Bridge notification. It never measures another configured program:
+  a healthy service means the Token Bridge is advancing. Cached
   15 s, concurrent polls share one measurement. `HEALTH_MAX_INGEST_AGE_SECS`
   (default 3600, min 1; the default is deliberate, quiet 25-minute gaps have
   happened). Answers 503 only when Postgres or Redis is down, or
@@ -823,6 +863,14 @@ cargo test
   unknown error and the Alchemy free-tier range error). Capture logs with
   `scripts/capture_evm_fixtures.sh` and an `EVM_RPC_ETHEREUM` from the
   environment; the key is never written.
+* `tests/multi_program_ingestion.rs`: the real ingester against a loopback
+  WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
+  get one `logsSubscribe` each, their notifications advance separate checkpoints
+  and publish their own signature, and a rejected subscription for one program
+  does not stop the other. `tests/indexer_state_checkpoint.rs` covers the
+  monotonic checkpoint and the one-time move of the legacy
+  `solana_last_ingested_slot` to the Token Bridge's per-program key (value and
+  heartbeat copied, a later legacy write cannot rewind it).
 * `tests/persistence_idempotency.rs`: Postgres 18 via testcontainers (Docker).
   Redelivering the same tx never duplicates rows in `transactions`,
   `bridge_transfers` or `wormhole_messages`.
@@ -909,7 +957,7 @@ only real adapter.
 * \[x] A1. Adapter trait and registry. `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx`, Wormhole Token Bridge outbound decode, wiring into `analyse_tx`, and A1b inbound redeems via `required_accounts` + `getMultipleAccounts` + in-house posted-VAA parser
 * \[x] A2. Generalised domain model and schema (`protocol`, `via`, `direction`, chain refs, per-protocol message key, `NUMERIC` amounts). `bridge_transfers` split from `wormhole_messages`. Existing rows migrated in place, tested on staged legacy data
 * \[x] A3. DB-backed chain registry seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs stored as `unresolved(protocol, id)`. Registry carries status and provenance for the later LLM-proposal upgrade (not built in this phase). Done: tables, seed, `load_snapshot`, DB tests, SQL `resolve_chain`, unresolved IDs persisted, callers moved off `ChainId` (kept only as the frozen `/api/v1` type), refresh task wired
-* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list
+* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist; the NTT and other adapters remain
 * \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share
