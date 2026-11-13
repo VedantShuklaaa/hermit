@@ -2,7 +2,7 @@
 
 Detailed notes moved out of the README. Start with [README.md](../README.md).
 
-Contents: [Domain model](#domain-model-and-implementation-notes) · [Project structure](#project-structure-full) · [Read path](#read-path) · [Reliability](#reliability-properties) · [Known limitations](#known-limitations) · [API details](#api-details) · [Operations](#operations) · [Testing detail](#testing-detail) · [Roadmap](#roadmap) · [Benchmarks](#benchmarks)
+Contents: [Domain model](#domain-model-and-implementation-notes) · [Project structure](#project-structure-full) · [Read path](#read-path) · [Reliability](#reliability-properties) · [Known gaps](#known-gaps) · [API details](#api-details) · [Operations](#operations) · [Testing detail](#testing-detail) · [Roadmap](#roadmap) · [Benchmarks](#benchmarks)
 
 ***
 
@@ -727,11 +727,14 @@ and the miss is not cached, so a later request retries.
 
 ***
 
-## Known limitations
+## Known gaps
+
+The consolidated protocol and operations gap list lives in the
+[README](../README.md#known-gaps). These are limitations of the read and
+enrichment path:
 
 * **An orphaned join stays.** A hash or `Completed` status written from an event that a reorg later deletes is never cleared; a generous `finality_depth` is the mitigation.
 * **Outbound NFT transfers never leave `Pending`.** The NFT side of a transfer on an EVM chain emits no event the watcher can join: the EVM watcher is Token Bridge and Core Bridge only, and an NFT destination tx is not confirmed by watching. WormholeScan's destination tx hash is still recorded as a hint, but the status deliberately stays `Pending` rather than advancing on an unverified hint. An inbound redeem on Solana is decoded from the posted VAA and is `Completed`.
-* **deBridge DLN cancel, claim and unlock are not indexed.** `createOrder`/`createOrderWithNonce` and `fulfillOrder` are decoded, but `cancelOrder`, `sendOrderCancel`, `sendUnlock` and `sendBatchUnlock` are not, so a cancelled or unlocked order keeps whatever row its create or fill produced. DLN has no enrichment provider: a source order that is never filled stays `Pending`, and a fill seen before its source keeps `source_tx_hash` NULL until the source leg is indexed.
 
 ***
 

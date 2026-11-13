@@ -193,12 +193,15 @@ EVM coverage is in [Phase E](docs/REFERENCE.md#phase-e-evm-coverage-separate-che
 
 ## Known gaps
 
-* deBridge DLN `cancelOrder`, `sendOrderCancel`, `sendUnlock` and
-  `sendBatchUnlock` are not indexed, so a cancelled or unlocked order keeps the
-  row its create or fill produced.
-* A deBridge source order that is never filled stays `Pending`, and a fill seen
-  before its source row keeps `source_tx_hash` NULL until the source leg is
-  indexed.
+* **NTT:** each deployment has its own program IDs, so indexing it needs a deployment registry.
+* **Mayan:** instruction layouts and order-hash derivation are undocumented, and the fulfill is driver-side.
+* **Allbridge:** no standalone Solana bridge; its flows are CCTP and LayerZero OFT.
+* **CCTP:** inbound completions only (no sends, no EVM adapters). Stellar (domain 27) needs a StrKey decoding arm, and domains 22, 25, 29, 31 and 37 are unmapped and stored unresolved.
+* **deBridge:** `cancelOrder`, `sendOrderCancel`, `sendUnlock` and `sendBatchUnlock` are not indexed, so a cancelled or unlocked order keeps the row its create or fill produced; DLN chains not mapped in this registry (Linea, NEAR, TRON and others) are stored unresolved; with no DLN enrichment an unfilled source order stays `Pending` and a fill seen first keeps `source_tx_hash` NULL until the source leg arrives.
+* **Explorer URLs:** not set for HyperEVM, Monad or Arc.
+* **Rate limits:** per instance; set `API_TRUST_FORWARDED_FOR=1` behind Caddy or all clients share one bucket.
+* **Protocol filter:** the 400 message in `src/services/transfers.rs` is hand-listed and must be updated when a protocol is added.
+* **Test name:** `migration_seeds_the_ten_known_chains` is stale (it now covers more chains).
 
 ## Headline numbers
 
