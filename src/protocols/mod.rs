@@ -6,6 +6,7 @@
 pub mod amount;
 pub mod cctp;
 pub mod compose;
+pub mod debridge;
 pub mod registry;
 pub mod solana_tx;
 pub mod wormhole;
@@ -23,6 +24,10 @@ pub const TOKEN_BRIDGE_PROGRAM: &str = "token_bridge";
 /// with the Token Bridge, but is a different Solana program with its own payloads.
 pub const NFT_BRIDGE_PROGRAM: &str = "nft_bridge";
 
+/// The deBridge DLN source program discriminator. DLN has one Solana program per
+/// side, and this adapter decodes only the source-side order creation.
+pub const DEBRIDGE_PROGRAM: &str = "debridge";
+
 /// The serde default for a transfer that predates the discriminator.
 pub fn default_program() -> String {
     TOKEN_BRIDGE_PROGRAM.to_string()
@@ -34,6 +39,8 @@ pub enum Protocol {
     Wormhole,
     /// Circle CCTP V2 on Solana. It does not use the Wormhole core bridge or a VAA.
     Cctp,
+    /// deBridge DLN. Only source-side order creation on Solana is decoded.
+    Debridge,
 }
 
 impl Protocol {
@@ -41,6 +48,7 @@ impl Protocol {
         match self {
             Protocol::Wormhole => "wormhole",
             Protocol::Cctp => "cctp",
+            Protocol::Debridge => "debridge",
         }
     }
 
@@ -48,6 +56,7 @@ impl Protocol {
         match s {
             "wormhole" => Some(Protocol::Wormhole),
             "cctp" => Some(Protocol::Cctp),
+            "debridge" => Some(Protocol::Debridge),
             _ => None,
         }
     }
@@ -88,6 +97,11 @@ pub enum MessageId {
         /// Lowercase hex, 64 characters.
         nonce: String,
     },
+    /// deBridge DLN identity: the 32-byte order id from the `CreatedOrderId` event.
+    Debridge {
+        /// Lowercase hex, 64 characters.
+        order_id: String,
+    },
 }
 
 impl MessageId {
@@ -95,6 +109,7 @@ impl MessageId {
         match self {
             MessageId::Wormhole { .. } => Protocol::Wormhole,
             MessageId::Cctp { .. } => Protocol::Cctp,
+            MessageId::Debridge { .. } => Protocol::Debridge,
         }
     }
 
@@ -110,6 +125,7 @@ impl MessageId {
                 source_domain,
                 nonce,
             } => format!("{source_domain}/{nonce}"),
+            MessageId::Debridge { order_id } => order_id.clone(),
         }
     }
 }
@@ -133,9 +149,9 @@ pub struct TokenRef {
 /// One bridge transfer decoded from a Solana transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedTransfer {
-    /// Which program inside the protocol decoded this: `token_bridge` or
-    /// `nft_bridge`. It is what `/api/v1` can represent and what `/api/v2` exposes
-    /// additively.
+    /// Which program inside the protocol decoded this: `token_bridge`, `nft_bridge`,
+    /// `cctp` or `debridge`. It is what `/api/v1` can represent and what `/api/v2`
+    /// exposes additively.
     pub program: String,
     pub message: MessageId,
     pub direction: Direction,

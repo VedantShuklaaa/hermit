@@ -197,6 +197,14 @@ fn message_id(row: &StoredTransfer) -> Result<MessageId, AppError> {
                 nonce,
             })
         }
+        "debridge" => {
+            if row.message_key.is_empty() {
+                return Err(missing("order_id"));
+            }
+            Ok(MessageId::Debridge {
+                order_id: row.message_key.clone(),
+            })
+        }
         other => Err(AppError::Normalisation(format!(
             "unsupported protocol: {other}"
         ))),

@@ -141,6 +141,7 @@ fn the_v2_message_id_is_the_origin_domain_and_the_32_byte_nonce() {
         transfers: vec![StoredTransfer {
             program: "cctp".to_string(),
             protocol: "cctp".to_string(),
+            message_key: format!("0/{nonce}"),
             direction: "Inbound".to_string(),
             observed_tx_hash: HASH.to_string(),
             event_index: 0,

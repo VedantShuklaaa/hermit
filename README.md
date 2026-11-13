@@ -10,8 +10,9 @@ over WebSocket.
 The product is moving from a Wormhole transfer indexer to a protocol-agnostic
 core with one adapter per bridge protocol. The Wormhole Token Bridge is decoded
 by default; the Wormhole NFT Bridge is decoded when its program is configured
-(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), and Circle CCTP V2 inbound completions
-when both `SOLANA_CCTP_*` programs are configured.
+(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), Circle CCTP V2 inbound completions
+when both `SOLANA_CCTP_*` programs are configured, and deBridge DLN source-side
+orders from the fixed `DlnSource` program.
 
 Full details (implementation notes, read path, reliability, config, metrics,
 roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
@@ -22,6 +23,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | --- | --- |
 | Wormhole Token Bridge | Outbound sends indexed chain-first and start `Pending` (Solana data alone; EVM logs and WormholeScan enrich). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
 | Wormhole NFT Bridge (opt-in) | `transfer_native`/`transfer_wrapped` sends and `complete_native`/`complete_wrapped` redeems decoded when `SOLANA_NFT_BRIDGE_PROGRAM` is set; admin and metadata instructions rejected. Outbound NFT rows stay `Pending`: no watched EVM event confirms the NFT side |
+| deBridge DLN (source-side) | `createOrder`/`createOrderWithNonce` decoded from the fixed `DlnSource` program. The 32-byte order id comes from the `CreatedOrderId` event; the destination leg is not indexed yet, so rows stay `Pending` |
 | EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan. A bad chain row or RPC URL is skipped and logged, leaving the other chains watching |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
@@ -53,7 +55,9 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Wormhole Token Bridge | Sends and redeems indexed |
 | Wormhole NFT Bridge | Sends and redeems indexed when `SOLANA_NFT_BRIDGE_PROGRAM` is set |
 | Wormhole NTT and other Wormhole programs | Phase A (A4). Multi-program ingestion, per-program checkpoints, the `program` discriminator and the NFT Bridge adapter are in place; NTT and the remaining adapters are not |
-| Mayan, CCTP, LayerZero/Stargate, deBridge, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
+| Circle CCTP V2 | Inbound completions indexed when both `SOLANA_CCTP_*` programs are set |
+| deBridge DLN | Source-side orders (`createOrder`/`createOrderWithNonce`) indexed; destination-side fills are not |
+| Mayan, LayerZero/Stargate, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
 
 ## Architecture
 
@@ -99,7 +103,7 @@ hermit/
 │   ├── normaliser/             # provider JSON -> domain (pure)
 │   ├── clients/                # Helius, WormholeScan, rate limiter
 │   ├── chain_adapters/         # token symbol/decimals per chain
-│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole adapter
+│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole/CCTP/deBridge adapters
 │   ├── chains/                 # DB-backed chain registry
 │   ├── enrichment/             # providers + background re-enrichment
 │   ├── evm/                    # Ethereum log watcher, cursor, tx-hash lookup
@@ -180,7 +184,7 @@ Per-file coverage: [reference](docs/REFERENCE.md#testing-detail).
 | 2 | Deploy pipeline and roles | Roles, health, Caddy done. CD, hostnames, hardening, metrics dashboards open |
 | 3 | Scale the API | 3b, 3c, 3e, 3f, 3g, perf-1, perf-2 done. 3a, 3d open |
 | 4 | WebSocket stream recall/precision | 4a to 4g done |
-| B+ | One protocol per phase | Not started |
+| B+ | One protocol per phase | deBridge DLN source-side done; destination-side and the other protocols open |
 | E | EVM coverage (separate checklist) | E0 to E3 done; E4 open |
 
 Each checkpoint: branch, tests/fixtures, benchmark, Results row, PR, tag, deploy,

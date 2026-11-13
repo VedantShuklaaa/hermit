@@ -16,8 +16,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   ID, ...) with a unique key per protocol, wallets, token, amount and a status:
   `Detected`, `Pending`, `Completed`, plus `Failed`/`Refunded` where a protocol
   needs them.
-* Storage is split into a protocol-agnostic `bridge_transfers` table and one
-  detail table per protocol (`wormhole_messages` today). Identity is
+* Storage is split into a protocol-agnostic `bridge_transfers` table and, where a
+  protocol needs one, a detail table (`wormhole_messages`, `cctp_messages`; deBridge
+  needs none because the order id is the message key). Identity is
   `UNIQUE (protocol, message_key)`. `observed_tx_hash` is the Solana tx it was
   decoded from and `event_index` its position there, so one tx can hold several
   transfers.
@@ -35,8 +36,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
 
 ### Implemented so far
 
-* `MessageId` is an enum with one variant per protocol (only `Wormhole` today).
-  `MessageId::key()` is the canonical string stored as `bridge_transfers.message_key`.
+* `MessageId` is an enum with one variant per protocol (`Wormhole`, `Cctp` and
+  `Debridge` today). `MessageId::key()` is the canonical string stored as
+  `bridge_transfers.message_key`.
 * `BridgeAdapter` is pure: `classify(&SolanaTx)` returns either the transfers it
   contains or a `Reject` of kind `not_transfer`, `unsupported` or `malformed`, with
   a reason. `ProtocolRegistry` routes a tx to every adapter whose program appears
@@ -48,9 +50,10 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   Only `active` rows resolve, in both tables, and a mapping must point at an
   active chain, so a `pending_review` proposal can never label a real transfer.
 * The migration seeds the 10 current chains plus the `wormhole` namespace (checked
-  against `sdk/vaa/structs.go` in wormhole-foundation/wormhole) and the `evm`
-  namespace (checked against ethereum-lists/chains). Each mapping row carries
-  `status`, `origin` (`seed`, `manual`, `llm`), `evidence` and `verified_at`.
+  against `sdk/vaa/structs.go` in wormhole-foundation/wormhole), the `evm`
+  namespace (checked against ethereum-lists/chains), the CCTP domains and the
+  `debridge` internal chain IDs. Each mapping row carries `status`, `origin`
+  (`seed`, `manual`, `llm`), `evidence` and `verified_at`.
 * `protocols::wormhole::WormholeAdapter` decodes Token Bridge outbound transfers
   (`transfer_native`, `transfer_wrapped` and the with-payload variants) from the tx
   alone. The Token Bridge CPIs the core bridge `PostMessage`: its instruction data
@@ -190,6 +193,68 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   adapter off. When set, both IDs are registered to the CCTP adapter and
   removed from the Wormhole adapter's program set, so no transaction is
   classified twice and an unset deployment sees exactly the old behaviour.
+* **deBridge DLN source side.** `protocols/debridge/mod.rs` implements the same
+  `BridgeAdapter` for DLN on Solana. Only the source-side order creation is
+  indexed; the destination-side fill is a follow-up.
+
+  | Program | ID | Verified against |
+  | --- | --- | --- |
+  | DlnSource | `src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4` | <https://docs.debridge.com/dln-details/overview/deployed-contracts> |
+
+  The IDL is <https://github.com/debridge-finance/abis-and-idls/blob/master/idls/src.ts>.
+  Instruction discriminators are Anchor's `sha256("global:<snake_case>")[..8]`:
+  `create_order = 8d3625cfedd2fad7`,
+  `create_order_with_nonce = 828362be28ce4432`.
+  Event discriminators are `sha256("event:<EventName>")[..8]`:
+  `CreatedOrder = 6a574ae6207847d2`,
+  `CreatedOrderId = bb291b490c3f0d54`.
+  The `create_order_with_nonce` instruction and both event values were checked
+  against mainnet transaction
+  `3ggTVbZvk38HfKTQ8fcTYkvTeDc1uw75KTGUzpm1MVHFJWHhFSbQBALshBmszepZDULTqTqxnMJhAPiT6UgXMUK5d`
+  (the official parser's create test). Failed transactions, every other
+  `DlnSource` instruction and any transaction whose events do not match its
+  order instructions are rejected, never stored.
+
+  **Identity.** `MessageId::Debridge { order_id }`, key = the order id as
+  lowercase hex (64 characters). The order id is the 32 bytes after the 8-byte
+  `CreatedOrderId` event discriminator in a `Program data:` log printed while
+  `DlnSource` is the running program. No client-side hashing is needed. The
+  `CreatedOrder` event carries the final `Order`, from which the adapter reads the
+  give amount, the Solana mint, the take chain and the receiver. A `give` chain
+  other than Solana 7565164 is rejected `malformed`.
+
+  **Chains.** The migration `20261115130000_debridge_chain_ids.sql` seeds the
+  DLN internal IDs checked against
+  <https://docs.debridge.com/home/architecture/supported-chains>:
+
+  | deBridge ID | Chain |
+  | --- | --- |
+  | 7565164 | Solana |
+  | 1 | Ethereum |
+  | 56 | BNB Smart Chain |
+  | 137 | Polygon |
+  | 43114 | Avalanche |
+  | 42161 | Arbitrum |
+  | 10 | Optimism |
+  | 8453 | Base |
+  | 5042 | Arc |
+  | 100000022 | HyperEVM |
+  | 100000030 | Monad |
+
+  HyperEVM and Monad use DLN's internal IDs, not their EVM chain IDs. Gnosis is
+  not on DLN's supported list; Linea and the other listed chains are not in this
+  registry yet. Any other ID is stored as an unresolved `debridge` reference.
+  Destination addresses are decoded for the seeded chains: 32-byte Solana
+  addresses as base58, 20-byte EVM addresses as `0x` + hex. An unknown chain
+  leaves the wallet absent, never an error. The source amount and token come from
+  the order's `give` side, so they are read for Solana.
+
+  **Read path.** A source-side row starts `Pending`: the observed Solana tx is
+  the source and no destination leg is indexed yet. `/api/v1` does not represent
+  it; `/api/v2` returns
+  `message_id: { protocol: "debridge", order_id }` and
+  `program: "debridge"`. The adapter is always registered under the fixed
+  `DlnSource` program; there is no `SOLANA_DEBRIDGE_*` configuration.
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -228,6 +293,10 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   * `20261115120000_cctp_messages.sql` adds `cctp_messages` (`transfer_id` PK,
     `source_domain`, `nonce`, message `version`, unique on
     `(source_domain, nonce)`) and seeds CCTP domains 0, 1, 3, 5 and 6.
+  * `20261115130000_debridge_chain_ids.sql` seeds the `debridge` namespace in
+    `protocol_chain_ids` with the DLN internal IDs for Solana and the ten EVM
+    chains already in the registry (see the deBridge section above). It adds no
+    `chains` rows and leaves `explorer_tx_url` NULL.
 * **Per-program Solana ingestion (A4, ingestion plumbing).** The configured set
   is `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV), or the single
   `SOLANA_TOKEN_BRIDGE_PROGRAM` when the list is unset. A second, separately
@@ -386,7 +455,9 @@ hermit/
 │   ├── 20261111120000_evm_watch_target_chain_id.sql
 │   ├── 20261112120000_evm_watch_target_finality_mode.sql
 │   ├── 20261113120000_enable_base_arbitrum_avalanche.sql
-│   └── 20261114120000_bridge_transfer_program.sql
+│   ├── 20261114120000_bridge_transfer_program.sql
+│   ├── 20261115120000_cctp_messages.sql
+│   └── 20261115130000_debridge_chain_ids.sql
 ├── docs/
 │   ├── REFERENCE.md                     # this file
 │   ├── 3e-worker-patience.md
@@ -432,10 +503,14 @@ hermit/
 │   │   ├── compose.rs
 │   │   ├── solana_tx.rs                # pure SolanaTx view from Helius jsonParsed + preloaded accounts
 │   │   ├── amount.rs                   # RawAmount
-│   │   └── wormhole/
-│   │       ├── mod.rs                  # Token Bridge adapter, outbound and inbound
-│   │       ├── nft_bridge.rs           # NFT Bridge adapter, opt-in via SOLANA_NFT_BRIDGE_PROGRAM
-│   │       └── posted_vaa.rs           # core bridge posted VAA account parser
+│   │   ├── wormhole/
+│   │   │   ├── mod.rs                  # Token Bridge adapter, outbound and inbound
+│   │   │   ├── nft_bridge.rs           # NFT Bridge adapter, opt-in via SOLANA_NFT_BRIDGE_PROGRAM
+│   │   │   └── posted_vaa.rs           # core bridge posted VAA account parser
+│   │   ├── cctp/
+│   │   │   └── mod.rs                  # CCTP V2 inbound completion adapter, opt-in
+│   │   └── debridge/
+│   │       └── mod.rs                  # DLN source-side createOrder adapter
 │   ├── chains/
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve
 │   │   └── db.rs                       # load_snapshot
@@ -483,13 +558,17 @@ hermit/
 ├── tests/
 │   ├── bridge_transfers_schema.rs
 │   ├── chain_registry_db.rs
+│   ├── cctp_fixtures.rs
+│   ├── cctp_persistence.rs
 │   ├── common/
+│   ├── debridge_fixtures.rs
 │   ├── decode_unit.rs
 │   ├── evm_log_watch.rs
 │   ├── fixtures_decode.rs
 │   ├── golden_fixtures.rs
 │   ├── list_transfers.rs
 │   ├── persistence_idempotency.rs
+│   ├── v1_api_snapshots.rs
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json, account_<name>_vaa.json
 ├── benches/                            # (planned) criterion, Phase 1
 ├── .env.example
@@ -631,6 +710,7 @@ and the miss is not cached, so a later request retries.
 
 * **An orphaned join stays.** A hash or `Completed` status written from an event that a reorg later deletes is never cleared; a generous `finality_depth` is the mitigation.
 * **Outbound NFT transfers never leave `Pending`.** The NFT side of a transfer on an EVM chain emits no event the watcher can join: the EVM watcher is Token Bridge and Core Bridge only, and an NFT destination tx is not confirmed by watching. WormholeScan's destination tx hash is still recorded as a hint, but the status deliberately stays `Pending` rather than advancing on an unverified hint. An inbound redeem on Solana is decoded from the posted VAA and is `Completed`.
+* **deBridge source-side orders stay `Pending`.** Only `DlnSource` on Solana is indexed. The destination fill is not decoded, so nothing advances the row and no destination tx hash is set. No enrichment provider covers DLN either, so the background re-enrichment leaves these rows untouched.
 
 ***
 
@@ -651,9 +731,10 @@ and the miss is not cached, so a later request retries.
 
 `/api/v1` keeps the frozen Wormhole Token Bridge shape. Every `bridge_transfers`
 row records the sub-program that decoded it in `program` (`token_bridge`, or
-`nft_bridge` for the NFT Bridge). The v1 compatibility mapper returns only a row
+`nft_bridge` for the NFT Bridge; the CCTP and deBridge adapters write `cctp` and
+`debridge`). The v1 compatibility mapper returns only a row
 whose `program = 'token_bridge'`; a transaction whose transfers all come from
-another program (for example `nft_bridge`) is rejected with
+another program (for example `nft_bridge` or `debridge`) is rejected with
 `422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
 carries `program` on every transfer, and the field is additive: v1 response
 bodies are byte for byte unchanged.
@@ -672,7 +753,7 @@ GET /api/v2/transfers?limit=50&direction=Inbound&status=Completed&chain=ethereum
 | --- | --- | --- |
 | `limit` | page size | default 50, 1 to 200 |
 | `cursor` | position from the previous `next_cursor` | opaque; strictly after the last returned row |
-| `protocol` | exact stored protocol | `wormhole` or `cctp`; anything else is 400 |
+| `protocol` | exact stored protocol | `wormhole`, `cctp` or `debridge`; anything else is 400 |
 | `direction` | `Outbound` or `Inbound` | case-sensitive |
 | `status` | `Detected`, `Pending`, `Completed`, `Failed`, `Refunded` | |
 | `chain` | canonical chain slug from `chains.slug` | matches source **or** destination |
@@ -997,6 +1078,14 @@ cargo test
   Unit tests in `src/protocols/wormhole/nft_bridge.rs` cover the instruction
   table, both send variants, both completions from synthetic posted VAAs,
   admin/metadata rejection, malformed and short payloads, and outbound pairing.
+* `tests/debridge_fixtures.rs`: golden test over a captured mainnet
+  `createOrderWithNonce` transaction. The decoded order id (from `CreatedOrderId`),
+  amount, Solana mint, destination chain (1) and destination wallet are checked
+  against the on-chain events. No network. Unit tests in
+  `src/protocols/debridge/mod.rs` cover a plain `createOrder`, the same decoding
+  for both instructions from synthetic Borsh data and logs, an unknown
+  destination chain, admin/other instructions, a failed transaction, a create
+  without an order-id event, and an event printed by an inner program.
 * `tests/multi_program_ingestion.rs`: the real ingester against a loopback
   WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
   get one `logsSubscribe` each, their notifications advance separate checkpoints
@@ -1113,7 +1202,9 @@ Each phase adds one protocol, in descending order of Solana bridge volume:
 4. Write the adapter, its enrichment provider if the protocol has an API, and its chain-ID mappings.
 5. Cover composition with any protocol already indexed (Mayan over Wormhole and CCTP, aggregators over everything).
 
-Candidates: Mayan (Swift, MCTP), Circle CCTP, LayerZero/Stargate, deBridge, Allbridge, Hyperlane, Chainlink CCIP, Across.
+Candidates: Mayan (Swift, MCTP), LayerZero/Stargate, Allbridge, Hyperlane,
+Chainlink CCIP, Across. Circle CCTP (inbound completions) and deBridge DLN
+(source-side orders) are indexed; their remaining directions are follow-ups.
 
 #### Later upgrade: unknown-chain resolution
 

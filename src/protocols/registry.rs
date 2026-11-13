@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::cctp::CctpAdapter;
+use super::debridge::DebridgeAdapter;
 use super::wormhole::WormholeAdapter;
 use super::wormhole::nft_bridge::NftBridgeAdapter;
 use super::{BridgeAdapter, Classification, Protocol, SolanaTx};
@@ -146,6 +147,10 @@ pub fn configured_registry(
     ids.dedup();
     registry.register_with_programs(Arc::new(WormholeAdapter), ids);
 
+    // DLN has one fixed Solana source program, so it is always registered. It is
+    // not part of the Wormhole override list and never claims a Wormhole program.
+    registry.register(Arc::new(DebridgeAdapter));
+
     if let Some(id) = nft_bridge {
         registry.register_with_programs(Arc::new(NftBridgeAdapter), vec![id.to_string()]);
     }
@@ -181,6 +186,7 @@ pub fn parse_program_overrides(csv: &str) -> Result<Vec<(Protocol, String)>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::debridge::DLN_SOURCE;
     use crate::protocols::{Reject, solana_tx::Instruction};
 
     struct Fake {
@@ -335,14 +341,15 @@ mod tests {
                 "ProgramA".to_string(),
                 "ProgramB".to_string(),
                 "TokenBridge".to_string(),
+                DLN_SOURCE.to_string(),
             ],
-            "the configured Token Bridge is always registered as well"
+            "the configured Token Bridge and the fixed DLN source are always registered"
         );
 
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string()],
-            "with no override the configured Token Bridge is the whole set"
+            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
+            "with no override the configured Token Bridge and DLN are the whole set"
         );
     }
 
@@ -350,8 +357,8 @@ mod tests {
     fn the_nft_bridge_is_registered_only_when_configured() {
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string()],
-            "unset means existing deployments see exactly the old set"
+            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
+            "unset means the NFT adapter adds nothing"
         );
 
         let registry = configured_registry(
@@ -362,7 +369,11 @@ mod tests {
         );
         assert_eq!(
             registry.program_ids(),
-            vec!["NftBridge".to_string(), "TokenBridge".to_string()]
+            vec![
+                "NftBridge".to_string(),
+                "TokenBridge".to_string(),
+                DLN_SOURCE.to_string(),
+            ]
         );
         assert_eq!(
             registry.protocols_for("NftBridge"),
@@ -374,8 +385,8 @@ mod tests {
     fn the_cctp_programs_are_registered_only_when_configured() {
         assert_eq!(
             configured_registry(&[], "TokenBridge", None, None).program_ids(),
-            vec!["TokenBridge".to_string()],
-            "unset CCTP is no behaviour change"
+            vec!["TokenBridge".to_string(), DLN_SOURCE.to_string()],
+            "unset CCTP is no behaviour change beyond the fixed DLN source"
         );
 
         let registry = configured_registry(
@@ -390,6 +401,7 @@ mod tests {
                 "MessageTransmitter".to_string(),
                 "TokenBridge".to_string(),
                 "TokenMessenger".to_string(),
+                DLN_SOURCE.to_string(),
             ]
         );
         assert_eq!(
@@ -405,6 +417,12 @@ mod tests {
             vec![Protocol::Wormhole],
             "the Wormhole adapter keeps only the programs it owns"
         );
+    }
+
+    #[test]
+    fn the_debridge_source_is_always_registered() {
+        let registry = configured_registry(&[], "TokenBridge", None, None);
+        assert_eq!(registry.protocols_for(DLN_SOURCE), vec![Protocol::Debridge]);
     }
 
     #[test]
