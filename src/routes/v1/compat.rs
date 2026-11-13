@@ -240,6 +240,18 @@ mod tests {
     }
 
     #[test]
+    fn an_nft_bridge_transfer_has_no_v1_representation() {
+        let mut nft = transfer(1, chain(NS_WORMHOLE, "2"));
+        nft.program = crate::protocols::NFT_BRIDGE_PROGRAM.to_string();
+        let error = to_v1(&response(vec![nft]), None).expect_err("v1 is Token Bridge only");
+        assert!(
+            matches!(error, AppError::Normalisation(ref message)
+                if message.contains("nft_bridge")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn a_transaction_without_transfers_still_maps() {
         let v1 = to_v1(&response(vec![]), None).expect("frozen shape");
         assert!(v1.bridge_transfer.is_none());

@@ -549,3 +549,50 @@ async fn a_full_page_without_more_rows_has_no_next_cursor() {
     assert_eq!(sequences(&response), vec![5, 4, 3, 2, 1]);
     assert_eq!(response.next_cursor, None);
 }
+
+#[tokio::test]
+async fn an_nft_bridge_row_is_served_with_its_program() {
+    let db = test_db().await;
+    let (transaction_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO transactions (hash, chain, status, slot, timestamp, fee_lamports, signer) \
+         VALUES ('list-nft-tx', 1, 'Success', 1, NULL, 5000, 'signer') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("insert transaction");
+    let (transfer_id,): (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO bridge_transfers (
+            transaction_id, source_tx_hash,
+            source_ref_protocol, source_ref_id, source_chain_id,
+            destination_ref_protocol, destination_ref_id, destination_chain_id,
+            protocol, program, message_key, direction, event_index, observed_tx_hash,
+            token, token_symbol, status, amount, created_at, updated_at
+        )
+        VALUES (
+            $1, 'list-nft-tx', 'wormhole', '1', 1, 'wormhole', '2', 2,
+            'wormhole', 'nft_bridge', '1/ee/1317', 'Outbound', 0, 'list-nft-tx',
+            '0xcollection', 'CAC', 'Pending', 1, now(), now()
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(transaction_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("insert nft transfer");
+    sqlx::query(
+        "INSERT INTO wormhole_messages (transfer_id, emitter_chain, emitter_address, sequence) \
+         VALUES ($1, 1, 'ee', 1317)",
+    )
+    .bind(transfer_id)
+    .execute(&db.pool)
+    .await
+    .expect("insert wormhole message");
+
+    let snapshot = load_snapshot(&db.pool).await.expect("snapshot");
+    let response = list(&db.pool, &snapshot, query("50")).await;
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.items[0].program, "nft_bridge");
+    assert_eq!(response.items[0].token_symbol.as_deref(), Some("CAC"));
+}

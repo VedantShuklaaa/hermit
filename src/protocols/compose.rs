@@ -33,6 +33,9 @@ pub fn compose(transfers: Vec<DetectedTransfer>) -> Vec<DetectedTransfer> {
                 if kept.token.is_none() {
                     kept.token = t.token;
                 }
+                if kept.token_symbol.is_none() {
+                    kept.token_symbol = t.token_symbol;
+                }
                 if kept.amount_raw.is_none() {
                     kept.amount_raw = t.amount_raw;
                 }
@@ -68,6 +71,7 @@ mod tests {
             source_wallet: None,
             destination_wallet: None,
             token: None,
+            token_symbol: None,
             amount_raw: None,
             via: None,
         }

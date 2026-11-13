@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 const PROGRAM_A: &str = "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb";
 const PROGRAM_B: &str = "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth";
+/// The NFT Bridge program, a second Wormhole program with its own subscription.
+const NFT_PROGRAM: &str = "WnFt12ZrnzZrFZkt2xsNsaNWoQribnuQ5B5FrDbwDhD";
 
 struct FakeSolana {
     url: String,
@@ -241,6 +243,44 @@ async fn each_program_is_subscribed_and_checkpoints_independently() {
         .await
         .expect("redis connection");
     for program in [PROGRAM_A, PROGRAM_B] {
+        let seen: i64 = redis::cmd("EXISTS")
+            .arg(format!("bridge:seen:solana:{}", signature(program)))
+            .query_async(&mut client)
+            .await
+            .expect("EXISTS");
+        assert_eq!(seen, 1, "the notification for {program} was not published");
+    }
+
+    stop_ingester(stop, task).await;
+}
+
+#[tokio::test]
+async fn the_token_bridge_and_nft_bridge_ingest_side_by_side() {
+    let db = common::test_db().await;
+    let redis = common::test_redis().await;
+    let fake = fake_solana(&[], &[(PROGRAM_A, 444), (NFT_PROGRAM, 555)]).await;
+
+    let (stop, task) = start_ingester(&fake, &db, &redis.url, &[PROGRAM_A, NFT_PROGRAM]).await;
+
+    wait_for_slot(&db.pool, PROGRAM_A, 444).await;
+    wait_for_slot(&db.pool, NFT_PROGRAM, 555).await;
+
+    let subscriptions = fake.subscriptions.lock().unwrap().clone();
+    assert!(
+        subscriptions.contains(&PROGRAM_A.to_string()),
+        "the Token Bridge was not subscribed: {subscriptions:?}"
+    );
+    assert!(
+        subscriptions.contains(&NFT_PROGRAM.to_string()),
+        "the NFT Bridge was not subscribed: {subscriptions:?}"
+    );
+
+    let mut client = redis::Client::open(redis.url.as_str())
+        .expect("redis client")
+        .get_connection_manager()
+        .await
+        .expect("redis connection");
+    for program in [PROGRAM_A, NFT_PROGRAM] {
         let seen: i64 = redis::cmd("EXISTS")
             .arg(format!("bridge:seen:solana:{}", signature(program)))
             .query_async(&mut client)

@@ -232,6 +232,9 @@ pub struct AppConfig {
     /// (`protocol:program_id` CSV) when set, otherwise the single
     /// `SOLANA_TOKEN_BRIDGE_PROGRAM`. One subscription and checkpoint per entry.
     pub solana_bridge_programs: Vec<(Protocol, String)>,
+    /// The Solana NFT Bridge program. Opt-in: `None` means the NFT Bridge is not
+    /// subscribed to, so an existing deployment routes and ingests exactly as before.
+    pub solana_nft_bridge_program: Option<String>,
     pub solana_ws_url: String,
     pub allowed_origins: Vec<String>,
     pub ingest: IngestConfig,
@@ -341,6 +344,11 @@ impl AppConfig {
             non_empty("SOLANA_BRIDGE_PROGRAMS"),
             &solana_token_bridge_program,
         )?;
+        // Opt-in. Unset means the NFT Bridge is not subscribed to at all.
+        let solana_nft_bridge_program = non_empty("SOLANA_NFT_BRIDGE_PROGRAM");
+        if let Some(id) = &solana_nft_bridge_program {
+            validate_program_id("SOLANA_NFT_BRIDGE_PROGRAM", id)?;
+        }
 
         Ok(Self {
             role,
@@ -377,6 +385,7 @@ impl AppConfig {
                 .unwrap_or(8080),
             solana_token_bridge_program,
             solana_bridge_programs,
+            solana_nft_bridge_program,
             solana_ws_url: required("SOLANA_WS_URL")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
             ingest: IngestConfig {
@@ -528,6 +537,7 @@ impl AppConfig {
                 Protocol::Wormhole,
                 "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
             )],
+            solana_nft_bridge_program: None,
             solana_ws_url: "ws://127.0.0.1:1".to_string(),
             allowed_origins: Vec::new(),
             ingest: IngestConfig {
