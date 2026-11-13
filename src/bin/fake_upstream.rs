@@ -19,7 +19,8 @@
 //!   GET  /debug/fixture/:signature          which fixture a signature maps to and its status
 //!
 //! Env: FAKE_PORT (9090), FAKE_LATENCY_MS (50), FAKE_JITTER_MS (0), FAKE_429_RATE (0.0,
-//! clamped to 0..=1). No API key and no network access are needed.
+//! clamped to 0..=1), FAKE_WORMHOLE_429_FIRST (0: the first N calls to each WormholeScan
+//! route answer 429, then the route succeeds). No API key and no network access are needed.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -44,6 +45,7 @@ struct Config {
     latency: Duration,
     jitter_ms: u64,
     rate_429: f64,
+    wormhole_429_first: u64,
     fixtures_dir: PathBuf,
 }
 
@@ -69,7 +71,8 @@ impl Config {
                 "--help" | "-h" => {
                     println!(
                         "usage: fake_upstream [--fixtures DIR]\n\n\
-                         env: FAKE_PORT, FAKE_LATENCY_MS, FAKE_JITTER_MS, FAKE_429_RATE"
+                         env: FAKE_PORT, FAKE_LATENCY_MS, FAKE_JITTER_MS, FAKE_429_RATE, \
+                         FAKE_WORMHOLE_429_FIRST"
                     );
                     std::process::exit(0);
                 }
@@ -82,6 +85,7 @@ impl Config {
             latency: Duration::from_millis(number("FAKE_LATENCY_MS", 50u64)),
             jitter_ms: number("FAKE_JITTER_MS", 0u64),
             rate_429: number("FAKE_429_RATE", 0.0f64).clamp(0.0, 1.0),
+            wormhole_429_first: number("FAKE_WORMHOLE_429_FIRST", 0u64),
             fixtures_dir,
         })
     }
@@ -330,10 +334,15 @@ impl FakeState {
     }
 
     fn rate_limited(&self, method: &str) -> bool {
-        if self.config.rate_429 <= 0.0 || rand::random::<f64>() >= self.config.rate_429 {
+        let mut stats = self.stats.lock().expect("stats mutex poisoned");
+        // `begin_call` counted this request before the check, so `calls` is the
+        // 1-based attempt number on this route.
+        let forced = method.starts_with("wormhole:")
+            && stats.calls.get(method).copied().unwrap_or(0) <= self.config.wormhole_429_first;
+        if !forced && (self.config.rate_429 <= 0.0 || rand::random::<f64>() >= self.config.rate_429)
+        {
             return false;
         }
-        let mut stats = self.stats.lock().expect("stats mutex poisoned");
         *stats.injected_429.entry(method.to_string()).or_default() += 1;
         true
     }
