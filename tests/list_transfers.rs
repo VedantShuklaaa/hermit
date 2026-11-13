@@ -88,6 +88,57 @@ async fn insert_row(
     .expect("insert wormhole message");
 }
 
+/// A CCTP row has its own message detail table instead of `wormhole_messages`.
+async fn insert_cctp_row(pool: &PgPool, seq: i64, created_at: DateTime<Utc>) {
+    let tx_hash = format!("list-cctp-tx-{seq}");
+    let nonce = format!("{seq:064x}");
+    let (transaction_id,): (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO transactions (hash, chain, status, slot, timestamp, fee_lamports, signer)
+        VALUES ($1, 1, 'Success', 1, NULL, 5000, 'signer')
+        RETURNING id
+        "#,
+    )
+    .bind(&tx_hash)
+    .fetch_one(pool)
+    .await
+    .expect("insert transaction");
+
+    let (transfer_id,): (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO bridge_transfers (
+            transaction_id, source_tx_hash,
+            source_ref_protocol, source_ref_id,
+            destination_ref_protocol, destination_ref_id,
+            protocol, message_key, direction, event_index, observed_tx_hash,
+            status, amount, created_at, updated_at
+        )
+        VALUES (
+            $1, $2, 'cctp', '5', 'cctp', '0',
+            'cctp', $3, 'Outbound', 0, $2, 'Completed', 1000000, $4, $4
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(transaction_id)
+    .bind(&tx_hash)
+    .bind(format!("5/{nonce}"))
+    .bind(created_at)
+    .fetch_one(pool)
+    .await
+    .expect("insert cctp transfer");
+
+    sqlx::query(
+        "INSERT INTO cctp_messages (transfer_id, source_domain, nonce, version)
+         VALUES ($1, 5, $2, 1)",
+    )
+    .bind(transfer_id)
+    .bind(&nonce)
+    .execute(pool)
+    .await
+    .expect("insert cctp message");
+}
+
 fn sequences(response: &TransferListResponse) -> Vec<i64> {
     response
         .items
@@ -356,9 +407,56 @@ async fn filters_select_the_expected_rows() {
             ..query("50")
         },
         &[],
-        "an unknown protocol is an empty page",
+        "a known protocol with no rows is an empty page",
     )
     .await;
+}
+
+#[tokio::test]
+async fn the_protocol_filter_selects_only_that_protocol() {
+    let db = test_db().await;
+    insert_row(
+        &db.pool,
+        1,
+        "Outbound",
+        "Completed",
+        Some(1),
+        "1",
+        Some(2),
+        "2",
+        Some("USDC"),
+        at(0),
+    )
+    .await;
+    insert_cctp_row(&db.pool, 2, at(1)).await;
+    let snapshot = load_snapshot(&db.pool).await.expect("snapshot");
+
+    for protocol in ["wormhole", "cctp"] {
+        let response = list(
+            &db.pool,
+            &snapshot,
+            ListQuery {
+                protocol: Some(protocol.to_string()),
+                ..query("50")
+            },
+        )
+        .await;
+        assert_eq!(response.items.len(), 1, "{protocol}");
+        assert_eq!(response.items[0].protocol, protocol);
+        assert_eq!(response.next_cursor, None);
+    }
+
+    let combined = list(
+        &db.pool,
+        &snapshot,
+        ListQuery {
+            protocol: Some("wormhole".to_string()),
+            direction: Some("Inbound".to_string()),
+            ..query("50")
+        },
+    )
+    .await;
+    assert!(combined.items.is_empty(), "protocol combines with filters");
 }
 
 #[tokio::test]
@@ -470,6 +568,20 @@ async fn validation_errors_are_400s_and_the_last_page_has_no_cursor() {
     .expect_err("unknown chain");
     assert!(
         matches!(&error, AppError::BadRequest(message) if message == "unknown chain: atlantis")
+    );
+
+    let error = list_transfers(
+        &db.pool,
+        &snapshot,
+        ListQuery {
+            protocol: Some("tokens".to_string()),
+            ..ListQuery::default()
+        },
+    )
+    .await
+    .expect_err("unknown protocol");
+    assert!(
+        matches!(&error, AppError::BadRequest(message) if message == "protocol must be wormhole or cctp")
     );
 
     let error = list_transfers(

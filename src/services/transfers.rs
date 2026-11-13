@@ -13,6 +13,7 @@ use crate::chains::{ChainKey, Snapshot};
 use crate::db::repository::{self, TransferListQuery};
 use crate::domain::api::{TransferListResponse, TransferStatus};
 use crate::error::AppError;
+use crate::protocols::Protocol;
 use crate::services::api_v2;
 
 /// Default page size when `limit` is omitted.
@@ -98,7 +99,16 @@ pub fn parse_query(raw: ListQuery, chains: &Snapshot) -> Result<ListParams, AppE
         Some(value) => Some(Cursor::decode(value)?),
     };
 
-    let protocol = non_empty("protocol", raw.protocol)?;
+    let protocol = match non_empty("protocol", raw.protocol)? {
+        None => None,
+        Some(value) if Protocol::parse(&value).is_some() => Some(value),
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "protocol must be wormhole or cctp".to_string(),
+            ));
+        }
+    };
+
     let token = non_empty("token", raw.token)?;
 
     let direction = match non_empty("direction", raw.direction)? {
