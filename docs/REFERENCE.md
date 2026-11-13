@@ -763,6 +763,25 @@ another program (for example `nft_bridge` or `debridge`) is rejected with
 carries `program` on every transfer, and the field is additive: v1 response
 bodies are byte for byte unchanged.
 
+### Protocol display names
+
+Every `/api/v2` transfer object also carries `protocol_name`, a human-facing
+product name derived from `(protocol, program)`. `protocol` and `program` are
+unchanged, and the field is additive: `/api/v1` bodies do not include it.
+
+| `protocol` | `program` | `protocol_name` |
+| --- | --- | --- |
+| `wormhole` | `token_bridge` | `Portal` |
+| `wormhole` | `nft_bridge` | `Portal NFT` |
+| `wormhole` | `ntt` | `NTT` (reserved; no NTT adapter yet) |
+| `cctp` | any | `CCTP` |
+| `debridge` | any | `deBridge` |
+| `mayan` | any | `Mayan` (reserved; no Mayan adapter yet) |
+| anything else | any | the raw `protocol` string |
+
+The mapping lives next to the `Protocol` enum in `src/protocols/mod.rs`, not in
+the routes, so a new adapter gets its name by adding one arm.
+
 ### List transfers (`GET /api/v2/transfers`)
 
 Lists stored transfers newest first, one page per request. `items` uses the same

@@ -512,6 +512,43 @@ async fn the_protocol_filter_selects_only_that_protocol() {
 }
 
 #[tokio::test]
+async fn every_row_carries_its_protocol_display_name() {
+    let db = test_db().await;
+    insert_row(
+        &db.pool,
+        1,
+        "Outbound",
+        "Completed",
+        Some(1),
+        "1",
+        Some(2),
+        "2",
+        None,
+        at(0),
+    )
+    .await;
+    insert_cctp_row(&db.pool, 2, at(1)).await;
+    insert_debridge_row(&db.pool, 3, at(2)).await;
+    let snapshot = load_snapshot(&db.pool).await.expect("snapshot");
+
+    let response = list(&db.pool, &snapshot, query("50")).await;
+    let names: Vec<(&str, &str)> = response
+        .items
+        .iter()
+        .map(|item| (item.protocol.as_str(), item.protocol_name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("debridge", "deBridge"),
+            ("cctp", "CCTP"),
+            ("wormhole", "Portal"),
+        ],
+        "newest first"
+    );
+}
+
+#[tokio::test]
 async fn the_time_range_is_inclusive_from_and_exclusive_to() {
     let db = test_db().await;
     for seq in 1..=3 {

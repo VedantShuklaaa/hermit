@@ -147,6 +147,7 @@ fn chain_id(view: &ChainView) -> Result<ChainId, AppError> {
 mod tests {
     use super::*;
     use crate::domain::api::ChainDetails;
+    use crate::protocols::display_name;
 
     fn chain(protocol: &str, id: &str) -> ChainView {
         ChainView {
@@ -160,6 +161,7 @@ mod tests {
         TransferView {
             protocol: "wormhole".to_string(),
             program: TOKEN_BRIDGE_PROGRAM.to_string(),
+            protocol_name: display_name("wormhole", TOKEN_BRIDGE_PROGRAM).to_string(),
             direction: crate::protocols::Direction::Outbound,
             via: None,
             observed_tx_hash: "sig".to_string(),

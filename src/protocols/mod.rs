@@ -62,6 +62,23 @@ impl Protocol {
     }
 }
 
+/// The human-facing product name for a stored `(protocol, program)` pair. Unknown
+/// combinations fall back to the raw protocol string, so a protocol is readable
+/// before it gets a name here.
+pub fn display_name<'a>(protocol: &'a str, program: &str) -> &'a str {
+    match (protocol, program) {
+        ("wormhole", TOKEN_BRIDGE_PROGRAM) => "Portal",
+        ("wormhole", NFT_BRIDGE_PROGRAM) => "Portal NFT",
+        // Reserved for the NTT adapter; NTT deployments are separate programs.
+        ("wormhole", "ntt") => "NTT",
+        ("cctp", _) => "CCTP",
+        ("debridge", _) => "deBridge",
+        // Reserved for the Mayan adapter.
+        ("mayan", _) => "Mayan",
+        _ => protocol,
+    }
+}
+
 /// Which way a transfer moves relative to Solana.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
@@ -217,5 +234,46 @@ pub trait BridgeAdapter: Send + Sync {
     /// Pure: derived from the tx alone. Most adapters need none.
     fn required_accounts(&self, _tx: &SolanaTx) -> Vec<String> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    #[test]
+    fn the_token_bridge_is_portal() {
+        assert_eq!(display_name("wormhole", TOKEN_BRIDGE_PROGRAM), "Portal");
+    }
+
+    #[test]
+    fn the_nft_bridge_is_portal_nft() {
+        assert_eq!(display_name("wormhole", NFT_BRIDGE_PROGRAM), "Portal NFT");
+    }
+
+    #[test]
+    fn ntt_is_reserved_under_wormhole() {
+        assert_eq!(display_name("wormhole", "ntt"), "NTT");
+    }
+
+    #[test]
+    fn cctp_has_its_own_name() {
+        assert_eq!(display_name("cctp", "cctp"), "CCTP");
+    }
+
+    #[test]
+    fn debridge_has_its_own_name() {
+        assert_eq!(display_name("debridge", DEBRIDGE_PROGRAM), "deBridge");
+    }
+
+    #[test]
+    fn mayan_is_reserved() {
+        assert_eq!(display_name("mayan", "mayan"), "Mayan");
+    }
+
+    #[test]
+    fn unknown_combinations_fall_back_to_the_raw_protocol() {
+        assert_eq!(display_name("wormhole", "core_bridge"), "wormhole");
+        assert_eq!(display_name("layerzero", "stargate"), "layerzero");
     }
 }
