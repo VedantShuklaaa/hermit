@@ -235,6 +235,10 @@ pub struct AppConfig {
     /// The Solana NFT Bridge program. Opt-in: `None` means the NFT Bridge is not
     /// subscribed to, so an existing deployment routes and ingests exactly as before.
     pub solana_nft_bridge_program: Option<String>,
+    /// The CCTP V2 programs. Opt-in: both are set or neither is, and unset means the
+    /// CCTP adapter is off and ingestion is unchanged.
+    pub solana_cctp_message_transmitter_program: Option<String>,
+    pub solana_cctp_token_messenger_minter_program: Option<String>,
     pub solana_ws_url: String,
     pub allowed_origins: Vec<String>,
     pub ingest: IngestConfig,
@@ -349,6 +353,25 @@ impl AppConfig {
         if let Some(id) = &solana_nft_bridge_program {
             validate_program_id("SOLANA_NFT_BRIDGE_PROGRAM", id)?;
         }
+        // CCTP is opt-in too, and only ever on as a pair.
+        let solana_cctp_message_transmitter_program =
+            non_empty("SOLANA_CCTP_MESSAGE_TRANSMITTER_PROGRAM");
+        let solana_cctp_token_messenger_minter_program =
+            non_empty("SOLANA_CCTP_TOKEN_MESSENGER_MINTER_PROGRAM");
+        match (
+            &solana_cctp_message_transmitter_program,
+            &solana_cctp_token_messenger_minter_program,
+        ) {
+            (Some(transmitter), Some(minter)) => {
+                validate_program_id("SOLANA_CCTP_MESSAGE_TRANSMITTER_PROGRAM", transmitter)?;
+                validate_program_id("SOLANA_CCTP_TOKEN_MESSENGER_MINTER_PROGRAM", minter)?;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!(
+                "set both SOLANA_CCTP_MESSAGE_TRANSMITTER_PROGRAM and \
+                 SOLANA_CCTP_TOKEN_MESSENGER_MINTER_PROGRAM, or neither"
+            ),
+        }
 
         Ok(Self {
             role,
@@ -386,6 +409,8 @@ impl AppConfig {
             solana_token_bridge_program,
             solana_bridge_programs,
             solana_nft_bridge_program,
+            solana_cctp_message_transmitter_program,
+            solana_cctp_token_messenger_minter_program,
             solana_ws_url: required("SOLANA_WS_URL")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
             ingest: IngestConfig {
@@ -538,6 +563,8 @@ impl AppConfig {
                 "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
             )],
             solana_nft_bridge_program: None,
+            solana_cctp_message_transmitter_program: None,
+            solana_cctp_token_messenger_minter_program: None,
             solana_ws_url: "ws://127.0.0.1:1".to_string(),
             allowed_origins: Vec::new(),
             ingest: IngestConfig {

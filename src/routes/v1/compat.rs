@@ -69,7 +69,12 @@ fn transfer_to_v1(transfer: &TransferView) -> Result<BridgeTransfer, AppError> {
         emitter_chain,
         emitter_address,
         sequence,
-    } = &transfer.message_id;
+    } = &transfer.message_id
+    else {
+        return Err(AppError::Normalisation(
+            "message id has no /api/v1 representation".into(),
+        ));
+    };
 
     let status = match transfer.status {
         TransferStatus::Detected => BridgeStatus::Detected,
@@ -247,6 +252,24 @@ mod tests {
         assert!(
             matches!(error, AppError::Normalisation(ref message)
                 if message.contains("nft_bridge")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_cctp_transfer_has_no_v1_representation() {
+        let mut cctp = transfer(1, chain("cctp", "0"));
+        cctp.protocol = "cctp".to_string();
+        cctp.program = "cctp".to_string();
+        cctp.destination = chain("cctp", "5");
+        cctp.message_id = MessageId::Cctp {
+            source_domain: 0,
+            nonce: "ab".repeat(32),
+        };
+        let error = to_v1(&response(vec![cctp]), None).expect_err("v1 has no CCTP identity");
+        assert!(
+            matches!(error, AppError::Normalisation(ref message)
+                if message.contains("cctp")),
             "{error:?}"
         );
     }

@@ -18,6 +18,8 @@ use std::sync::{Arc, RwLock};
 pub const NS_WORMHOLE: &str = "wormhole";
 /// Namespace of EVM chain IDs.
 pub const NS_EVM: &str = "evm";
+/// Namespace of Circle CCTP domain IDs (`u32`).
+pub const NS_CCTP: &str = "cctp";
 
 /// A chain identifier exactly as a protocol wrote it, plus which namespace it is in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +38,10 @@ impl RawChainRef {
 
     pub fn wormhole(id: u16) -> Self {
         Self::new(NS_WORMHOLE, id)
+    }
+
+    pub fn cctp(id: u32) -> Self {
+        Self::new(NS_CCTP, id)
     }
 }
 

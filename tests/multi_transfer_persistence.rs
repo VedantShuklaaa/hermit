@@ -20,6 +20,8 @@ fn transfer(sequence: u64, event_index: u16, destination: ChainId) -> DecodedTra
     let mut bridge = tx.bridge_transfer.take().expect("sample transfer");
     bridge.token = Some("token-mint-address".to_string());
 
+    let row = bridge::services::detect::row_values(&bridge);
+
     DecodedTransfer {
         detected: DetectedTransfer {
             program: bridge::protocols::TOKEN_BRIDGE_PROGRAM.to_string(),
@@ -46,7 +48,8 @@ fn transfer(sequence: u64, event_index: u16, destination: ChainId) -> DecodedTra
                 reference: Some("order-1".to_string()),
             }),
         },
-        bridge,
+        bridge: Some(bridge),
+        row,
     }
 }
 
@@ -60,7 +63,7 @@ fn analysis() -> (
         transfer(701, 1, ChainId::Polygon),
     ];
     // `/api/v1` keeps reading the first transfer, as before A10.
-    tx.bridge_transfer = Some(transfers[0].bridge.clone());
+    tx.bridge_transfer = transfers[0].bridge.clone();
     (tx, transfers)
 }
 

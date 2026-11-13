@@ -378,7 +378,7 @@ async fn refresh(
     .await;
 
     match fetched {
-        Ok(analysed) if analysed.tx.bridge_transfer.is_some() => {
+        Ok(analysed) if analysed.tx.bridge_transfer.is_some() || !analysed.transfers.is_empty() => {
             if let Err(e) = persist_analysis(&state.db, &analysed.tx, &analysed.transfers).await {
                 tracing::warn!(error = %e, hash = %hash, "refresh write-back failed");
             }
@@ -493,7 +493,8 @@ pub async fn analyse_cached(
 
         match &fetched {
             Ok(analysed) => {
-                if analysed.tx.bridge_transfer.is_some() {
+                // A protocol with no v1 body (CCTP) still persists its decoded rows.
+                if analysed.tx.bridge_transfer.is_some() || !analysed.transfers.is_empty() {
                     if let Err(e) =
                         persist_analysis(&state.db, &analysed.tx, &analysed.transfers).await
                     {

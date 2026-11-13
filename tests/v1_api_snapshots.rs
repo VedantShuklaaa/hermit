@@ -183,6 +183,8 @@ fn stored(name: &str, current: &Current) -> StoredTransactionWithTransfers {
             emitter_chain: Some(i32::from(bridge.message_id.emitter_chain)),
             emitter_address: Some(bridge.message_id.emitter_address.clone()),
             sequence: Some(bridge.message_id.sequence.to_string()),
+            cctp_source_domain: None,
+            cctp_nonce: None,
         }],
     }
 }

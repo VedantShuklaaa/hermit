@@ -124,6 +124,10 @@ impl AppState {
             &config.solana_bridge_programs,
             &config.solana_token_bridge_program,
             config.solana_nft_bridge_program.as_deref(),
+            config
+                .solana_cctp_message_transmitter_program
+                .as_deref()
+                .zip(config.solana_cctp_token_messenger_minter_program.as_deref()),
         ));
 
         Ok(Self {
@@ -187,6 +191,10 @@ impl AppState {
             &config.solana_bridge_programs,
             &config.solana_token_bridge_program,
             config.solana_nft_bridge_program.as_deref(),
+            config
+                .solana_cctp_message_transmitter_program
+                .as_deref()
+                .zip(config.solana_cctp_token_messenger_minter_program.as_deref()),
         ));
 
         Ok(Self {

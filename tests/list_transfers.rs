@@ -92,8 +92,9 @@ fn sequences(response: &TransferListResponse) -> Vec<i64> {
     response
         .items
         .iter()
-        .map(|item| match item.message_id {
-            MessageId::Wormhole { sequence, .. } => i64::try_from(sequence).expect("sequence"),
+        .map(|item| match &item.message_id {
+            MessageId::Wormhole { sequence, .. } => i64::try_from(*sequence).expect("sequence"),
+            other => panic!("unexpected message id: {other:?}"),
         })
         .collect()
 }

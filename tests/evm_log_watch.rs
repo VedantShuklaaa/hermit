@@ -571,7 +571,12 @@ fn decoded(
     };
     let bridge =
         detect::to_bridge_transfer(&detected, None, &registry.snapshot()).expect("transfer");
-    DecodedTransfer { detected, bridge }
+    let row = detect::row_values(&bridge);
+    DecodedTransfer {
+        detected,
+        bridge: Some(bridge),
+        row,
+    }
 }
 
 async fn ethereum_chain_id(pool: &PgPool) -> i16 {
@@ -785,7 +790,7 @@ async fn the_watcher_stores_logs_and_joins_both_sides() {
     );
     let transfers = vec![outbound, inbound];
     let mut tx = common::sample_tx("solana-send", SEQUENCE, ChainId::Ethereum, Some("1000000"));
-    tx.bridge_transfer = Some(transfers[0].bridge.clone());
+    tx.bridge_transfer = transfers[0].bridge.clone();
     bridge::db::repository::persist_analysis(pool, &tx, &transfers)
         .await
         .expect("persist transfers");
@@ -924,7 +929,7 @@ async fn the_watcher_stores_logs_and_joins_both_sides() {
     );
     let mut plain_tx =
         common::sample_tx("solana-send", SEQUENCE, ChainId::Ethereum, Some("1000000"));
-    plain_tx.bridge_transfer = Some(plain.bridge.clone());
+    plain_tx.bridge_transfer = plain.bridge.clone();
     bridge::db::repository::persist_analysis(pool, &plain_tx, std::slice::from_ref(&plain))
         .await
         .expect("re-persist");
@@ -2151,7 +2156,8 @@ async fn the_transfer_side_lookup_fills_both_directions() {
         2,
         &registry,
     )
-    .bridge;
+    .bridge
+    .expect("outbound bridge");
     assert!(lookup.apply(&mut outbound).await.expect("lookup"));
     assert_eq!(outbound.destination_tx_hash.as_deref(), Some(REDEEM_TX));
     assert!(matches!(outbound.status, BridgeStatus::Completed));
@@ -2165,7 +2171,8 @@ async fn the_transfer_side_lookup_fills_both_directions() {
         1,
         &registry,
     )
-    .bridge;
+    .bridge
+    .expect("inbound bridge");
     assert!(lookup.apply(&mut inbound).await.expect("lookup"));
     assert_eq!(inbound.source_tx_hash.as_deref(), Some(SEND_TX));
 

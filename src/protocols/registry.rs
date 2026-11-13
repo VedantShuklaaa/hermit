@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::cctp::CctpAdapter;
 use super::wormhole::WormholeAdapter;
 use super::wormhole::nft_bridge::NftBridgeAdapter;
 use super::{BridgeAdapter, Classification, Protocol, SolanaTx};
@@ -116,16 +117,28 @@ pub fn default_registry() -> ProtocolRegistry {
 /// The NFT Bridge is opt-in: `nft_bridge` is `None` unless the deployment names its
 /// program, and when it is set that program belongs to the NFT adapter rather than
 /// to the Token Bridge, which the override list would otherwise claim it for.
+///
+/// CCTP V2 is opt-in the same way, as a `(message transmitter, token messenger minter)`
+/// pair. Its programs are removed from the Wormhole adapter's set, so a tx is never
+/// classified twice.
 pub fn configured_registry(
     overrides: &[(Protocol, String)],
     token_bridge: &str,
     nft_bridge: Option<&str>,
+    cctp: Option<(&str, &str)>,
 ) -> ProtocolRegistry {
     let mut registry = ProtocolRegistry::new();
 
+    let cctp_ids: Vec<&str> = cctp
+        .map(|(transmitter, minter)| vec![transmitter, minter])
+        .unwrap_or_default();
     let mut ids: Vec<String> = overrides
         .iter()
-        .filter(|(protocol, id)| *protocol == Protocol::Wormhole && nft_bridge != Some(id.as_str()))
+        .filter(|(protocol, id)| {
+            *protocol == Protocol::Wormhole
+                && nft_bridge != Some(id.as_str())
+                && !cctp_ids.contains(&id.as_str())
+        })
         .map(|(_, id)| id.clone())
         .collect();
     ids.push(token_bridge.to_string());
@@ -135,6 +148,13 @@ pub fn configured_registry(
 
     if let Some(id) = nft_bridge {
         registry.register_with_programs(Arc::new(NftBridgeAdapter), vec![id.to_string()]);
+    }
+
+    if let Some((transmitter, minter)) = cctp {
+        registry.register_with_programs(
+            Arc::new(CctpAdapter::new(transmitter, minter)),
+            vec![transmitter.to_string(), minter.to_string()],
+        );
     }
 
     registry
@@ -310,7 +330,7 @@ mod tests {
             (Protocol::Wormhole, "ProgramB".to_string()),
         ];
         assert_eq!(
-            configured_registry(&ids, "TokenBridge", None).program_ids(),
+            configured_registry(&ids, "TokenBridge", None, None).program_ids(),
             vec![
                 "ProgramA".to_string(),
                 "ProgramB".to_string(),
@@ -320,7 +340,7 @@ mod tests {
         );
 
         assert_eq!(
-            configured_registry(&[], "TokenBridge", None).program_ids(),
+            configured_registry(&[], "TokenBridge", None, None).program_ids(),
             vec!["TokenBridge".to_string()],
             "with no override the configured Token Bridge is the whole set"
         );
@@ -329,7 +349,7 @@ mod tests {
     #[test]
     fn the_nft_bridge_is_registered_only_when_configured() {
         assert_eq!(
-            configured_registry(&[], "TokenBridge", None).program_ids(),
+            configured_registry(&[], "TokenBridge", None, None).program_ids(),
             vec!["TokenBridge".to_string()],
             "unset means existing deployments see exactly the old set"
         );
@@ -338,6 +358,7 @@ mod tests {
             &[(Protocol::Wormhole, "NftBridge".to_string())],
             "TokenBridge",
             Some("NftBridge"),
+            None,
         );
         assert_eq!(
             registry.program_ids(),
@@ -346,6 +367,43 @@ mod tests {
         assert_eq!(
             registry.protocols_for("NftBridge"),
             vec![Protocol::Wormhole]
+        );
+    }
+
+    #[test]
+    fn the_cctp_programs_are_registered_only_when_configured() {
+        assert_eq!(
+            configured_registry(&[], "TokenBridge", None, None).program_ids(),
+            vec!["TokenBridge".to_string()],
+            "unset CCTP is no behaviour change"
+        );
+
+        let registry = configured_registry(
+            &[],
+            "TokenBridge",
+            None,
+            Some(("MessageTransmitter", "TokenMessenger")),
+        );
+        assert_eq!(
+            registry.program_ids(),
+            vec![
+                "MessageTransmitter".to_string(),
+                "TokenBridge".to_string(),
+                "TokenMessenger".to_string(),
+            ]
+        );
+        assert_eq!(
+            registry.protocols_for("MessageTransmitter"),
+            vec![Protocol::Cctp]
+        );
+        assert_eq!(
+            registry.protocols_for("TokenMessenger"),
+            vec![Protocol::Cctp]
+        );
+        assert_eq!(
+            registry.protocols_for("TokenBridge"),
+            vec![Protocol::Wormhole],
+            "the Wormhole adapter keeps only the programs it owns"
         );
     }
 

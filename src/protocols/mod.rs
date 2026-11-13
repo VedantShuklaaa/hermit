@@ -4,6 +4,7 @@
 //! contains or a [`Reject`] with a reason. No IO, no clock, no database.
 
 pub mod amount;
+pub mod cctp;
 pub mod compose;
 pub mod registry;
 pub mod solana_tx;
@@ -31,18 +32,22 @@ pub fn default_program() -> String {
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Wormhole,
+    /// Circle CCTP V2 on Solana. It does not use the Wormhole core bridge or a VAA.
+    Cctp,
 }
 
 impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             Protocol::Wormhole => "wormhole",
+            Protocol::Cctp => "cctp",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "wormhole" => Some(Protocol::Wormhole),
+            "cctp" => Some(Protocol::Cctp),
             _ => None,
         }
     }
@@ -76,12 +81,20 @@ pub enum MessageId {
         emitter_address: String,
         sequence: u64,
     },
+    /// CCTP V2 identity: the origin domain and the 32-byte nonce Circle assigned.
+    /// Both are read from the attested message on a Solana `receive_message`.
+    Cctp {
+        source_domain: u32,
+        /// Lowercase hex, 64 characters.
+        nonce: String,
+    },
 }
 
 impl MessageId {
     pub fn protocol(&self) -> Protocol {
         match self {
             MessageId::Wormhole { .. } => Protocol::Wormhole,
+            MessageId::Cctp { .. } => Protocol::Cctp,
         }
     }
 
@@ -93,6 +106,10 @@ impl MessageId {
                 emitter_address,
                 sequence,
             } => format!("{emitter_chain}/{emitter_address}/{sequence}"),
+            MessageId::Cctp {
+                source_domain,
+                nonce,
+            } => format!("{source_domain}/{nonce}"),
         }
     }
 }

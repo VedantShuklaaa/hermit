@@ -8,7 +8,7 @@ use crate::domain::transaction::{NormalisedTransaction, TxStatus};
 use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
 use crate::error::AppError;
 use crate::normaliser;
-use crate::protocols::SolanaTx;
+use crate::protocols::{Protocol, SolanaTx};
 use crate::services::correlator;
 use crate::services::detect;
 use crate::services::token_metadata::resolve_token_metadata;
@@ -111,39 +111,54 @@ async fn analyse_tx_inner(
             let snapshot = state.chains.snapshot();
             let mut decoded = Vec::with_capacity(detected.len());
             for (position, transfer) in detected.iter().enumerate() {
-                // Best effort: a slow or failing metadata lookup never blocks detection.
-                let metadata = match detect::token_lookup(transfer) {
-                    Some((token_chain, address)) => tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        resolve_token_metadata(&state.registry, token_chain, &address, None),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok),
-                    None => None,
-                };
+                let (bridge, row) = match transfer.message.protocol() {
+                    Protocol::Wormhole => {
+                        // Best effort: a slow or failing metadata lookup never blocks detection.
+                        let metadata = match detect::token_lookup(transfer) {
+                            Some((token_chain, address)) => tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                resolve_token_metadata(
+                                    &state.registry,
+                                    token_chain,
+                                    &address,
+                                    None,
+                                ),
+                            )
+                            .await
+                            .ok()
+                            .and_then(Result::ok),
+                            None => None,
+                        };
 
-                let mut bridge = detect::to_bridge_transfer(transfer, metadata, &snapshot)?;
-                let enriched = state
-                    .enrichment
-                    .enrich(
-                        EnrichInput {
-                            source_tx_hash: hash,
-                            prefetch: Prefetch::Done(wormhole_result.as_ref()),
-                        },
-                        &mut bridge,
-                    )
-                    .await;
-                // The v1 body carries the first transfer and its WormholeScan event.
-                if position == 0 && enriched.outcome == EnrichOutcome::Applied {
-                    tx.bridge_event = enriched.bridge_event;
-                }
+                        let mut bridge = detect::to_bridge_transfer(transfer, metadata, &snapshot)?;
+                        let enriched = state
+                            .enrichment
+                            .enrich(
+                                EnrichInput {
+                                    source_tx_hash: hash,
+                                    prefetch: Prefetch::Done(wormhole_result.as_ref()),
+                                },
+                                &mut bridge,
+                            )
+                            .await;
+                        // The v1 body carries the first transfer and its WormholeScan event.
+                        if position == 0 && enriched.outcome == EnrichOutcome::Applied {
+                            tx.bridge_event = enriched.bridge_event;
+                        }
+                        let row = detect::row_values(&bridge);
+                        (Some(bridge), row)
+                    }
+                    // CCTP has no v1 representation and no WormholeScan enrichment: the
+                    // chain alone carries everything stored.
+                    Protocol::Cctp => (None, detect::cctp_row_values(transfer, &snapshot)),
+                };
                 decoded.push(DecodedTransfer {
                     detected: transfer.clone(),
                     bridge,
+                    row,
                 });
             }
-            tx.bridge_transfer = decoded.first().map(|decoded| decoded.bridge.clone());
+            tx.bridge_transfer = decoded.first().and_then(|decoded| decoded.bridge.clone());
 
             tracing::info!(
                 total_ms = t_total.elapsed().as_millis() as u64,
