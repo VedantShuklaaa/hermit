@@ -120,6 +120,19 @@ pub struct EvmRpcEndpointConfig {
     pub rps: u32,
 }
 
+/// Per-client rate limiting for the public HTTP API.
+#[derive(Clone, Debug)]
+pub struct ApiRateLimitConfig {
+    /// `API_RATE_LIMIT_RPS`, default 10. Sustained requests/sec per client.
+    pub rps: u32,
+    /// `API_RATE_LIMIT_BURST`, default 20. Requests a client may make at once.
+    pub burst: u32,
+    /// `API_TRUST_FORWARDED_FOR`, default off. Off keys the limiter by the peer
+    /// address; on uses the leftmost `X-Forwarded-For` entry, which is only safe
+    /// behind a proxy that overwrites the header.
+    pub trust_forwarded_for: bool,
+}
+
 /// Server-owned live feed backed by Redis.
 #[derive(Clone, Debug)]
 pub struct LiveFeedConfig {
@@ -241,6 +254,7 @@ pub struct AppConfig {
     pub solana_cctp_token_messenger_minter_program: Option<String>,
     pub solana_ws_url: String,
     pub allowed_origins: Vec<String>,
+    pub api_rate_limit: ApiRateLimitConfig,
     pub ingest: IngestConfig,
     pub reenrich: ReenrichConfig,
     pub worker: WorkerConfig,
@@ -413,6 +427,11 @@ impl AppConfig {
             solana_cctp_token_messenger_minter_program,
             solana_ws_url: required("SOLANA_WS_URL")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
+            api_rate_limit: ApiRateLimitConfig {
+                rps: number("API_RATE_LIMIT_RPS", 10u32).max(1),
+                burst: number("API_RATE_LIMIT_BURST", 20u32).max(1),
+                trust_forwarded_for: flag(std::env::var("API_TRUST_FORWARDED_FOR").ok().as_deref()),
+            },
             ingest: IngestConfig {
                 enabled: std::env::var("INGEST_ENABLED")
                     .map(|v| v != "0")
@@ -567,6 +586,11 @@ impl AppConfig {
             solana_cctp_token_messenger_minter_program: None,
             solana_ws_url: "ws://127.0.0.1:1".to_string(),
             allowed_origins: Vec::new(),
+            api_rate_limit: ApiRateLimitConfig {
+                rps: 10,
+                burst: 20,
+                trust_forwarded_for: false,
+            },
             ingest: IngestConfig {
                 enabled: false,
                 backfill: false,

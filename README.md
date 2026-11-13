@@ -131,6 +131,14 @@ Errors, list parameters and live-feed behaviour: see the
 [reference](docs/REFERENCE.md#api-details). CORS is origin-allowlisted via
 `ALLOWED_ORIGINS`; nothing is permitted by default.
 
+Public API requests are rate-limited in-process per client: `API_RATE_LIMIT_RPS`
+(default 10) sustained requests per second with `API_RATE_LIMIT_BURST` (default
+20). Over the limit answers `429` with a `Retry-After` header and the usual JSON
+error shape (`RATE_LIMITED`). `/health` and the metrics listener are exempt. The
+client is the peer IP; `X-Forwarded-For` is ignored unless
+`API_TRUST_FORWARDED_FOR=1` is set behind a proxy that overwrites the header.
+Each replica enforces its own budget.
+
 ## Running locally
 
 Requires Postgres 18 and Redis.

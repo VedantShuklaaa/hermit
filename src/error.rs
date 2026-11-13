@@ -47,6 +47,11 @@ pub enum AppError {
     #[error("service overloaded, retry shortly")]
     Overloaded,
 
+    /// The public API's per-client limiter rejected the request before it reached a
+    /// handler. `retry_after_secs` is what the limiter says is left to wait.
+    #[error("rate limit exceeded, retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
+
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -86,6 +91,7 @@ impl AppError {
             }
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             AppError::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED"),
+            AppError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         }
     }
@@ -99,6 +105,7 @@ impl AppError {
     pub fn is_transient(&self) -> bool {
         match self {
             AppError::Overloaded
+            | AppError::RateLimited { .. }
             | AppError::UpstreamRateLimited(_)
             | AppError::UpstreamTimeout(_)
             | AppError::TransactionNotFound(_) => true,
@@ -164,11 +171,6 @@ impl IntoResponse for AppError {
             other => other.to_string(),
         };
 
-        let retry_after = matches!(
-            self,
-            AppError::Overloaded | AppError::UpstreamRateLimited(_)
-        );
-
         let mut resp = (
             status,
             Json(ErrorBody {
@@ -177,9 +179,17 @@ impl IntoResponse for AppError {
         )
             .into_response();
 
-        if retry_after {
-            resp.headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        match &self {
+            AppError::RateLimited { retry_after_secs } => {
+                if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    resp.headers_mut().insert(RETRY_AFTER, value);
+                }
+            }
+            AppError::Overloaded | AppError::UpstreamRateLimited(_) => {
+                resp.headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            }
+            _ => {}
         }
         resp
     }
@@ -217,6 +227,9 @@ mod tests {
     fn limiter_and_transport_failures_are_transient() {
         for error in [
             AppError::Overloaded,
+            AppError::RateLimited {
+                retry_after_secs: 1,
+            },
             AppError::UpstreamRateLimited("helius"),
             AppError::UpstreamTimeout("helius"),
             AppError::TransactionNotFound("sig".into()),
