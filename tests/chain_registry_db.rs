@@ -48,9 +48,24 @@ async fn migration_seeds_the_ten_known_chains() {
     }
 
     assert_eq!(
+        snap.slug(key_of(&reg, &RawChainRef::cctp(7))),
+        Some("polygon"),
+        "cctp domain 7"
+    );
+    assert_eq!(
+        snap.slug(key_of(&reg, &RawChainRef::cctp(15))),
+        Some("monad"),
+        "cctp domain 15"
+    );
+    assert_eq!(
         snap.slug(key_of(&reg, &RawChainRef::cctp(19))),
         Some("hyperevm"),
         "cctp domain 19"
+    );
+    assert_eq!(
+        snap.slug(key_of(&reg, &RawChainRef::cctp(26))),
+        Some("arc"),
+        "cctp domain 26"
     );
 }
 
