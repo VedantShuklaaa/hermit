@@ -672,7 +672,7 @@ GET /api/v2/transfers?limit=50&direction=Inbound&status=Completed&chain=ethereum
 | --- | --- | --- |
 | `limit` | page size | default 50, 1 to 200 |
 | `cursor` | position from the previous `next_cursor` | opaque; strictly after the last returned row |
-| `protocol` | exact stored protocol | non-empty |
+| `protocol` | exact stored protocol | `wormhole` or `cctp`; anything else is 400 |
 | `direction` | `Outbound` or `Inbound` | case-sensitive |
 | `status` | `Detected`, `Pending`, `Completed`, `Failed`, `Refunded` | |
 | `chain` | canonical chain slug from `chains.slug` | matches source **or** destination |
@@ -684,7 +684,7 @@ Pagination is keyset over `(created_at DESC, id DESC)`: no `OFFSET`, and rows
 with identical `created_at` are visited exactly once. The ordering key is the
 time the indexer stored the row, not block time. `from`/`to` combine with the
 cursor as additional bounds. Errors: 400 `BAD_REQUEST` (invalid limit, cursor,
-timestamp; unknown chain, direction, status; `from >= to`), 500 `INTERNAL_ERROR`.
+timestamp; unknown chain, direction, status, protocol; `from >= to`), 500 `INTERNAL_ERROR`.
 No cache on this path. Plans and the one added index:
 [3g-list-endpoint.md](3g-list-endpoint.md).
 

@@ -21,7 +21,7 @@ GET /api/v2/transfers
 | --- | --- | --- |
 | `limit` | page size | default 50, 1 to 200; anything else is 400 |
 | `cursor` | opaque position from the previous page's `next_cursor` | strictly after the last returned row; invalid is 400 |
-| `protocol` | exact `bridge_transfers.protocol` | non-empty |
+| `protocol` | exact `bridge_transfers.protocol` | `wormhole` or `cctp`; anything else is 400 |
 | `direction` | `Outbound` or `Inbound` | case-sensitive; anything else is 400 |
 | `status` | `Detected`, `Pending`, `Completed`, `Failed`, `Refunded` | anything else is 400 |
 | `chain` | chain slug from `chains.slug` | matches source **or** destination; unknown slug is 400 |
