@@ -8,7 +8,7 @@ use crate::domain::api::{
 };
 use crate::domain::transaction::{NormalisedTransaction, TxStatus};
 use crate::error::AppError;
-use crate::protocols::{Direction, MessageId, Via};
+use crate::protocols::{Direction, MessageId, Via, display_name};
 
 /// Stored transaction + rows -> `/api/v2` response, ordered by `event_index`.
 pub fn assemble(
@@ -51,6 +51,7 @@ pub fn from_v1(tx: &NormalisedTransaction, chains: &Snapshot) -> TransactionResp
         .map(|t| TransferView {
             protocol: "wormhole".to_string(),
             program: t.program.clone(),
+            protocol_name: display_name("wormhole", &t.program).to_string(),
             direction: t.direction(),
             via: None,
             observed_tx_hash: tx.hash.clone(),
@@ -136,6 +137,7 @@ pub(crate) fn transfer_view(
     Ok(TransferView {
         protocol: row.protocol.clone(),
         program: row.program.clone(),
+        protocol_name: display_name(&row.protocol, &row.program).to_string(),
         direction,
         via,
         observed_tx_hash: row.observed_tx_hash.clone(),

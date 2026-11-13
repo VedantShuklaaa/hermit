@@ -93,7 +93,7 @@ mod tests {
         ChainDetails, ChainView, TransactionResponse, TransferStatus, TransferView,
     };
     use crate::domain::transaction::TxStatus;
-    use crate::protocols::{Direction, MessageId, TOKEN_BRIDGE_PROGRAM};
+    use crate::protocols::{Direction, MessageId, TOKEN_BRIDGE_PROGRAM, display_name};
 
     fn chain(protocol: &str, id: &str) -> ChainView {
         ChainView {
@@ -107,6 +107,7 @@ mod tests {
         TransferView {
             protocol: protocol.to_string(),
             program: TOKEN_BRIDGE_PROGRAM.to_string(),
+            protocol_name: display_name(protocol, TOKEN_BRIDGE_PROGRAM).to_string(),
             direction: Direction::Outbound,
             via: None,
             observed_tx_hash: "sig".to_string(),

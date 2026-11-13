@@ -131,6 +131,11 @@ GET /health
 ```
 
 `chain` is the source chain; Solana is the only supported source today.
+Every `/api/v2` transfer also carries `protocol_name`, a human-facing product
+name derived from `(protocol, program)` (`Portal`, `Portal NFT`, `CCTP`,
+`deBridge`, ...); `protocol` and `program` are unchanged. Unknown combinations
+fall back to the raw protocol string. Names: see the
+[reference](docs/REFERENCE.md#protocol-display-names).
 Errors, list parameters and live-feed behaviour: see the
 [reference](docs/REFERENCE.md#api-details). CORS is origin-allowlisted via
 `ALLOWED_ORIGINS`; nothing is permitted by default.

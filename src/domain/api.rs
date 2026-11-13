@@ -37,6 +37,8 @@ pub struct TransferView {
     pub protocol: String,
     /// The protocol sub-program that decoded this transfer, e.g. `token_bridge`.
     pub program: String,
+    /// Human-facing product name for `(protocol, program)`, e.g. `Portal`.
+    pub protocol_name: String,
     pub direction: Direction,
     /// The router or outer protocol, when there is one.
     pub via: Option<Via>,
