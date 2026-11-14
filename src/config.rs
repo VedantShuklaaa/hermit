@@ -182,6 +182,14 @@ pub struct IngestConfig {
     pub dedupe_ttl_secs: u64,
     /// WebSocket ping interval. A ping every this long keeps the connection observable.
     pub ping_secs: u64,
+    /// Gap between programs' first connects at startup, so a provider's per-key
+    /// connection limit is not hit by every `logsSubscribe` at once. `0` connects
+    /// them together.
+    pub connect_stagger_ms: u64,
+    /// Most programs allowed a live WebSocket connection. `None` is unlimited and
+    /// `0` keeps none; programs past the cap are covered by the reconciliation poll
+    /// only.
+    pub max_ws_connections: Option<usize>,
     /// No-frame watchdog. When not even a Pong arrives for this long the connection is
     /// treated as dead and reconnected. Always above `ping_secs`.
     pub watchdog_secs: u64,
@@ -457,6 +465,10 @@ impl AppConfig {
                 rewind_slots: number("INGEST_REWIND_SLOTS", 20u64),
                 dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 7200u64),
                 ping_secs,
+                connect_stagger_ms: number("INGEST_CONNECT_STAGGER_MS", 500u64),
+                max_ws_connections: std::env::var("INGEST_MAX_WS_CONNECTIONS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok()),
                 watchdog_secs,
                 poll_secs: number("INGEST_POLL_SECS", 300u64).max(30),
                 poll_overlap_secs: number("INGEST_POLL_OVERLAP_SECS", 600i64).max(0),
@@ -613,6 +625,8 @@ impl AppConfig {
                 rewind_slots: 20,
                 dedupe_ttl_secs: 0,
                 ping_secs: 30,
+                connect_stagger_ms: 0,
+                max_ws_connections: None,
                 watchdog_secs: 90,
                 poll_secs: 300,
                 poll_overlap_secs: 600,

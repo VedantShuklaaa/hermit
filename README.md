@@ -34,7 +34,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
 | Chains | DB-backed registry, refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Unknown chains stored as unresolved |
 | Enrichment | `EnrichmentProvider` trait; background worker re-enriches open rows and backfills missing inbound origin txs |
-| Ingestion | Always on, supervised. One `logsSubscribe` and checkpoint per configured program ID. Reconnect rewind, watchdog, concurrent backfill, periodic reconciliation poll |
+| Ingestion | Always on, supervised. One `logsSubscribe` and checkpoint per configured program ID, connects staggered by `INGEST_CONNECT_STAGGER_MS` (default 500) and capped by `INGEST_MAX_WS_CONNECTIONS` when set (capped-out programs stay covered by the reconciliation poll). Reconnect rewind with jittered backoff, watchdog, concurrent backfill, periodic reconciliation poll |
 | Read path | `/analyse` with memory cache, Postgres, single-flight, stale-while-revalidate |
 | CI | `fmt --check`, `clippy -D warnings`, `cargo test` on every PR and `main` |
 | Deploy | Two systemd units (`bridge-api`, `bridge-stream`) on EC2, Postgres on RDS, Caddy for TLS |
