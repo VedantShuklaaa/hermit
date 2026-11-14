@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::cctp::CctpAdapter;
 use super::debridge::DebridgeAdapter;
+use super::mayan::MayanAdapter;
 use super::wormhole::WormholeAdapter;
 use super::wormhole::nft_bridge::NftBridgeAdapter;
 use super::wormhole::ntt::NttAdapter;
@@ -124,6 +125,9 @@ pub fn default_registry() -> ProtocolRegistry {
 /// pair. Its programs are removed from the Wormhole adapter's set, so a tx is never
 /// classified twice.
 ///
+/// Mayan Swift V2 has one fixed program, so it is always registered and never claims
+/// a Wormhole program.
+///
 /// NTT is opt-in per deployment: `ntt_programs` lists the programs that host
 /// `release_wormhole_outbound`, and each is removed from the Wormhole adapter's set
 /// for the same reason. An empty list registers no NTT adapter.
@@ -158,6 +162,9 @@ pub fn configured_registry(
     // DLN has one fixed Solana source program, so it is always registered. It is
     // not part of the Wormhole override list and never claims a Wormhole program.
     registry.register(Arc::new(DebridgeAdapter));
+
+    // Swift V2 likewise has one fixed Solana program.
+    registry.register(Arc::new(MayanAdapter));
 
     if let Some(id) = nft_bridge {
         registry.register_with_programs(Arc::new(NftBridgeAdapter), vec![id.to_string()]);
@@ -357,9 +364,10 @@ mod tests {
                 "ProgramB".to_string(),
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ],
-            "the configured Token Bridge and the fixed DLN programs are always registered"
+            "the configured Token Bridge and the fixed DLN and Mayan programs are always registered"
         );
 
         assert_eq!(
@@ -367,9 +375,10 @@ mod tests {
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ],
-            "with no override the configured Token Bridge and DLN are the whole set"
+            "with no override the configured Token Bridge, DLN and Mayan are the whole set"
         );
     }
 
@@ -380,6 +389,7 @@ mod tests {
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ],
             "unset means the NFT adapter adds nothing"
@@ -398,6 +408,7 @@ mod tests {
                 "NftBridge".to_string(),
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ]
         );
@@ -414,9 +425,10 @@ mod tests {
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ],
-            "unset CCTP is no behaviour change beyond the fixed DLN programs"
+            "unset CCTP is no behaviour change beyond the fixed DLN and Mayan programs"
         );
 
         let registry = configured_registry(
@@ -433,6 +445,7 @@ mod tests {
                 "TokenBridge".to_string(),
                 "TokenMessenger".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ]
         );
@@ -458,6 +471,7 @@ mod tests {
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ],
             "an empty NTT list adds nothing"
@@ -477,6 +491,7 @@ mod tests {
                 "NttManager".to_string(),
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
+                crate::protocols::mayan::MAYAN_SWIFT_V2.to_string(),
                 DLN_SOURCE.to_string(),
             ]
         );
@@ -506,6 +521,15 @@ mod tests {
         assert_eq!(
             registry.protocols_for(DLN_DESTINATION),
             vec![Protocol::Debridge]
+        );
+    }
+
+    #[test]
+    fn the_mayan_program_is_always_registered() {
+        let registry = configured_registry(&[], "TokenBridge", None, None, &[]);
+        assert_eq!(
+            registry.protocols_for(crate::protocols::mayan::MAYAN_SWIFT_V2),
+            vec![Protocol::Mayan]
         );
     }
 

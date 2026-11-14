@@ -13,12 +13,13 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
 * A transfer carries `protocol`, an optional `via` (outer router), `direction`,
   source and destination chain references, a protocol-specific message identity
   (Wormhole emitter/sequence, CCTP domain/nonce, LayerZero GUID, deBridge order
-  ID, ...) with a unique key per protocol, wallets, token, amount and a status:
+  ID, Mayan order hash, ...) with a unique key per protocol, wallets, token,
+  amount and a status:
   `Detected`, `Pending`, `Completed`, plus `Failed`/`Refunded` where a protocol
   needs them.
 * Storage is split into a protocol-agnostic `bridge_transfers` table and, where a
   protocol needs one, a detail table (`wormhole_messages`, `cctp_messages`; deBridge
-  needs none because the order id is the message key). Identity is
+  and Mayan need none because their message identity is the message key). Identity is
   `UNIQUE (protocol, message_key)`. `observed_tx_hash` is the Solana tx it was
   decoded from and `event_index` its position there, so one tx can hold several
   transfers.
@@ -36,9 +37,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
 
 ### Implemented so far
 
-* `MessageId` is an enum with one variant per protocol (`Wormhole`, `Cctp` and
-  `Debridge` today). `MessageId::key()` is the canonical string stored as
-  `bridge_transfers.message_key`.
+* `MessageId` is an enum with one variant per protocol (`Wormhole`, `Cctp`,
+  `Debridge` and `Mayan` today). `MessageId::key()` is the canonical string stored
+  as `bridge_transfers.message_key`.
 * `BridgeAdapter` is pure: `classify(&SolanaTx)` returns either the transfers it
   contains or a `Reject` of kind `not_transfer`, `unsupported` or `malformed`, with
   a reason. `ProtocolRegistry` routes a tx to every adapter whose program appears
@@ -373,6 +374,50 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   `message_id: { protocol: "debridge", order_id }` and
   `program: "debridge"`. The adapter is always registered under the two fixed
   programs; there is no `SOLANA_DEBRIDGE_*` configuration.
+* **Mayan Swift V2.** `protocols/mayan/mod.rs` implements the same `BridgeAdapter`
+  for Swift V2 on Solana. Only the source-side order creation (`init_order`) is
+  indexed; fulfillment is driver-side and not covered, and the legacy V1 program is
+  out of scope.
+
+  | Program | ID | Verified against |
+  | --- | --- | --- |
+  | Swift V2 | `mayan34VedncxdK2XobtvWFDXQASUTBXhUVzt2kKgny` | the Swift program table at <https://docs.mayan.finance> and `swift_v2` in <https://github.com/mayan-finance/swap-sdk/blob/main/src/addresses.ts> |
+
+  Swift V2 has no published IDL. The layouts below are the ones the official SDK
+  serializes and were confirmed against mainnet transaction
+  `QCaMXBE6VSZgajW5wJCHqxesQwjjdRgUUhMCoX8cwd2HXwiQZpVzGrWDMUE4s9dpj5msdN9KPZfmXjN2Qn9Hkes`.
+  The `init_order` discriminator is `204c290c27a284db` and `OrderInitialized` is
+  `b4762cf9a6192851`. The instruction args are 198 bytes including the
+  discriminator: `amountInMin: u64`, `nativeInput: u8`, `feeSubmit: u64`,
+  `destAddress: [u8; 32]`, `chainDest: u16`, `tokenOut: [u8; 32]`,
+  `amountOutMin: u64`, `gasDrop: u64`, `feeCancel: u64`, `feeRefund: u64`,
+  `deadline: u64`, `refAddress: [u8; 32]`, `feeRateRef: u8`, `feeRateMayan: u8`,
+  `auctionMode: u8`, `randomKey: [u8; 32]`. Its ten accounts are trader, relayer,
+  source state, source state ATA, relayer ATA, custom payload or program id, mint,
+  fee manager, token program and system program. The source state address is the
+  PDA `[b"STATE_SOURCE", order_hash, u16le chainDest]`; on the captured
+  transaction it matches the state account.
+
+  **Identity.** `MessageId::Mayan { order_hash }`, key = the order hash as lowercase
+  hex (64 characters), taken from the 32 bytes after the 8-byte `OrderInitialized`
+  event discriminator. The event payload is the hash then a little-endian `u64`
+  `amountIn`; that amount is stored. No client-side hashing is needed, and a
+  transaction without the event is not a transfer. `register_order`, `fulfill`,
+  `settle`, `cancel` and every other instruction are rejected, as are failed
+  transactions.
+
+  **Chains.** `source` is the `wormhole` namespace at Solana's ID 1 and
+  `destination` is the `wormhole` ID in `chainDest`; the adapter reuses the existing
+  `wormhole` registry rows, so no migration is needed. Destination addresses are
+  decoded for Solana (32-byte base58) and EVM (last 20 bytes as `0x` + hex) chain
+  IDs. An unknown chain ID leaves the wallet absent and resolves as unresolved,
+  never an error.
+
+  **Read path.** The observed Solana tx is the source, so the row is `Pending` with
+  `source_tx_hash` set and no destination tx. `/api/v1` does not represent Swift
+  V2; `/api/v2` returns `message_id: { protocol: "mayan", order_hash }` and
+  `program: "swift_v2"`. The adapter is always registered under the fixed program;
+  there is no `SOLANA_MAYAN_*` configuration.
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -627,8 +672,10 @@ hermit/
 │   │   │   └── posted_vaa.rs           # core bridge posted VAA account parser
 │   │   ├── cctp/
 │   │   │   └── mod.rs                  # CCTP V2 inbound completion adapter, opt-in
-│   │   └── debridge/
-│   │       └── mod.rs                  # DLN source createOrder + destination fulfillOrder
+│   │   ├── debridge/
+│   │   │   └── mod.rs                  # DLN source createOrder + destination fulfillOrder
+│   │   └── mayan/
+│   │       └── mod.rs                  # Swift V2 source init_order
 │   ├── chains/
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve
 │   │   └── db.rs                       # load_snapshot
@@ -686,6 +733,7 @@ hermit/
 │   ├── fixtures_decode.rs
 │   ├── golden_fixtures.rs
 │   ├── list_transfers.rs
+│   ├── mayan_fixtures.rs
 │   ├── persistence_idempotency.rs
 │   ├── v1_api_snapshots.rs
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json, account_<name>_vaa.json
@@ -853,11 +901,12 @@ enrichment path:
 
 `/api/v1` keeps the frozen Wormhole Token Bridge shape. Every `bridge_transfers`
 row records the sub-program that decoded it in `program` (`token_bridge`,
-`nft_bridge` for the NFT Bridge, `ntt` for NTT; the CCTP and deBridge adapters
-write `cctp` and `debridge`). The v1 compatibility mapper returns only a row
+`nft_bridge` for the NFT Bridge, `ntt` for NTT; the CCTP, deBridge and Mayan
+adapters write `cctp`, `debridge` and `swift_v2`). The v1 compatibility mapper
+returns only a row
 whose `program = 'token_bridge'`; a transaction whose transfers all come from
-another program (for example `nft_bridge` or `debridge`) is rejected with
-`422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
+another program (for example `nft_bridge`, `debridge` or `swift_v2`) is rejected
+with `422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
 carries `program` on every transfer, and the field is additive: v1 response
 bodies are byte for byte unchanged.
 
@@ -874,7 +923,7 @@ unchanged, and the field is additive: `/api/v1` bodies do not include it.
 | `wormhole` | `ntt` | `NTT` |
 | `cctp` | any | `CCTP` |
 | `debridge` | any | `deBridge` |
-| `mayan` | any | `Mayan` (reserved; no Mayan adapter yet) |
+| `mayan` | any | `Mayan` |
 | anything else | any | the raw `protocol` string |
 
 The mapping lives next to the `Protocol` enum in `src/protocols/mod.rs`, not in
@@ -894,7 +943,7 @@ GET /api/v2/transfers?limit=50&direction=Inbound&status=Completed&chain=ethereum
 | --- | --- | --- |
 | `limit` | page size | default 50, 1 to 200 |
 | `cursor` | position from the previous `next_cursor` | opaque; strictly after the last returned row |
-| `protocol` | exact stored protocol | `wormhole`, `cctp` or `debridge`; anything else is 400 |
+| `protocol` | exact stored protocol | `wormhole`, `cctp`, `debridge` or `mayan`; anything else is 400 |
 | `direction` | `Outbound` or `Inbound` | case-sensitive |
 | `status` | `Detected`, `Pending`, `Completed`, `Failed`, `Refunded` | |
 | `chain` | canonical chain slug from `chains.slug` | matches source **or** destination |
@@ -1262,6 +1311,16 @@ cargo test
   instructions (including cancel/claim/unlock discriminators), a failed
   transaction, a create without an order-id event or a fill without its event, a
   fill whose take chain is not Solana, and an event printed by an inner program.
+* `tests/mayan_fixtures.rs`: a golden test over a captured mainnet `init_order`.
+  It checks the order hash and amount from `OrderInitialized`, the Solana mint and
+  trader from the instruction accounts, destination chain 4 and its EVM address
+  from the args, and that the row values are `Pending` with the observed tx as
+  `source_tx_hash`. It also resolves the destination through the existing
+  `wormhole` registry mapping and shows a failed tx and one without the event are
+  not transfers. No network. Unit tests in `src/protocols/mayan/mod.rs` cover EVM
+  and Solana addresses, an unknown destination chain, non-`init_order`
+  instructions, a missing event, a failed transaction, truncated data/event, and
+  an event printed by an inner program.
 * `tests/multi_program_ingestion.rs`: the real ingester against a loopback
   WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
   get one `logsSubscribe` each, their notifications advance separate checkpoints
@@ -1378,10 +1437,11 @@ Each phase adds one protocol, in descending order of Solana bridge volume:
 4. Write the adapter, its enrichment provider if the protocol has an API, and its chain-ID mappings.
 5. Cover composition with any protocol already indexed (Mayan over Wormhole and CCTP, aggregators over everything).
 
-Candidates: Mayan (Swift, MCTP), LayerZero/Stargate, Allbridge, Hyperlane,
-Chainlink CCIP, Across. Circle CCTP (inbound completions) and deBridge DLN
-(source orders and destination fills) are indexed; CCTP's send side and DLN's
-cancel/claim/unlock instructions remain follow-ups.
+Candidates: LayerZero/Stargate, Allbridge, Hyperlane, Chainlink CCIP, Across.
+Circle CCTP (inbound completions), deBridge DLN (source orders and destination
+fills) and Mayan Swift V2 (source orders only) are indexed; CCTP's send side,
+DLN's cancel/claim/unlock instructions and Swift V2's fulfillment remain
+follow-ups.
 
 #### Later upgrade: unknown-chain resolution
 

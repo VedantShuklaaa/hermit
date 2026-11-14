@@ -12,8 +12,9 @@ core with one adapter per bridge protocol. The Wormhole Token Bridge is decoded
 by default; the Wormhole NFT Bridge is decoded when its program is configured
 (`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), Wormhole NTT outbound releases and
 inbound receives for the manager programs in `SOLANA_NTT_PROGRAMS` (opt-in), Circle CCTP V2 inbound
-completions when both `SOLANA_CCTP_*` programs are configured, and deBridge DLN
-orders from the fixed `DlnSource` and `DlnDestination` programs.
+completions when both `SOLANA_CCTP_*` programs are configured, deBridge DLN
+orders from the fixed `DlnSource` and `DlnDestination` programs, and Mayan
+Swift V2 source orders from its fixed program.
 
 Full details (implementation notes, read path, reliability, config, metrics,
 roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
@@ -26,6 +27,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Wormhole NFT Bridge (opt-in) | `transfer_native`/`transfer_wrapped` sends and `complete_native`/`complete_wrapped` redeems decoded when `SOLANA_NFT_BRIDGE_PROGRAM` is set; admin and metadata instructions rejected. Outbound NFT rows stay `Pending`: no watched EVM event confirms the NFT side |
 | Wormhole NTT (opt-in) | `release_wormhole_outbound` and `receive_wormhole_message` decoded when the manager program is in `SOLANA_NTT_PROGRAMS`. Outbound is paired with the core bridge `PostMessage` for the message identity; inbound is decoded from the posted VAA account with the same identity, so both legs converge. `transfer_burn`/`transfer_lock` alone, admin calls and `redeem`/`release_inbound_*` alone are rejected. An inbound row is `Completed` when the same tx also carries `release_inbound_mint`/`release_inbound_unlock`, and `Pending` when the release is in a separate tx, which is not indexed |
 | deBridge DLN | `createOrder`/`createOrderWithNonce` on the fixed `DlnSource` and `fulfillOrder` on the fixed `DlnDestination`. Both read the 32-byte order id from the `CreatedOrderId`/`Fulfilled` event, so a fill completes its source row when both are indexed; a fill seen alone is stored `Completed`. Cancel, claim and unlock are not indexed |
+| Mayan Swift V2 | Source-side `init_order` on the fixed `mayan34…` program. The 32-byte order hash and amount come from the `OrderInitialized` event, so no client-side hashing is needed. `register_order`, `fulfill`, `settle`, `cancel` and other instructions are not indexed; the legacy V1 program is not covered |
 | EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan. A bad chain row or RPC URL is skipped and logged, leaving the other chains watching |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
@@ -59,7 +61,8 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Wormhole NTT (opt-in) | Outbound releases and inbound receives indexed for the manager programs in `SOLANA_NTT_PROGRAMS`; an inbound row is `Completed` when the same tx carries `release_inbound_*`, `Pending` when the release is a separate tx (Phase A, A4) |
 | Circle CCTP V2 | Inbound completions indexed when both `SOLANA_CCTP_*` programs are set |
 | deBridge DLN | Source orders (`createOrder`/`createOrderWithNonce`) and destination fills (`fulfillOrder`) indexed; cancel, claim and unlock are not |
-| Mayan, LayerZero/Stargate, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
+| Mayan Swift V2 | Source orders (`init_order`) indexed; fulfillment is not indexed and the legacy V1 program is not covered |
+| LayerZero/Stargate, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
 
 ## Architecture
 
@@ -105,7 +108,7 @@ hermit/
 │   ├── normaliser/             # provider JSON -> domain (pure)
 │   ├── clients/                # Helius, WormholeScan, rate limiter
 │   ├── chain_adapters/         # token symbol/decimals per chain
-│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole (Portal/NFT/NTT)/CCTP/deBridge adapters
+│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole (Portal/NFT/NTT)/CCTP/deBridge/Mayan adapters
 │   ├── chains/                 # DB-backed chain registry
 │   ├── enrichment/             # providers + background re-enrichment
 │   ├── evm/                    # Ethereum log watcher, cursor, tx-hash lookup
@@ -191,7 +194,7 @@ Per-file coverage: [reference](docs/REFERENCE.md#testing-detail).
 | 2 | Deploy pipeline and roles | Roles, health, Caddy done. CD, hostnames, hardening, metrics dashboards open |
 | 3 | Scale the API | 3b, 3c, 3e, 3f, 3g, perf-1, perf-2 done. 3a, 3d open |
 | 4 | WebSocket stream recall/precision | 4a to 4g done |
-| B+ | One protocol per phase | deBridge DLN source and destination done; the other protocols open |
+| B+ | One protocol per phase | deBridge DLN source and destination done; Mayan Swift V2 source done; the other protocols open |
 | E | EVM coverage (separate checklist) | E0 to E3 done; E4 open |
 
 Each checkpoint: branch, tests/fixtures, benchmark, Results row, PR, tag, deploy,
@@ -201,13 +204,13 @@ EVM coverage is in [Phase E](docs/REFERENCE.md#phase-e-evm-coverage-separate-che
 ## Known gaps
 
 * **NTT:** each deployment has its own manager program, so these are configured with `SOLANA_NTT_PROGRAMS`; outbound `release_wormhole_outbound` and inbound `receive_wormhole_message` are indexed. `release_inbound_mint`/`release_inbound_unlock` are only seen when they share the receive's tx; a release sent in a separate tx is not indexed, so that inbound row stays `Pending` and keeps both tx hashes NULL.
-* **Mayan:** instruction layouts and order-hash derivation are undocumented, and the fulfill is driver-side.
+* **Mayan:** send side only, fulfill not indexed, V1 legacy program not covered.
 * **Allbridge:** no standalone Solana bridge; its flows are CCTP and LayerZero OFT.
 * **CCTP:** inbound completions only (no sends, no EVM adapters). Stellar (domain 27) needs a StrKey decoding arm, and domains 22, 25, 29, 31 and 37 are unmapped and stored unresolved.
 * **deBridge:** `cancelOrder`, `sendOrderCancel`, `sendUnlock` and `sendBatchUnlock` are not indexed, so a cancelled or unlocked order keeps the row its create or fill produced; DLN chains not mapped in this registry (Linea, NEAR, TRON and others) are stored unresolved; with no DLN enrichment an unfilled source order stays `Pending` and a fill seen first keeps `source_tx_hash` NULL until the source leg arrives.
 * **Explorer URLs:** not set for HyperEVM, Monad or Arc.
 * **Rate limits:** per instance; set `API_TRUST_FORWARDED_FOR=1` behind Caddy or all clients share one bucket.
-* **Protocol filter:** the 400 message in `src/services/transfers.rs` is hand-listed and must be updated when a protocol is added.
+* **Protocol filter:** the 400 message in `src/services/transfers.rs` is hand-listed (`wormhole`, `cctp`, `debridge`, `mayan`) and must be updated when a protocol is added.
 * **Test name:** `migration_seeds_the_ten_known_chains` is stale (it now covers more chains).
 
 ## Headline numbers

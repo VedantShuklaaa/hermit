@@ -7,6 +7,7 @@ pub mod amount;
 pub mod cctp;
 pub mod compose;
 pub mod debridge;
+pub mod mayan;
 pub mod registry;
 pub mod solana_tx;
 pub mod wormhole;
@@ -32,6 +33,9 @@ pub const NTT_PROGRAM: &str = "ntt";
 /// side, and this adapter decodes only the source-side order creation.
 pub const DEBRIDGE_PROGRAM: &str = "debridge";
 
+/// Mayan Swift V2 on Solana. Only the source-side `init_order` is decoded.
+pub const MAYAN_PROGRAM: &str = "swift_v2";
+
 /// The serde default for a transfer that predates the discriminator.
 pub fn default_program() -> String {
     TOKEN_BRIDGE_PROGRAM.to_string()
@@ -45,6 +49,8 @@ pub enum Protocol {
     Cctp,
     /// deBridge DLN. Only source-side order creation on Solana is decoded.
     Debridge,
+    /// Mayan Swift V2. Only source-side `init_order` on Solana is decoded.
+    Mayan,
 }
 
 impl Protocol {
@@ -53,6 +59,7 @@ impl Protocol {
             Protocol::Wormhole => "wormhole",
             Protocol::Cctp => "cctp",
             Protocol::Debridge => "debridge",
+            Protocol::Mayan => "mayan",
         }
     }
 
@@ -61,6 +68,7 @@ impl Protocol {
             "wormhole" => Some(Protocol::Wormhole),
             "cctp" => Some(Protocol::Cctp),
             "debridge" => Some(Protocol::Debridge),
+            "mayan" => Some(Protocol::Mayan),
             _ => None,
         }
     }
@@ -76,7 +84,6 @@ pub fn display_name<'a>(protocol: &'a str, program: &str) -> &'a str {
         ("wormhole", NTT_PROGRAM) => "NTT",
         ("cctp", _) => "CCTP",
         ("debridge", _) => "deBridge",
-        // Reserved for the Mayan adapter.
         ("mayan", _) => "Mayan",
         _ => protocol,
     }
@@ -122,6 +129,12 @@ pub enum MessageId {
         /// Lowercase hex, 64 characters.
         order_id: String,
     },
+    /// Mayan Swift V2 identity: the 32-byte order hash from the `OrderInitialized`
+    /// event.
+    Mayan {
+        /// Lowercase hex, 64 characters.
+        order_hash: String,
+    },
 }
 
 impl MessageId {
@@ -130,6 +143,7 @@ impl MessageId {
             MessageId::Wormhole { .. } => Protocol::Wormhole,
             MessageId::Cctp { .. } => Protocol::Cctp,
             MessageId::Debridge { .. } => Protocol::Debridge,
+            MessageId::Mayan { .. } => Protocol::Mayan,
         }
     }
 
@@ -146,6 +160,7 @@ impl MessageId {
                 nonce,
             } => format!("{source_domain}/{nonce}"),
             MessageId::Debridge { order_id } => order_id.clone(),
+            MessageId::Mayan { order_hash } => order_hash.clone(),
         }
     }
 }
@@ -276,8 +291,8 @@ mod display_name_tests {
     }
 
     #[test]
-    fn mayan_is_reserved() {
-        assert_eq!(display_name("mayan", "mayan"), "Mayan");
+    fn mayan_has_its_own_name() {
+        assert_eq!(display_name("mayan", MAYAN_PROGRAM), "Mayan");
     }
 
     #[test]
