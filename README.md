@@ -144,7 +144,9 @@ GET /health
 Every `/api/v2` transfer also carries `protocol_name`, a human-facing product
 name derived from `(protocol, program)` (`Portal`, `Portal NFT`, `NTT`, `CCTP`,
 `deBridge`, `Mayan`); `protocol` and `program` are unchanged. Unknown combinations
-fall back to the raw protocol string. Names: see the
+fall back to the raw protocol string. Stored rows also carry `first_seen_at` and
+`updated_at` as epoch milliseconds — when the indexer first stored the row and
+the last write to it — with the same names as the live feed. Names: see the
 [reference](docs/REFERENCE.md#protocol-display-names).
 Errors, list parameters and live-feed behaviour: see the
 [reference](docs/REFERENCE.md#api-details). CORS is origin-allowlisted via

@@ -130,6 +130,8 @@ mod tests {
             amount_raw: None,
             amount_formatted: None,
             status: TransferStatus::Completed,
+            first_seen_at: Some(1_700_000_000_000),
+            updated_at: Some(1_700_000_000_000),
         }
     }
 

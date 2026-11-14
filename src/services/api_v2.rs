@@ -80,6 +80,9 @@ pub fn from_v1(tx: &NormalisedTransaction, chains: &Snapshot) -> TransactionResp
             amount_raw: t.amount.clone(),
             amount_formatted: t.amount_formatted.clone(),
             status: transfer_status(t.status.clone()),
+            // No stored row on this path, so there is no stored-row time.
+            first_seen_at: None,
+            updated_at: None,
         })
         .collect();
 
@@ -158,6 +161,8 @@ pub(crate) fn transfer_view(
         amount_raw: row.amount.clone(),
         amount_formatted: row.amount_formatted.clone(),
         status,
+        first_seen_at: Some(row.first_seen_at.timestamp_millis()),
+        updated_at: Some(row.updated_at.timestamp_millis()),
     })
 }
 
