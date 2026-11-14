@@ -670,7 +670,7 @@ async fn validation_errors_are_400s_and_the_last_page_has_no_cursor() {
     .await
     .expect_err("unknown protocol");
     assert!(
-        matches!(&error, AppError::BadRequest(message) if message == "protocol must be wormhole, cctp or debridge")
+        matches!(&error, AppError::BadRequest(message) if message == "protocol must be wormhole, cctp, debridge or mayan")
     );
 
     let error = list_transfers(

@@ -16,12 +16,13 @@ name="${1:?fixture name, e.g. completed_outbound}"
 sig="${2:?solana signature}"
 : "${HELIUS_URL:?set HELIUS_URL (do not commit it)}"
 WORMHOLE_URL="${WORMHOLE_URL:-https://api.wormholescan.io}"
+MAX_TX_VERSION="${MAX_TX_VERSION:-0}"
 
 dir="$(cd "$(dirname "$0")/.." && pwd)/tests/fixtures"
 mkdir -p "$dir"
 
 curl -sS --fail "$HELIUS_URL" -H 'content-type: application/json' \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"$sig\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"confirmed\"}]}" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"$sig\",{\"encoding\":\"jsonParsed\",\"maxSupportedTransactionVersion\":$MAX_TX_VERSION,\"commitment\":\"confirmed\"}]}" \
   | jq -e '.result' > "$dir/helius_${name}.json"
 echo "saved tests/fixtures/helius_${name}.json"
 

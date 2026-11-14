@@ -104,7 +104,7 @@ pub fn parse_query(raw: ListQuery, chains: &Snapshot) -> Result<ListParams, AppE
         Some(value) if Protocol::parse(&value).is_some() => Some(value),
         Some(_) => {
             return Err(AppError::BadRequest(
-                "protocol must be wormhole, cctp or debridge".to_string(),
+                "protocol must be wormhole, cctp, debridge or mayan".to_string(),
             ));
         }
     };
@@ -376,6 +376,33 @@ mod tests {
             &snapshot(),
         ));
         assert!(message.contains("status"));
+    }
+
+    #[test]
+    fn protocol_accepts_every_known_adapter_and_rejects_unknown_values() {
+        for value in ["wormhole", "cctp", "debridge", "mayan"] {
+            let params = parse_query(
+                ListQuery {
+                    protocol: Some(value.to_string()),
+                    ..query()
+                },
+                &snapshot(),
+            )
+            .unwrap();
+            assert_eq!(params.protocol.as_deref(), Some(value));
+        }
+
+        let message = bad_request(parse_query(
+            ListQuery {
+                protocol: Some("stargate".to_string()),
+                ..query()
+            },
+            &snapshot(),
+        ));
+        assert_eq!(
+            message,
+            "protocol must be wormhole, cctp, debridge or mayan"
+        );
     }
 
     #[test]

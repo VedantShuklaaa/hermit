@@ -309,6 +309,10 @@ async fn write_transfer(
             // The order id is already the row's `message_key`; DLN has no separate
             // detail table to fill.
         }
+        MessageId::Mayan { .. } => {
+            // The order hash is already the row's `message_key`; Swift has no
+            // separate detail table to fill.
+        }
     }
 
     Ok(())

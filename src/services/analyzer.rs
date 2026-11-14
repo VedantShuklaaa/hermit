@@ -161,6 +161,9 @@ async fn analyse_tx_inner(
                             detect::debridge_row_values(transfer, &snapshot)
                         },
                     ),
+                    // Mayan Swift V2 is source-side only: the observed Solana tx is
+                    // always the source and the row starts Pending.
+                    Protocol::Mayan => (None, detect::mayan_row_values(transfer, &snapshot)),
                 };
                 decoded.push(DecodedTransfer {
                     detected: transfer.clone(),

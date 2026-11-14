@@ -207,6 +207,14 @@ fn message_id(row: &StoredTransfer) -> Result<MessageId, AppError> {
                 order_id: row.message_key.clone(),
             })
         }
+        "mayan" => {
+            if row.message_key.is_empty() {
+                return Err(missing("order_hash"));
+            }
+            Ok(MessageId::Mayan {
+                order_hash: row.message_key.clone(),
+            })
+        }
         other => Err(AppError::Normalisation(format!(
             "unsupported protocol: {other}"
         ))),
