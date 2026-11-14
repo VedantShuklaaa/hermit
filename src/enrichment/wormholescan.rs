@@ -116,7 +116,9 @@ impl EnrichmentProvider for WormholeScanProvider {
                     self.fill_missing_origin(transfer, &chains).await;
                     Enriched {
                         outcome: EnrichOutcome::Applied,
-                        bridge_event: normaliser::wormhole::normalise(operation.clone()).ok(),
+                        bridge_event: normaliser::wormhole::normalise(operation.clone())
+                            .ok()
+                            .flatten(),
                     }
                 }
                 Enrichment::NoVaa => match self.fill_missing_origin(transfer, &chains).await {

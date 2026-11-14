@@ -10,30 +10,64 @@ use crate::domain::analysis::RowValues;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
 use crate::protocols::{
-    Classification, DetectedTransfer, Direction, MessageId, NFT_BRIDGE_PROGRAM, SolanaTx,
-    compose::compose, registry::ProtocolRegistry,
+    Classification, DetectedTransfer, Direction, MessageId, NFT_BRIDGE_PROGRAM, Protocol, Reject,
+    SolanaTx, compose::compose, registry::ProtocolRegistry,
 };
 use crate::services::token_metadata::TokenMetadata;
 use crate::vaa::decode::{decode_vaa, format_amount};
 use serde_json::Value;
 
-/// Runs every adapter that matches the tx and merges the result, one transfer per
-/// message identity. Rejections are logged with their kind and reason.
-pub fn detect(registry: &ProtocolRegistry, tx: &SolanaTx) -> Vec<DetectedTransfer> {
-    let mut found = Vec::new();
+/// Every adapter's verdict on a transaction: the transfers to store, and the
+/// rejections of adapters that matched the tx's programs but declined it.
+#[derive(Debug, Default)]
+pub struct Detection {
+    pub transfers: Vec<DetectedTransfer>,
+    pub rejected: Vec<(Protocol, Reject)>,
+}
+
+impl Detection {
+    /// True when an adapter outside the Wormhole family matched the tx, said it does
+    /// not decode this transfer yet (`Unsupported`), and no adapter decoded one.
+    ///
+    /// The WormholeScan-driven path exists for Wormhole-family gaps (a redeem whose
+    /// posted VAA account could not be loaded), so an explicit non-Wormhole answer is
+    /// final. Asking WormholeScan about a CCTP send returns a CCTP operation, which
+    /// is not a Wormhole message and must not become an analysis error.
+    pub fn unsupported_outside_wormhole(&self) -> bool {
+        self.transfers.is_empty()
+            && self.rejected.iter().any(|(protocol, reject)| {
+                *protocol != Protocol::Wormhole && matches!(reject, Reject::Unsupported(_))
+            })
+    }
+}
+
+/// Runs every adapter that matches the tx and returns both its transfers and its
+/// rejections. Rejections are logged with their kind and reason.
+pub fn detect_all(registry: &ProtocolRegistry, tx: &SolanaTx) -> Detection {
+    let mut found = Detection::default();
     for (protocol, classification) in registry.classify(tx) {
         match classification {
-            Classification::Transfers(transfers) => found.extend(transfers),
-            Classification::Rejected(reject) => tracing::info!(
-                protocol = protocol.as_str(),
-                kind = reject.kind(),
-                reason = reject.reason(),
-                signature = %tx.signature,
-                "not indexed as a transfer"
-            ),
+            Classification::Transfers(transfers) => found.transfers.extend(transfers),
+            Classification::Rejected(reject) => {
+                tracing::info!(
+                    protocol = protocol.as_str(),
+                    kind = reject.kind(),
+                    reason = reject.reason(),
+                    signature = %tx.signature,
+                    "not indexed as a transfer"
+                );
+                found.rejected.push((protocol, reject));
+            }
         }
     }
-    compose(found)
+    found.transfers = compose(found.transfers);
+    found
+}
+
+/// Runs every adapter that matches the tx and merges the result, one transfer per
+/// message identity.
+pub fn detect(registry: &ProtocolRegistry, tx: &SolanaTx) -> Vec<DetectedTransfer> {
+    detect_all(registry, tx).transfers
 }
 
 /// The token's chain (Wormhole ID) and address, when the transfer carries a token.
@@ -963,5 +997,71 @@ mod tests {
         assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
         assert!(t.destination_tx_hash.is_none());
         assert!(matches!(t.status, BridgeStatus::Pending));
+    }
+
+    fn solana_tx(instructions: Vec<crate::protocols::Instruction>) -> SolanaTx {
+        SolanaTx {
+            signature: "sig".into(),
+            slot: 1,
+            block_time: None,
+            failed: false,
+            signer: Some("Signer".into()),
+            account_keys: vec!["Signer".into()],
+            instructions,
+            logs: Vec::new(),
+            accounts: Default::default(),
+        }
+    }
+
+    fn instruction(
+        program_id: &str,
+        data: Vec<u8>,
+        accounts: Vec<String>,
+    ) -> crate::protocols::Instruction {
+        crate::protocols::Instruction {
+            program_id: program_id.into(),
+            accounts,
+            data,
+            parsed: None,
+            inner_of: None,
+        }
+    }
+
+    /// A CCTP send the adapter deliberately does not decode. WormholeScan has nothing
+    /// to add, so the fallback must stay off.
+    #[test]
+    fn an_unsupported_non_wormhole_rejection_skips_the_fallback() {
+        let mut registry = ProtocolRegistry::new();
+        registry.register(std::sync::Arc::new(
+            crate::protocols::cctp::CctpAdapter::default(),
+        ));
+        let tx = solana_tx(vec![instruction(
+            crate::protocols::cctp::TOKEN_MESSENGER_MINTER_V2,
+            vec![0xd7, 0x3c, 0x3d, 0x2e, 0x72, 0x37, 0x80, 0xb0],
+            Vec::new(),
+        )]);
+
+        let detection = detect_all(&registry, &tx);
+        assert!(detection.transfers.is_empty());
+        assert!(detection.unsupported_outside_wormhole());
+    }
+
+    /// The fallback exists for a Wormhole redeem whose posted VAA account could not
+    /// be loaded, so that rejection must still reach WormholeScan.
+    #[test]
+    fn an_unsupported_wormhole_rejection_keeps_the_fallback() {
+        let mut registry = ProtocolRegistry::new();
+        registry.register(std::sync::Arc::new(
+            crate::protocols::wormhole::WormholeAdapter,
+        ));
+        let tx = solana_tx(vec![instruction(
+            crate::protocols::wormhole::TOKEN_BRIDGE,
+            vec![2],
+            vec!["payer".into(), "config".into(), "PostedVaa".into()],
+        )]);
+
+        let detection = detect_all(&registry, &tx);
+        assert!(detection.transfers.is_empty());
+        assert!(!detection.unsupported_outside_wormhole());
     }
 }

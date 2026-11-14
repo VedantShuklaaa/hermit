@@ -627,3 +627,37 @@ async fn a_permanent_failure_is_dead_lettered_immediately() {
     shutdown.cancel();
     let _ = consumer.await;
 }
+
+/// A CCTP send is rejected by its adapter as `Unsupported`. That answer is final:
+/// WormholeScan must not be asked (its answer is a CCTP operation, not a Wormhole
+/// message), so analysis succeeds with no transfer and the consumer acknowledges
+/// the message instead of dead-lettering it.
+#[tokio::test]
+async fn an_unsupported_adapter_rejection_does_not_ask_wormholescan() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cctp_send");
+    let fake = common::start_fake_upstream_with_fixtures(&fixtures).await;
+    let hash = common::signature_for_fixture(&fake.base_url, "cctp_send").await;
+
+    let db = common::test_db().await;
+    let mut config = test_config(UNUSED_DB_URL, "redis://unused", &fake.base_url, 3, 1);
+    config.solana_cctp_message_transmitter_program =
+        Some(bridge::protocols::cctp::MESSAGE_TRANSMITTER_V2.to_string());
+    config.solana_cctp_token_messenger_minter_program =
+        Some(bridge::protocols::cctp::TOKEN_MESSENGER_MINTER_V2.to_string());
+    let state = live_state(&db.pool, config).await;
+
+    let analysis = bridge::services::analyzer::analyse_tx(&state, "solana", &hash)
+        .await
+        .expect("a rejected send is not an analysis error");
+    assert!(analysis.transfers.is_empty(), "the send is not indexed");
+    assert_eq!(
+        fake_calls_to(&fake.base_url, "wormhole:operations").await,
+        0,
+        "the adapter already rejected the tx; WormholeScan must not be asked"
+    );
+    assert!(
+        fake_calls_to(&fake.base_url, "helius:getTransaction").await > 0,
+        "the chain was read"
+    );
+}
