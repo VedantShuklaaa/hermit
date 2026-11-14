@@ -62,7 +62,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Wormhole NTT (opt-in) | Outbound releases and inbound receives indexed for the manager programs in `SOLANA_NTT_PROGRAMS`; an inbound row is `Completed` when the same tx carries `release_inbound_*`, `Pending` when the release is a separate tx (Phase A, A4) |
 | Circle CCTP V2 | Inbound completions indexed when both `SOLANA_CCTP_*` programs are set |
 | deBridge DLN | Source orders (`createOrder`/`createOrderWithNonce`) and destination fills (`fulfillOrder`) indexed; cancel, claim and unlock are not |
-| Mayan Swift V2 | Source orders (`init_order`) and destination fills (`fulfill`) indexed; settle, cancel and register_order are not, the state account layout is unofficial, and the legacy V1 program is not covered |
+| Mayan Swift V2 | Source orders (`init_order`) and destination fills (`fulfill`) indexed; settle, cancel and register\_order are not, the state account layout is unofficial, and the legacy V1 program is not covered |
 | LayerZero/Stargate, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
 
 ## Architecture
@@ -112,7 +112,7 @@ hermit/
 │   ├── vaa/                    # pure VAA decoding
 │   ├── normaliser/             # provider JSON -> domain (pure)
 │   ├── clients/                # Helius, WormholeScan, rate limiter
-│   ├── chain_adapters/         # token symbol/decimals per chain
+│   ├── chain_adapters/         # token symbol/decimals per chain, known-token table
 │   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole (Portal/NFT/NTT)/CCTP/deBridge/Mayan adapters
 │   ├── chains/                 # DB-backed chain registry
 │   ├── enrichment/             # providers + background re-enrichment
@@ -154,7 +154,7 @@ Errors, list parameters and live-feed behaviour: see the
 
 Public API requests are rate-limited in-process per client: `API_RATE_LIMIT_RPS`
 (default 10) sustained requests per second with `API_RATE_LIMIT_BURST` (default
-20). Over the limit answers `429` with a `Retry-After` header and the usual JSON
+20\). Over the limit answers `429` with a `Retry-After` header and the usual JSON
 error shape (`RATE_LIMITED`). `/health` and the metrics listener are exempt. The
 client is the peer IP; `X-Forwarded-For` is ignored unless
 `API_TRUST_FORWARDED_FOR=1` is set behind a proxy that overwrites the header.
@@ -215,6 +215,7 @@ EVM coverage is in [Phase E](docs/REFERENCE.md#phase-e-evm-coverage-separate-che
 * **Allbridge:** no standalone Solana bridge; its flows are CCTP and LayerZero OFT.
 * **CCTP:** inbound completions only (no sends, no EVM adapters); a send is rejected as unsupported without a WormholeScan lookup. Stellar (domain 27) needs a StrKey decoding arm; domains 22, 25, 29, 31 and 37 are unmapped and stored unresolved.
 * **deBridge:** `cancel`, `claim` and `unlock` (for example `cancelOrder`, `sendOrderCancel`, `sendUnlock`, `sendBatchUnlock`) are not indexed, so a cancelled or unlocked order keeps the row its create or fill produced; DLN chains this registry lacks (Linea, NEAR, TRON and others) are stored unresolved; with no DLN enrichment an unfilled source order stays `Pending` and a fill seen first keeps `source_tx_hash` NULL until the source leg arrives.
+* **Formatted amounts (CCTP, deBridge, Mayan):** `amount_formatted` and the symbol come from a hand-maintained table of known tokens (`src/chain_adapters/known_tokens.rs`, USDC and USDT on the main chains). A token outside the table keeps its raw `amount` and gets no formatted amount, because decimals are never guessed. Mayan fills are never formatted: a fill's amount is the amount out while its token is the source-chain token, so the two can have different decimals. Rows stored before this change need the one-off backfill in the PR notes.
 * **Explorer URLs:** not set for HyperEVM, Monad or Arc.
 * **List filter:** `GET /api/v2/transfers` has no `program` filter, so `protocol=wormhole` cannot separate Portal, Portal NFT and NTT rows; filter on the returned `program` field instead.
 * **Rate limits:** per instance; set `API_TRUST_FORWARDED_FOR=1` behind Caddy or all clients share one bucket.

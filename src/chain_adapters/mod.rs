@@ -1,6 +1,7 @@
 use crate::error::AppError;
 use async_trait::async_trait;
 
+pub mod known_tokens;
 pub mod registry;
 pub mod setup;
 pub mod solana;

@@ -5,6 +5,7 @@
 //! Enrichment can raise the status but never gates persistence, and it is only applied
 //! when the VAA matches the message decoded on chain.
 
+use crate::chain_adapters::known_tokens::{format_units, known_token};
 use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
 use crate::domain::analysis::RowValues;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
@@ -180,9 +181,41 @@ pub fn row_values(bridge: &BridgeTransfer) -> RowValues {
     }
 }
 
+/// Symbol and formatted amount for protocols whose amount is the real on-chain amount.
+/// Only tokens in the known-token table are formatted; an unknown token keeps its
+/// raw amount and no formatted one, because guessed decimals would show a wrong number.
+fn known_symbol_and_amount(
+    d: &DetectedTransfer,
+    chains: &Snapshot,
+) -> (Option<String>, Option<String>) {
+    let symbol = d.token_symbol.clone();
+    let (Some(token), Some(raw)) = (
+        d.token.as_ref(),
+        d.amount_raw
+            .as_ref()
+            .and_then(|a| a.as_str().parse::<u128>().ok()),
+    ) else {
+        return (symbol, None);
+    };
+    let Some(key) = chains.resolve(&token.chain).key() else {
+        return (symbol, None);
+    };
+    let Some(slug) = chains.slug(key) else {
+        return (symbol, None);
+    };
+    match known_token(slug, &token.address) {
+        Some((sym, decimals)) => (
+            symbol.or_else(|| Some(sym.to_string())),
+            format_units(raw, decimals),
+        ),
+        None => (symbol, None),
+    }
+}
+
 /// The `bridge_transfers` columns of a protocol v1 cannot represent. CCTP only reaches
 /// this path as an inbound completion, whose observed Solana tx is the destination side.
 pub fn cctp_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    let (token_symbol, amount_formatted) = known_symbol_and_amount(d, chains);
     RowValues {
         source_tx_hash: None,
         source_wallet: d.source_wallet.clone(),
@@ -191,9 +224,9 @@ pub fn cctp_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
         destination_tx_hash: Some(d.observed_tx.clone()),
         destination_explorer_url: chains.explorer_tx_url_for(&d.destination, &d.observed_tx),
         token: d.token.as_ref().map(|t| t.address.clone()),
-        token_symbol: d.token_symbol.clone(),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
-        amount_formatted: None,
+        token_symbol,
+        amount_formatted,
         status: BridgeStatus::Completed,
     }
 }
@@ -202,6 +235,8 @@ pub fn cctp_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
 /// Solana tx is the source, and the row starts `Pending` until a destination leg is
 /// seen.
 pub fn debridge_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    let (token_symbol, amount_formatted) = known_symbol_and_amount(d, chains);
+
     RowValues {
         source_tx_hash: Some(d.observed_tx.clone()),
         source_wallet: d.source_wallet.clone(),
@@ -210,9 +245,9 @@ pub fn debridge_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues
         destination_tx_hash: None,
         destination_explorer_url: None,
         token: d.token.as_ref().map(|t| t.address.clone()),
-        token_symbol: d.token_symbol.clone(),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
-        amount_formatted: None,
+        token_symbol,
+        amount_formatted,
         status: BridgeStatus::Pending,
     }
 }
@@ -221,6 +256,8 @@ pub fn debridge_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues
 /// observed Solana tx is the source, and the row starts `Pending` until a
 /// destination-side fill is seen.
 pub fn mayan_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    let (token_symbol, amount_formatted) = known_symbol_and_amount(d, chains);
+
     RowValues {
         source_tx_hash: Some(d.observed_tx.clone()),
         source_wallet: d.source_wallet.clone(),
@@ -229,9 +266,9 @@ pub fn mayan_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
         destination_tx_hash: None,
         destination_explorer_url: None,
         token: d.token.as_ref().map(|t| t.address.clone()),
-        token_symbol: d.token_symbol.clone(),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
-        amount_formatted: None,
+        token_symbol,
+        amount_formatted,
         status: BridgeStatus::Pending,
     }
 }
@@ -261,6 +298,8 @@ pub fn mayan_destination_row_values(d: &DetectedTransfer, chains: &Snapshot) -> 
 /// origin chain and unknown until it is indexed or enriched. The upsert merges both
 /// legs because they share the order id as the message key.
 pub fn debridge_destination_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    let (token_symbol, amount_formatted) = known_symbol_and_amount(d, chains);
+
     RowValues {
         source_tx_hash: None,
         source_wallet: d.source_wallet.clone(),
@@ -269,9 +308,9 @@ pub fn debridge_destination_row_values(d: &DetectedTransfer, chains: &Snapshot) 
         destination_tx_hash: Some(d.observed_tx.clone()),
         destination_explorer_url: chains.explorer_tx_url_for(&d.destination, &d.observed_tx),
         token: d.token.as_ref().map(|t| t.address.clone()),
-        token_symbol: d.token_symbol.clone(),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
-        amount_formatted: None,
+        token_symbol,
+        amount_formatted,
         status: BridgeStatus::Completed,
     }
 }
@@ -1063,5 +1102,63 @@ mod tests {
         let detection = detect_all(&registry, &tx);
         assert!(detection.transfers.is_empty());
         assert!(!detection.unsupported_outside_wormhole());
+    }
+
+    fn usdc_on_solana(amount: &str) -> DetectedTransfer {
+        let mut d = detected();
+        d.token = Some(TokenRef {
+            chain: RawChainRef::wormhole(1),
+            address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+        });
+        d.amount_raw = RawAmount::parse(amount);
+        d
+    }
+
+    #[test]
+    fn a_known_token_gets_a_symbol_and_a_formatted_amount() {
+        let d = usdc_on_solana("1234500");
+        for row in [
+            cctp_row_values(&d, &snap()),
+            debridge_row_values(&d, &snap()),
+            mayan_row_values(&d, &snap()),
+            debridge_destination_row_values(&d, &snap()),
+        ] {
+            assert_eq!(row.token_symbol.as_deref(), Some("USDC"));
+            assert_eq!(row.amount_formatted.as_deref(), Some("1.2345"));
+            assert_eq!(row.amount.as_deref(), Some("1234500"));
+        }
+    }
+
+    #[test]
+    fn an_unknown_token_keeps_the_raw_amount_and_no_formatted_one() {
+        let row = cctp_row_values(&detected(), &snap());
+        assert_eq!(row.amount.as_deref(), Some("5000000"));
+        assert!(row.amount_formatted.is_none());
+        assert!(row.token_symbol.is_none());
+    }
+
+    #[test]
+    fn a_payload_symbol_wins_over_the_table() {
+        let mut d = usdc_on_solana("1000000");
+        d.token_symbol = Some("USDCx".into());
+        let row = debridge_row_values(&d, &snap());
+        assert_eq!(row.token_symbol.as_deref(), Some("USDCx"));
+        assert_eq!(row.amount_formatted.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_mayan_fill_is_never_formatted() {
+        let row = mayan_destination_row_values(&usdc_on_solana("1000000"), &snap());
+        assert!(row.amount_formatted.is_none());
+    }
+
+    #[test]
+    fn a_token_on_an_unresolved_chain_is_not_formatted() {
+        let mut d = usdc_on_solana("1000000");
+        d.token = Some(TokenRef {
+            chain: RawChainRef::wormhole(9999),
+            address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+        });
+        assert!(cctp_row_values(&d, &snap()).amount_formatted.is_none());
     }
 }
