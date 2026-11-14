@@ -1,11 +1,11 @@
 use crate::error::AppError;
 use async_trait::async_trait;
 
+pub mod known_tokens;
 pub mod registry;
 pub mod setup;
 pub mod solana;
 pub mod token_metadata;
-pub mod known_tokens;
 
 /// Per-chain lookups the pipeline cannot read from a Solana tx alone (token symbol and
 /// decimals). Destination tx lookups live in `enrichment/`.
