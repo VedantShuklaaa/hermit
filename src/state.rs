@@ -128,6 +128,7 @@ impl AppState {
                 .solana_cctp_message_transmitter_program
                 .as_deref()
                 .zip(config.solana_cctp_token_messenger_minter_program.as_deref()),
+            &config.solana_ntt_programs,
         ));
 
         Ok(Self {
@@ -195,6 +196,7 @@ impl AppState {
                 .solana_cctp_message_transmitter_program
                 .as_deref()
                 .zip(config.solana_cctp_token_messenger_minter_program.as_deref()),
+            &config.solana_ntt_programs,
         ));
 
         Ok(Self {

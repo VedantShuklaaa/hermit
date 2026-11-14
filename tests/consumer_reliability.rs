@@ -64,6 +64,7 @@ fn test_config(
             bridge::protocols::wormhole::TOKEN_BRIDGE.to_string(),
         )],
         solana_nft_bridge_program: None,
+        solana_ntt_programs: Vec::new(),
         solana_cctp_message_transmitter_program: None,
         solana_cctp_token_messenger_minter_program: None,
         solana_ws_url: "ws://127.0.0.1:0".to_string(),

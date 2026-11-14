@@ -10,9 +10,10 @@ over WebSocket.
 The product is moving from a Wormhole transfer indexer to a protocol-agnostic
 core with one adapter per bridge protocol. The Wormhole Token Bridge is decoded
 by default; the Wormhole NFT Bridge is decoded when its program is configured
-(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), Circle CCTP V2 inbound completions
-when both `SOLANA_CCTP_*` programs are configured, and deBridge DLN orders from
-the fixed `DlnSource` and `DlnDestination` programs.
+(`SOLANA_NFT_BRIDGE_PROGRAM`, opt-in), Wormhole NTT outbound releases for the
+manager programs in `SOLANA_NTT_PROGRAMS` (opt-in), Circle CCTP V2 inbound
+completions when both `SOLANA_CCTP_*` programs are configured, and deBridge DLN
+orders from the fixed `DlnSource` and `DlnDestination` programs.
 
 Full details (implementation notes, read path, reliability, config, metrics,
 roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
@@ -23,6 +24,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | --- | --- |
 | Wormhole Token Bridge | Outbound sends indexed chain-first and start `Pending` (Solana data alone; EVM logs and WormholeScan enrich). Inbound redeems decoded from the posted VAA account and stored as `Completed` |
 | Wormhole NFT Bridge (opt-in) | `transfer_native`/`transfer_wrapped` sends and `complete_native`/`complete_wrapped` redeems decoded when `SOLANA_NFT_BRIDGE_PROGRAM` is set; admin and metadata instructions rejected. Outbound NFT rows stay `Pending`: no watched EVM event confirms the NFT side |
+| Wormhole NTT (opt-in) | `release_wormhole_outbound` decoded when its manager program is in `SOLANA_NTT_PROGRAMS`; paired with the core bridge `PostMessage` for the message identity. `transfer_burn`/`transfer_lock` alone, admin calls and inbound receives are rejected. Outbound only; inbound is a follow-up |
 | deBridge DLN | `createOrder`/`createOrderWithNonce` on the fixed `DlnSource` and `fulfillOrder` on the fixed `DlnDestination`. Both read the 32-byte order id from the `CreatedOrderId`/`Fulfilled` event, so a fill completes its source row when both are indexed; a fill seen alone is stored `Completed`. Cancel, claim and unlock are not indexed |
 | EVM logs | Ethereum Core Bridge `LogMessagePublished` and Token Bridge `TransferRedeemed` watched with a persisted cursor; fills source and destination tx hashes without WormholeScan. A bad chain row or RPC URL is skipped and logged, leaving the other chains watching |
 | Detection | Chain-first for Wormhole transfers. WormholeScan never gates persistence for decoded transfers |
@@ -54,7 +56,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | --- | --- |
 | Wormhole Token Bridge | Sends and redeems indexed |
 | Wormhole NFT Bridge | Sends and redeems indexed when `SOLANA_NFT_BRIDGE_PROGRAM` is set |
-| Wormhole NTT and other Wormhole programs | Phase A (A4). Multi-program ingestion, per-program checkpoints, the `program` discriminator and the NFT Bridge adapter are in place; NTT and the remaining adapters are not |
+| Wormhole NTT (opt-in) | Outbound releases indexed for the manager programs in `SOLANA_NTT_PROGRAMS`; inbound receives and other Wormhole programs are not yet indexed (Phase A, A4) |
 | Circle CCTP V2 | Inbound completions indexed when both `SOLANA_CCTP_*` programs are set |
 | deBridge DLN | Source orders (`createOrder`/`createOrderWithNonce`) and destination fills (`fulfillOrder`) indexed; cancel, claim and unlock are not |
 | Mayan, LayerZero/Stargate, Allbridge, Hyperlane, CCIP, Across | Candidates, ordered by DefiLlama Solana bridge volume |
@@ -103,7 +105,7 @@ hermit/
 │   ├── normaliser/             # provider JSON -> domain (pure)
 │   ├── clients/                # Helius, WormholeScan, rate limiter
 │   ├── chain_adapters/         # token symbol/decimals per chain
-│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole/CCTP/deBridge adapters
+│   ├── protocols/              # BridgeAdapter, registry, compose, Wormhole (Portal/NFT/NTT)/CCTP/deBridge adapters
 │   ├── chains/                 # DB-backed chain registry
 │   ├── enrichment/             # providers + background re-enrichment
 │   ├── evm/                    # Ethereum log watcher, cursor, tx-hash lookup
@@ -132,7 +134,7 @@ GET /health
 
 `chain` is the source chain; Solana is the only supported source today.
 Every `/api/v2` transfer also carries `protocol_name`, a human-facing product
-name derived from `(protocol, program)` (`Portal`, `Portal NFT`, `CCTP`,
+name derived from `(protocol, program)` (`Portal`, `Portal NFT`, `NTT`, `CCTP`,
 `deBridge`, ...); `protocol` and `program` are unchanged. Unknown combinations
 fall back to the raw protocol string. Names: see the
 [reference](docs/REFERENCE.md#protocol-display-names).
@@ -198,7 +200,7 @@ EVM coverage is in [Phase E](docs/REFERENCE.md#phase-e-evm-coverage-separate-che
 
 ## Known gaps
 
-* **NTT:** each deployment has its own program IDs, so indexing it needs a deployment registry.
+* **NTT:** each deployment has its own manager program, so these are configured with `SOLANA_NTT_PROGRAMS`; only outbound `release_wormhole_outbound` is indexed, and inbound `receive_wormhole_message` is a follow-up.
 * **Mayan:** instruction layouts and order-hash derivation are undocumented, and the fulfill is driver-side.
 * **Allbridge:** no standalone Solana bridge; its flows are CCTP and LayerZero OFT.
 * **CCTP:** inbound completions only (no sends, no EVM adapters). Stellar (domain 27) needs a StrKey decoding arm, and domains 22, 25, 29, 31 and 37 are unmapped and stored unresolved.

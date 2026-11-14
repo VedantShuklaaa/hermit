@@ -126,6 +126,70 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   registered only when `SOLANA_NFT_BRIDGE_PROGRAM` is set, and that program is
   never also registered to the Token Bridge adapter, so an unset variable keeps
   an existing deployment exact (same subscriptions, same registry, same rows).
+* **Wormhole NTT outbound (opt-in, per deployment).**
+  `protocols/wormhole/ntt.rs` implements the same `BridgeAdapter` for Wormhole
+  Native Token Transfers. NTT is per-token: each deployment has its own manager
+  program and a core emitter PDA derived as `[b"emitter"]`. In both verified
+  deployments the manager program hosts `release_wormhole_outbound` and derives
+  that PDA, so the configured IDs are manager programs, not one shared NTT
+  program. A deployment that moves the transceiver into a separate program must
+  configure that program ID instead. Instruction names and layouts were checked against the
+  `ntt_transceiver` IDL and program in
+  <https://github.com/wormhole-foundation/native-token-transfers/tree/main/solana/programs/ntt-transceiver>;
+  the wire format against `transceiver.rs`, `ntt.rs`, `ntt_manager.rs` and
+  `trimmed_amount.rs` in
+  <https://github.com/wormhole-foundation/native-token-transfers/tree/main/solana/modules/ntt-messages>.
+  Anchor discriminators are `sha256("global:<snake_case>")[..8]`, confirmed on
+  real mainnet transactions: `release_wormhole_outbound = ca5733ad8ea0bccc`,
+  `transfer_burn = 4b901ae8270c4bde`, `transfer_lock = b39e9294972eb0c8`.
+
+  **Deployments** used to verify and capture fixtures:
+
+  | Deployment | Manager program (configured) | Core emitter (Wormhole address) | Verified against |
+  | --- | --- | --- | --- |
+  | WalletConnect WCT | `nttLq3ZsKu9uAFWuBGksdZTPAjkMRyPkxp61CJPsntA` | `5FksLs44iw5TPZ1yngyxKxZyvBXeUCgQM7VQfiRZVK45` | <https://github.com/WalletConnect/contracts/blob/main/ntt/mainnet_deployment.json> |
+  | Sky USDS | `STTUVCMPuNbk21y1J6nqEGXSQ8HKvFmFBKnCvKHTrWn` | `4ZQYCg7ZiVeNp9DxUbgc4b9JpLXoX1RXYfMXS5saXpkC` | <https://github.com/sky-ecosystem/sky-ntt-migration/blob/main/docs/UserGuide.md> |
+
+  **Only outbound releases are indexed.** `release_wormhole_outbound` posts the
+  transfer through the core bridge, so it is paired with its `PostMessage` CPI
+  exactly as the Token Bridge and NFT Bridge adapters pair theirs (same top-level
+  parent, later execution, core emitter account among the instruction's accounts,
+  k-th `Sequence:` log for the k-th `PostMessage`). The pairing helper lives in
+  `protocols/wormhole/mod.rs` and is shared by all three adapters. The emitter is
+  the `[b"emitter"]` PDA of the program that hosts the release (declared in
+  `solana/programs/ntt-transceiver/src/wormhole/instructions/release_outbound.rs`);
+  for both verified deployments it is the manager program's PDA, confirmed by
+  derivation. The adapter reads its address from the core bridge `PostMessage`
+  accounts instead of re-deriving it, so the message key matches the signed VAA. Identity is
+  the existing `MessageId::Wormhole` key: emitter chain 1, the core emitter
+  (the deployment's transceiver) as lowercase hex, and the core sequence. `program`
+  is `ntt`, so `/api/v2` shows `protocol_name = "NTT"` and `/api/v1` does not
+  represent the row.
+
+  **Payload.** A `TransceiverMessage` starts with `0x9945FF10`, then the source
+  and recipient NTT managers (32 bytes each), a u16 BE manager-message length and
+  an `NttManagerMessage` (message id 32, sender 32, u16 BE payload length). Its
+  payload is a `NativeTokenTransfer` with prefix `0x994E5454`, a
+  `TrimmedAmount` (decimals u8, then amount u64 BE, at most 8 decimals), the
+  source token (32), recipient (32) and recipient chain (u16 BE); an optional
+  additional payload may follow the fixed 79 bytes. The adapter reads the fixed
+  fields and ignores the optional tail. The source token is always a Solana
+  account, so `token` is `(wormhole, 1, base58(source_token))`; the recipient is
+  decoded with the existing chain-address rules.
+
+  **Rejections.** Failed transactions are never transfers. A transaction with
+  only `transfer_burn` or `transfer_lock` is `not_transfer` (the step moves
+  tokens but carries no message), every other manager instruction is
+  `not_transfer` (admin, configuration or the inbound receive path), and a
+  truncated or mismatched payload is `malformed`. Inbound NTT
+  (`receive_wormhole_message`) is not decoded yet, so inbound NTT is not indexed.
+
+  **Config.** `SOLANA_NTT_PROGRAMS` is a CSV of manager program IDs. It is
+  opt-in and empty by default; every ID must be base58 for 32 bytes. When set,
+  each ID is registered to the NTT adapter, removed from the Wormhole adapter's
+  program set (so a manager is never classified as a Token Bridge), and
+  subscribed to with its own checkpoint. An empty list leaves an existing
+  deployment exactly as before.
 * **Circle CCTP V2 on Solana (opt-in).** `protocols/cctp/mod.rs` implements the
   same `BridgeAdapter` for Circle's V2 programs:
 
@@ -754,9 +818,9 @@ enrichment path:
 ### `/api/v1` and programs other than the Token Bridge
 
 `/api/v1` keeps the frozen Wormhole Token Bridge shape. Every `bridge_transfers`
-row records the sub-program that decoded it in `program` (`token_bridge`, or
-`nft_bridge` for the NFT Bridge; the CCTP and deBridge adapters write `cctp` and
-`debridge`). The v1 compatibility mapper returns only a row
+row records the sub-program that decoded it in `program` (`token_bridge`,
+`nft_bridge` for the NFT Bridge, `ntt` for NTT; the CCTP and deBridge adapters
+write `cctp` and `debridge`). The v1 compatibility mapper returns only a row
 whose `program = 'token_bridge'`; a transaction whose transfers all come from
 another program (for example `nft_bridge` or `debridge`) is rejected with
 `422 NORMALISATION_FAILED`, never mapped as a Token Bridge transfer. `/api/v2`
@@ -773,7 +837,7 @@ unchanged, and the field is additive: `/api/v1` bodies do not include it.
 | --- | --- | --- |
 | `wormhole` | `token_bridge` | `Portal` |
 | `wormhole` | `nft_bridge` | `Portal NFT` |
-| `wormhole` | `ntt` | `NTT` (reserved; no NTT adapter yet) |
+| `wormhole` | `ntt` | `NTT` |
 | `cctp` | any | `CCTP` |
 | `debridge` | any | `deBridge` |
 | `mayan` | any | `Mayan` (reserved; no Mayan adapter yet) |
@@ -1022,6 +1086,12 @@ scrape_configs:
   to the NFT Bridge adapter (never to the Token Bridge adapter, even if it also
   appears in `SOLANA_BRIDGE_PROGRAMS`) and subscribed to with its own
   checkpoint. When unset, nothing about an existing deployment changes.
+  `SOLANA_NTT_PROGRAMS` is an optional CSV of NTT manager program IDs, one per
+  deployment (for example
+  `nttLq3ZsKu9uAFWuBGksdZTPAjkMRyPkxp61CJPsntA,STTUVCMPuNbk21y1J6nqEGXSQ8HKvFmFBKnCvKHTrWn`).
+  Each ID is validated the same way, registered only to the NTT adapter, removed
+  from the Token Bridge adapter's set, and subscribed to with its own checkpoint.
+  Unset or empty disables the NTT adapter.
 * **Chain registry:** `CHAIN_REGISTRY_REFRESH_SECS` (default 60, min 5).
 * **EVM logs:** `EVM_WATCH_ENABLED` (off unless `1`/`true`), `EVM_RPC_<CHAIN>`
   per chain (suffix is the lowercased `chains.slug`, e.g.
@@ -1121,6 +1191,18 @@ cargo test
   Unit tests in `src/protocols/wormhole/nft_bridge.rs` cover the instruction
   table, both send variants, both completions from synthetic posted VAAs,
   admin/metadata rejection, malformed and short payloads, and outbound pairing.
+* `tests/ntt_fixtures.rs`: golden tests over a captured mainnet WalletConnect
+  WCT `release_wormhole_outbound` transaction (public Solana RPC, no
+  WormholeScan operation). The fixture also contains `transfer_burn`, so the
+  test proves the burn is ignored and the release is paired with its core bridge
+  `PostMessage`. It checks the message key (emitter chain 1, transceiver emitter,
+  sequence 439), amount, source token, destination chain 30 and recipient
+  wallet, plus `program = 'ntt'` and `protocol_name = "NTT"`. Further tests
+  reject a burn-only transaction, a failed transaction and a manager left
+  unconfigured, and show a Token Bridge fixture decodes identically with and
+  without NTT configured. Unit tests in `src/protocols/wormhole/ntt.rs` pin the
+  discriminators, the payload layout, admin/transfer_burn rejection, malformed
+  payloads, sequence pairing and the opt-in registry registration.
 * `tests/debridge_fixtures.rs`: golden tests over captured mainnet
   `createOrderWithNonce` and `fulfillOrder` transactions. The source test checks
   the order id (from `CreatedOrderId`), amount, Solana mint, destination chain
@@ -1232,7 +1314,7 @@ only real adapter.
 * \[x] A1. Adapter trait and registry. `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx`, Wormhole Token Bridge outbound decode, wiring into `analyse_tx`, and A1b inbound redeems via `required_accounts` + `getMultipleAccounts` + in-house posted-VAA parser
 * \[x] A2. Generalised domain model and schema (`protocol`, `via`, `direction`, chain refs, per-protocol message key, `NUMERIC` amounts). `bridge_transfers` split from `wormhole_messages`. Existing rows migrated in place, tested on staged legacy data
 * \[x] A3. DB-backed chain registry seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs stored as `unresolved(protocol, id)`. Registry carries status and provenance for the later LLM-proposal upgrade (not built in this phase). Done: tables, seed, `load_snapshot`, DB tests, SQL `resolve_chain`, unresolved IDs persisted, callers moved off `ChainId` (kept only as the frozen `/api/v1` type), refresh task wired
-* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist. NFT Bridge adapter done (opt-in via `SOLANA_NFT_BRIDGE_PROGRAM`): program ID, instruction order and payload verified against `consts.ts`, `nft_bridge/program/src/lib.rs` and whitepaper 0006; sends and completions decoded, admin/metadata rejected. NTT and the other adapters remain, so the item stays open
+* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist. NFT Bridge adapter done (opt-in via `SOLANA_NFT_BRIDGE_PROGRAM`): program ID, instruction order and payload verified against `consts.ts`, `nft_bridge/program/src/lib.rs` and whitepaper 0006; sends and completions decoded, admin/metadata rejected. NTT outbound done (opt-in via `SOLANA_NTT_PROGRAMS`, one manager program per deployment; `release_wormhole_outbound` decoded, inbound not yet) and the other adapters remain, so the item stays open
 * \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share

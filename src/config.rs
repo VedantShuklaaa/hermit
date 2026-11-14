@@ -248,6 +248,11 @@ pub struct AppConfig {
     /// The Solana NFT Bridge program. Opt-in: `None` means the NFT Bridge is not
     /// subscribed to, so an existing deployment routes and ingests exactly as before.
     pub solana_nft_bridge_program: Option<String>,
+    /// Programs that host NTT `release_wormhole_outbound`, one per deployment (the
+    /// manager program in the verified deployments). `SOLANA_NTT_PROGRAMS` is a CSV,
+    /// opt-in and empty by default: NTT has no shared program ID, so without this
+    /// list the adapter is off and ingestion is unchanged.
+    pub solana_ntt_programs: Vec<String>,
     /// The CCTP V2 programs. Opt-in: both are set or neither is, and unset means the
     /// CCTP adapter is off and ingestion is unchanged.
     pub solana_cctp_message_transmitter_program: Option<String>,
@@ -367,6 +372,13 @@ impl AppConfig {
         if let Some(id) = &solana_nft_bridge_program {
             validate_program_id("SOLANA_NFT_BRIDGE_PROGRAM", id)?;
         }
+        // NTT is opt-in per deployment and has no default program ID.
+        let mut solana_ntt_programs = csv_list("SOLANA_NTT_PROGRAMS");
+        for id in &solana_ntt_programs {
+            validate_program_id("SOLANA_NTT_PROGRAMS", id)?;
+        }
+        solana_ntt_programs.sort();
+        solana_ntt_programs.dedup();
         // CCTP is opt-in too, and only ever on as a pair.
         let solana_cctp_message_transmitter_program =
             non_empty("SOLANA_CCTP_MESSAGE_TRANSMITTER_PROGRAM");
@@ -423,6 +435,7 @@ impl AppConfig {
             solana_token_bridge_program,
             solana_bridge_programs,
             solana_nft_bridge_program,
+            solana_ntt_programs,
             solana_cctp_message_transmitter_program,
             solana_cctp_token_messenger_minter_program,
             solana_ws_url: required("SOLANA_WS_URL")?,
@@ -582,6 +595,7 @@ impl AppConfig {
                 "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
             )],
             solana_nft_bridge_program: None,
+            solana_ntt_programs: Vec::new(),
             solana_cctp_message_transmitter_program: None,
             solana_cctp_token_messenger_minter_program: None,
             solana_ws_url: "ws://127.0.0.1:1".to_string(),

@@ -24,6 +24,10 @@ pub const TOKEN_BRIDGE_PROGRAM: &str = "token_bridge";
 /// with the Token Bridge, but is a different Solana program with its own payloads.
 pub const NFT_BRIDGE_PROGRAM: &str = "nft_bridge";
 
+/// The NTT sub-program. Each NTT deployment is its own manager program, so there is
+/// no fixed default program ID; deployments are configured per instance.
+pub const NTT_PROGRAM: &str = "ntt";
+
 /// The deBridge DLN source program discriminator. DLN has one Solana program per
 /// side, and this adapter decodes only the source-side order creation.
 pub const DEBRIDGE_PROGRAM: &str = "debridge";
@@ -69,8 +73,7 @@ pub fn display_name<'a>(protocol: &'a str, program: &str) -> &'a str {
     match (protocol, program) {
         ("wormhole", TOKEN_BRIDGE_PROGRAM) => "Portal",
         ("wormhole", NFT_BRIDGE_PROGRAM) => "Portal NFT",
-        // Reserved for the NTT adapter; NTT deployments are separate programs.
-        ("wormhole", "ntt") => "NTT",
+        ("wormhole", NTT_PROGRAM) => "NTT",
         ("cctp", _) => "CCTP",
         ("debridge", _) => "deBridge",
         // Reserved for the Mayan adapter.
@@ -167,8 +170,8 @@ pub struct TokenRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedTransfer {
     /// Which program inside the protocol decoded this: `token_bridge`, `nft_bridge`,
-    /// `cctp` or `debridge`. It is what `/api/v1` can represent and what `/api/v2`
-    /// exposes additively.
+    /// `ntt`, `cctp` or `debridge`. It is what `/api/v1` can represent and what
+    /// `/api/v2` exposes additively.
     pub program: String,
     pub message: MessageId,
     pub direction: Direction,
@@ -252,8 +255,8 @@ mod display_name_tests {
     }
 
     #[test]
-    fn ntt_is_reserved_under_wormhole() {
-        assert_eq!(display_name("wormhole", "ntt"), "NTT");
+    fn ntt_has_its_own_name() {
+        assert_eq!(display_name("wormhole", NTT_PROGRAM), "NTT");
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! decoded from it here. Without the account an inbound redeem is `Unsupported`.
 
 pub mod nft_bridge;
+pub mod ntt;
 pub mod posted_vaa;
 
 use super::amount::RawAmount;
@@ -166,10 +167,26 @@ fn parent(tx: &SolanaTx, pos: usize) -> usize {
     tx.instructions[pos].inner_of.unwrap_or(pos)
 }
 
-fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTransfer>, Reject> {
-    // Every PostMessage in the tx, in execution order, whoever emitted it. The core
-    // bridge logs one `Sequence:` line per PostMessage, so the k-th message pairs
-    // with the k-th line.
+/// One core bridge message made by a bridge instruction.
+struct CoreMessage<'a> {
+    emitter_address: String,
+    sequence: u64,
+    payload: &'a [u8],
+}
+
+/// Pairs each bridge instruction in `outbound` with the core bridge `PostMessage` it
+/// made: same top-level parent, executed after it, with the core bridge's emitter
+/// account among the instruction's accounts. `missing_reason` names the caller when no
+/// message pairs.
+///
+/// Every PostMessage in the tx is considered in execution order, whoever emitted it.
+/// The core bridge logs one `Sequence:` line per PostMessage, so the k-th message pairs
+/// with the k-th line.
+fn pair_post_messages<'a>(
+    tx: &'a SolanaTx,
+    outbound: &[usize],
+    missing_reason: &'static str,
+) -> Result<Vec<CoreMessage<'a>>, Reject> {
     let mut core: Vec<usize> = tx
         .instructions
         .iter()
@@ -192,31 +209,27 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
     ordered.sort_by_key(|&pos| exec_key(tx, pos));
 
     let mut claimed = vec![false; core.len()];
-    let mut transfers = Vec::with_capacity(ordered.len());
+    let mut messages = Vec::with_capacity(ordered.len());
 
-    for (event_index, &token_pos) in ordered.iter().enumerate() {
-        let token_ix = &tx.instructions[token_pos];
-        let token_key = exec_key(tx, token_pos);
-        let token_parent = parent(tx, token_pos);
+    for &bridge_pos in &ordered {
+        let bridge_ix = &tx.instructions[bridge_pos];
+        let bridge_key = exec_key(tx, bridge_pos);
+        let bridge_parent = parent(tx, bridge_pos);
 
-        // The PostMessage this Token Bridge instruction made: same top-level
-        // parent, executed after it, emitted by an account the instruction was given.
         let rank = core
             .iter()
             .enumerate()
             .find(|&(rank, &core_pos)| {
                 !claimed[rank]
-                    && parent(tx, core_pos) == token_parent
-                    && exec_key(tx, core_pos) > token_key
+                    && parent(tx, core_pos) == bridge_parent
+                    && exec_key(tx, core_pos) > bridge_key
                     && tx.instructions[core_pos]
                         .accounts
                         .get(CORE_EMITTER_ACCOUNT)
-                        .is_some_and(|emitter| token_ix.accounts.contains(emitter))
+                        .is_some_and(|emitter| bridge_ix.accounts.contains(emitter))
             })
             .map(|(rank, _)| rank)
-            .ok_or(Reject::Malformed(
-                "no PostMessage under the token bridge instruction",
-            ))?;
+            .ok_or(Reject::Malformed(missing_reason))?;
         claimed[rank] = true;
 
         let core_ix = &tx.instructions[core[rank]];
@@ -233,7 +246,27 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
 
         let payload = post_message_payload(&core_ix.data)
             .ok_or(Reject::Malformed("PostMessage data does not parse"))?;
-        let decoded = parse_transfer_payload(payload)?;
+
+        messages.push(CoreMessage {
+            emitter_address,
+            sequence: sequences[rank],
+            payload,
+        });
+    }
+
+    Ok(messages)
+}
+
+fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTransfer>, Reject> {
+    let messages = pair_post_messages(
+        tx,
+        outbound,
+        "no PostMessage under the token bridge instruction",
+    )?;
+    let mut transfers = Vec::with_capacity(messages.len());
+
+    for (event_index, message) in messages.into_iter().enumerate() {
+        let decoded = parse_transfer_payload(message.payload)?;
 
         let to_hex = hex::encode(decoded.to);
         let token_hex = hex::encode(decoded.token_address);
@@ -242,8 +275,8 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
             program: TOKEN_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: SOLANA,
-                emitter_address,
-                sequence: sequences[rank],
+                emitter_address: message.emitter_address,
+                sequence: message.sequence,
             },
             direction: Direction::Outbound,
             observed_tx: tx.signature.clone(),
