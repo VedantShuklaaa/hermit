@@ -4,8 +4,10 @@ use crate::error::{AppError, persistence_error_is_transient};
 use crate::services::analyzer::analyse_tx;
 use crate::state::AppState;
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use redis::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -52,6 +54,8 @@ impl RedisConsumer {
             stream = BRIDGE_TX_STREAM,
             group = CONSUMER_GROUP,
             consumer = %self.consumer_name,
+            concurrency = self.state.config.worker.concurrency,
+            read_count = self.state.config.worker.read_count,
             "Redis consumer started"
         );
 
@@ -95,6 +99,8 @@ impl RedisConsumer {
             stream = BRIDGE_TX_STREAM,
             group = CONSUMER_GROUP,
             consumer = %self.consumer_name,
+            reclaim_idle_ms = self.state.config.worker.reclaim_idle_ms,
+            reclaim_interval_secs = self.state.config.worker.reclaim_interval_secs,
             "Redis recovery worker started"
         );
 
@@ -464,17 +470,19 @@ impl RedisConsumer {
         }
 
         // A transaction waiting for its VAA can take a while, so a batch is handled
-        // concurrently instead of letting one slow transaction hold up the rest.
-        let results = futures_util::future::join_all(batch.into_iter().map(
-            |(message_id, candidate, delivery_count)| {
+        // concurrently instead of letting one slow transaction hold up the rest. The
+        // bound is per worker: a larger read batch queues here instead of putting
+        // every claimed entry in flight at once.
+        let futures = batch
+            .into_iter()
+            .map(|(message_id, candidate, delivery_count)| {
                 let mut connection = connection.clone();
                 async move {
                     self.process_candidate(&mut connection, &message_id, &candidate, delivery_count)
                         .await
                 }
-            },
-        ))
-        .await;
+            });
+        let results = collect_bounded(futures, self.state.config.worker.concurrency).await;
 
         for result in results {
             result?;
@@ -603,5 +611,72 @@ impl RedisConsumer {
         }
 
         Ok(())
+    }
+}
+
+/// Runs at most `limit` futures at once and keeps their results in completion
+/// order. A read batch is deliberately allowed to be larger than the bound: the
+/// surplus waits here, claimed but not yet in flight.
+async fn collect_bounded<Fut, T>(futures: impl Iterator<Item = Fut>, limit: usize) -> Vec<T>
+where
+    Fut: Future<Output = T>,
+{
+    futures_util::stream::iter(futures)
+        .buffer_unordered(limit.max(1))
+        .collect()
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// One future that records how many neighbours are running beside it.
+    struct Probe {
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl Probe {
+        async fn run(&self) {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_larger_than_the_bound_never_exceeds_it_in_flight() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(Probe {
+            in_flight: in_flight.clone(),
+            peak: peak.clone(),
+        });
+
+        let futures = (0..10).map(|_| {
+            let probe = probe.clone();
+            async move { probe.run().await }
+        });
+        let results = collect_bounded(futures, 2).await;
+
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "more than the configured concurrency ran at once"
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_zero_bound_still_runs_every_future() {
+        let futures = (0..3).map(|value| async move { value });
+        let results = collect_bounded(futures, 0).await;
+
+        assert_eq!(results.len(), 3);
     }
 }

@@ -146,6 +146,7 @@ fn ingest_config() -> IngestConfig {
         // The fake server has no HTTP RPC, and this test is about the live path.
         backfill: false,
         backfill_max: 0,
+        backfill_max_age_secs: 0,
         backfill_pace_ms: 0,
         rewind_slots: 0,
         dedupe_ttl_secs: 60,

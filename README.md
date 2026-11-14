@@ -34,7 +34,7 @@ roadmap, benchmarks): [docs/REFERENCE.md](docs/REFERENCE.md).
 | Domain model | Generalised: `bridge_transfers` keyed by `(protocol, message_key)`, with `direction`, `via`, raw + resolved chains, `NUMERIC(78,0)` amounts. Wormhole fields in `wormhole_messages` |
 | Chains | DB-backed registry, refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Unknown chains stored as unresolved |
 | Enrichment | `EnrichmentProvider` trait; background worker re-enriches open rows and backfills missing inbound origin txs |
-| Ingestion | Always on, supervised. One `logsSubscribe` and checkpoint per configured program ID, connects staggered by `INGEST_CONNECT_STAGGER_MS` (default 500) and capped by `INGEST_MAX_WS_CONNECTIONS` when set (capped-out programs stay covered by the reconciliation poll). Reconnect rewind with jittered backoff, watchdog, concurrent backfill, periodic reconciliation poll |
+| Ingestion | Always on, supervised. One `logsSubscribe` and checkpoint per configured program ID, connects staggered by `INGEST_CONNECT_STAGGER_MS` (default 500) and capped by `INGEST_MAX_WS_CONNECTIONS` when set (capped-out programs stay covered by the reconciliation poll). Reconnect rewind with jittered backoff, watchdog, concurrent backfill bounded by `INGEST_BACKFILL_MAX` and `INGEST_BACKFILL_MAX_AGE_SECS` (6 h), periodic reconciliation poll |
 | Read path | `/analyse` with memory cache, Postgres, single-flight, stale-while-revalidate |
 | CI | `fmt --check`, `clippy -D warnings`, `cargo test` on every PR and `main` |
 | Deploy | Two systemd units (`bridge-api`, `bridge-stream`) on EC2, Postgres on RDS, Caddy for TLS |
@@ -90,7 +90,11 @@ flowchart LR
 Enrichment runs after the transfer is stored; a failed or empty enrichment
 never blocks persistence. Redis Streams (consumer groups + `XAUTOCLAIM`) give
 at-least-once delivery without a second infrastructure dependency; Postgres
-upserts make persistence idempotent.
+upserts make persistence idempotent. Workers claim a small batch
+(`CONSUMER_READ_COUNT`, 4) and analyse at most `CONSUMER_CONCURRENCY` (2) at a
+time, so entries are not claimed long before they can run; recovery waits
+`WORKER_RECLAIM_IDLE_MS` (15 min) before reclaiming, well above the worst case
+a message can spend waiting on the Helius limiter plus analysis.
 
 ## Project structure
 

@@ -99,6 +99,7 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             enabled: false,
             backfill: false,
             backfill_max: 0,
+            backfill_max_age_secs: 0,
             backfill_pace_ms: 0,
             rewind_slots: 20,
             dedupe_ttl_secs: 0,
@@ -125,7 +126,8 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             reclaim_idle_ms: 300_000,
             reclaim_interval_secs: 30,
             worker_count: 5,
-            read_count: 10,
+            concurrency: 2,
+            read_count: 4,
         },
         evm: bridge::config::EvmConfig {
             enabled: false,

@@ -889,7 +889,12 @@ and the miss is not cached, so a later request retries.
   `WORKER_MAX_DELIVERIES` (default 10) it is dead-lettered with the reason.
 * **Self-healing recovery.** A dedicated worker reclaims messages abandoned by a
   crashed consumer via `XAUTOCLAIM`, every `WORKER_RECLAIM_INTERVAL_SECS` (30)
-  and after `WORKER_RECLAIM_IDLE_MS` (5 min), running the same handler as first delivery.
+  and after `WORKER_RECLAIM_IDLE_MS` (15 min), running the same handler as first
+  delivery. The idle threshold must exceed the worst case a message can spend
+  waiting for a provider token and in analysis; a message that is merely queued
+  behind the limiter must never be reclaimed, because each `XAUTOCLAIM` claim
+  increments its delivery count. Workers therefore claim small batches
+  (`CONSUMER_READ_COUNT`, 4) and run at most `CONSUMER_CONCURRENCY` (2) at a time.
 * **Graceful shutdown.** SIGTERM/Ctrl+C stops new work, lets in-flight messages
   finish, and drains open HTTP/WS connections.
 * **Upstream protection on the read path.** Per-provider rate limiters, retries
@@ -931,8 +936,10 @@ and the miss is not cached, so a later request retries.
 * **Helius token wait.** The API sheds a request after 2 s without a token
   (`Overloaded`, 503). Live workers wait up to `HELIUS_LIVE_TOKEN_WAIT_MS` (20 s)
   for the first token of a message, but `Overloaded` is transient, so the
-  message stays pending and recovery redelivers it. The wait must stay well
-  below the reclaim idle time (5 min).
+  message stays pending and recovery redelivers it. The reclaim idle time
+  (15 min) covers the worst case of those token waits, the transient retry
+  budget and the 90 s VAA window, so queueing behind the limiter does not spend
+  a delivery.
 
 ***
 
@@ -1202,6 +1209,8 @@ scrape_configs:
   used by the `reconcile` bin and the poll, each with its own limiter.
 * **Ingestion (A8):** `INGEST_ENABLED` (default on, `0` is a kill switch),
   `LIVE_BACKFILL` (default on), `INGEST_BACKFILL_MAX` (5000),
+  `INGEST_BACKFILL_MAX_AGE_SECS` (21600, 6 h; `0` disables the age cap, so a
+  long downtime only replays signatures newer than the window),
   `INGEST_BACKFILL_PACE_MS` (750), `INGEST_REWIND_SLOTS` (20),
   `INGEST_DEDUPE_TTL_SECS` (7200, `0` disables). Startup connects each
   program's subscription `INGEST_CONNECT_STAGGER_MS` (500, `0` connects them
@@ -1226,9 +1235,13 @@ scrape_configs:
   active when `INGEST_ENABLED` is on. It scans every registered program, so a
   program over the `INGEST_MAX_WS_CONNECTIONS` cap is still reconciled.
 * **Worker patience:** `HELIUS_LIVE_TOKEN_WAIT_MS` (20000), `WORKER_MAX_DELIVERIES`
-  (10), `WORKER_RECLAIM_IDLE_MS` (300000), `WORKER_RECLAIM_INTERVAL_SECS` (30),
-  `CONSUMER_COUNT` (5), `CONSUMER_READ_COUNT` (10), `DB_POOL_MAX` (20). The 3f
-  sweep found no gain above these defaults; raise only with a measurement
+  (10), `WORKER_RECLAIM_IDLE_MS` (900000, 15 min),
+  `WORKER_RECLAIM_INTERVAL_SECS` (30), `CONSUMER_COUNT` (5),
+  `CONSUMER_CONCURRENCY` (2), `CONSUMER_READ_COUNT` (4), `DB_POOL_MAX` (20).
+  Keep the read count at one to two times the concurrency: it is the number of
+  entries one worker claims per round, and a large batch leaves entries
+  unacknowledged behind the Helius limiter. The 3f sweep found no throughput
+  gain above these defaults; raise them only with a measurement
   ([3f-write-path.md](3f-write-path.md)).
 * **Programs:** `SOLANA_TOKEN_BRIDGE_PROGRAM` is the single Token Bridge address
   and the fallback. `SOLANA_BRIDGE_PROGRAMS` (`protocol:program_id` CSV, e.g.
@@ -1301,7 +1314,14 @@ cargo test
 * `src/ingestion/backfill.rs` unit tests: no backfill without a checkpoint, the
   rewound window including the checkpoint's own slot, stop at the cutoff,
   checkpoint below the rewind floored at 0, failed/slotless entries skipped, the
-  `INGEST_BACKFILL_MAX` cap, the empty page. `src/ingestion/checkpoint.rs` covers
+  `INGEST_BACKFILL_MAX` cap, the `INGEST_BACKFILL_MAX_AGE_SECS` boundary (the
+  signature exactly at the cap is kept, the next older one stops the page, a
+  missing `blockTime` is kept, `0` disables the check), the empty page.
+  `src/redis/consumer.rs` unit tests cover the per-worker concurrency bound: a
+  batch larger than the bound never has more futures in flight than the bound,
+  and a zero bound still runs every future. `tests/consumer_reliability.rs`
+  also checks that a pending message inside the reclaim idle threshold is left
+  alone (no second delivery, no upstream call). `src/ingestion/checkpoint.rs` covers
   the 4c invariant: live slots deferred while backfill runs, a mid-backfill drop
   leaves the checkpoint unchanged, completion releases the newest live slot,
   failed backfill stays closed, no-backfill connections persist immediately. The
@@ -1503,7 +1523,7 @@ only real adapter.
 * \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share
-* \[x] A8. Ingestion always on, no longer tied to `/stream` clients. Ingester starts under `spawn_supervised`; Helius spend bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped by `INGEST_BACKFILL_MAX`, paced by `INGEST_BACKFILL_PACE_MS`, Redis `SET NX EX` dedupe. Workers read through the live Helius limiter (4/s free plan), so bursts queue in the stream instead of being dropped
+* \[x] A8. Ingestion always on, no longer tied to `/stream` clients. Ingester starts under `spawn_supervised`; Helius spend bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped by `INGEST_BACKFILL_MAX` and `INGEST_BACKFILL_MAX_AGE_SECS`, paced by `INGEST_BACKFILL_PACE_MS`, Redis `SET NX EX` dedupe. Workers read through the live Helius limiter (4/s free plan), so bursts queue in the stream instead of being dropped
 * \[x] A9. Fixtures from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Inbound fixtures carry the captured posted VAA account
 * \[x] A10. API versioning: `/api/v2` serves the generalised model; `/api/v1` keeps its Wormhole-shaped response through a compatibility mapper, pinned byte for byte by fixture snapshots. WebSocket stream unchanged. Every decoded transfer persisted with its `event_index`
 
@@ -1794,9 +1814,12 @@ zero latency. With the Helius lane raised to 100000 tokens/s the write path
 sustains about 0.9k messages/s on EC2 (RDS, local Redis; 2.35k on the laptop)
 with 5000/5000 rows and no dead letters. With the real 4/s quota it is
 quota-bound at 2.3 to 2.4 messages/s, with Helius limiter wait averaging 4.0 s
-per call. Larger `XREADGROUP COUNT`, bounded per-worker concurrency, batched
-upserts and a bigger pool were flat or worse, so no behavioural change was
-kept. The isolated ceiling is Postgres work per message; real traffic has
+per call. Larger `XREADGROUP COUNT`, batched upserts and a bigger pool were
+flat or worse. Bounded per-worker concurrency was also flat on throughput, but
+it is now the default (2, with a read batch of 4) for a different reason: a
+large batch leaves entries claimed and unacknowledged behind the limiter, and
+recovery can mistake them for abandoned work. This is a correctness change at
+the free-plan quota, not a throughput claim. The isolated ceiling is Postgres work per message; real traffic has
 distinct message keys, whereas the six fake fixtures collapse onto one hot
 `bridge_transfers` row. Method and the RDS connection assumption:
 [3f-write-path.md](3f-write-path.md).
