@@ -185,7 +185,7 @@ pub fn debridge_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues
 
 /// The `bridge_transfers` columns of a Mayan Swift V2 source-side order. The
 /// observed Solana tx is the source, and the row starts `Pending` until a
-/// destination leg is seen (fulfillment is not indexed yet).
+/// destination-side fill is seen.
 pub fn mayan_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
     RowValues {
         source_tx_hash: Some(d.observed_tx.clone()),
@@ -199,6 +199,26 @@ pub fn mayan_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
         amount_formatted: None,
         status: BridgeStatus::Pending,
+    }
+}
+
+/// The `bridge_transfers` columns of a Mayan Swift V2 destination-side fill. The
+/// observed Solana tx is the destination, so the row is `Completed`; its source tx
+/// is on the origin chain and unknown. A fill and its source order share the order
+/// hash as the message key, so the upsert merges both legs.
+pub fn mayan_destination_row_values(d: &DetectedTransfer, chains: &Snapshot) -> RowValues {
+    RowValues {
+        source_tx_hash: None,
+        source_wallet: d.source_wallet.clone(),
+        source_explorer_url: None,
+        destination_wallet: d.destination_wallet.clone(),
+        destination_tx_hash: Some(d.observed_tx.clone()),
+        destination_explorer_url: chains.explorer_tx_url_for(&d.destination, &d.observed_tx),
+        token: d.token.as_ref().map(|t| t.address.clone()),
+        token_symbol: d.token_symbol.clone(),
+        amount: d.amount_raw.as_ref().map(|a| a.to_string()),
+        amount_formatted: None,
+        status: BridgeStatus::Completed,
     }
 }
 

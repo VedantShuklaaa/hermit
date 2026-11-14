@@ -375,9 +375,10 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   `program: "debridge"`. The adapter is always registered under the two fixed
   programs; there is no `SOLANA_DEBRIDGE_*` configuration.
 * **Mayan Swift V2.** `protocols/mayan/mod.rs` implements the same `BridgeAdapter`
-  for Swift V2 on Solana. Only the source-side order creation (`init_order`) is
-  indexed; fulfillment is driver-side and not covered, and the legacy V1 program is
-  out of scope.
+  for Swift V2 on Solana. The source-side order creation (`init_order`) and the
+  destination-side fill (`fulfill`) are indexed; `settle`, `cancel`,
+  `register_order` and other instructions are out of scope, and so is the legacy V1
+  program.
 
   | Program | ID | Verified against |
   | --- | --- | --- |
@@ -402,22 +403,53 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   hex (64 characters), taken from the 32 bytes after the 8-byte `OrderInitialized`
   event discriminator. The event payload is the hash then a little-endian `u64`
   `amountIn`; that amount is stored. No client-side hashing is needed, and a
-  transaction without the event is not a transfer. `register_order`, `fulfill`,
-  `settle`, `cancel` and every other instruction are rejected, as are failed
+  transaction without the event is not a transfer.
+
+  **Fulfill.** The destination-side instruction discriminator is
+  `8f0234ceaea4f748`, and its args are 40 bytes: the discriminator followed by the
+  32-byte unlocker. It has eight accounts, and account 0 is the destination state
+  account. That account is the PDA `[b"STATE_DEST", order_hash]` under the Swift
+  program and is 471 bytes. There is no IDL, so this layout was recovered from
+  mainnet and cross-checked as follows: every one of 9,207 open 471-byte accounts
+  owned by the program has discriminator `7cacf0a8f95cf1a3` and is exactly
+  `PDA([b"STATE_DEST", data[284..316]])`, and seven `fulfill` samples (the primary
+  transaction `2Y2EZPiVZ8bwdAGLSSQXNaTuBQtx3VoQRpM5R8SPonqGpMyYPKHHp5Nquv8aRkRkz3fRLh38d8eWe1spwVqCZwWp`
+  and six more) each succeeded, carried eight accounts with the state account first,
+  and pointed at a verified state account. The offsets read are:
+
+  | Offset | Size | Field |
+  | --- | --- | --- |
+  | 45 | 2 | source chain, little-endian `u16` |
+  | 59 | 20 | source-chain token address (EVM 20-byte form) |
+  | 284 | 32 | order hash |
+  | 422 | 8 | amount out, little-endian `u64` |
+  | 451 | 20 | unlocker |
+
+  The source chain, token and amount matched the actual balance changes and the
+  `fulfill` args in every sample. A fill carries only the unlocker, so the fetch
+  step preloads the state account through `required_accounts`; without it the
+  instruction is reported unsupported rather than guessed. The adapter does not
+  decode `settle`, `cancel` or `register_order`, and it rejects failed
   transactions.
 
   **Chains.** `source` is the `wormhole` namespace at Solana's ID 1 and
-  `destination` is the `wormhole` ID in `chainDest`; the adapter reuses the existing
-  `wormhole` registry rows, so no migration is needed. Destination addresses are
-  decoded for Solana (32-byte base58) and EVM (last 20 bytes as `0x` + hex) chain
-  IDs. An unknown chain ID leaves the wallet absent and resolves as unresolved,
-  never an error.
+  `destination` is the `wormhole` ID in `chainDest` for a source order; a fill swaps
+  them, with the observed Solana tx as the destination. The adapter reuses the
+  existing `wormhole` registry rows, so no migration is needed. Destination
+  addresses are decoded for Solana (32-byte base58) and EVM (last 20 bytes as `0x` +
+  hex) chain IDs. An unknown chain ID leaves the wallet absent and resolves as
+  unresolved, never an error. For a fill, the source-chain token is 20 bytes only
+  for an EVM source chain; another source chain's token is left absent.
 
-  **Read path.** The observed Solana tx is the source, so the row is `Pending` with
-  `source_tx_hash` set and no destination tx. `/api/v1` does not represent Swift
-  V2; `/api/v2` returns `message_id: { protocol: "mayan", order_hash }` and
-  `program: "swift_v2"`. The adapter is always registered under the fixed program;
-  there is no `SOLANA_MAYAN_*` configuration.
+  **Read path.** A source `init_order` is the source side, so its row is `Pending`
+  with `source_tx_hash` set and no destination tx. A `fulfill` is the destination
+  side, so its row is `Completed` with the observed tx as `destination_tx_hash` and
+  no source tx. Both use the order hash as the message key, so the existing
+  `(protocol, message_key)` upsert merges the legs in either arrival order and never
+  lowers the status. `/api/v1` does not represent Swift V2; `/api/v2` returns
+  `message_id: { protocol: "mayan", order_hash }` and `program: "swift_v2"`. The
+  adapter is always registered under the fixed program; there is no
+  `SOLANA_MAYAN_*` configuration.
 * **Migrations** (none has a down migration: snapshot the database before deploying):
   * `20261018120000_generalise_bridge_transfers.sql` (A2) rewrites existing rows
     in place: every legacy row becomes `protocol = 'wormhole'`,
@@ -734,6 +766,7 @@ hermit/
 │   ├── golden_fixtures.rs
 │   ├── list_transfers.rs
 │   ├── mayan_fixtures.rs
+│   ├── mayan_persistence.rs
 │   ├── persistence_idempotency.rs
 │   ├── v1_api_snapshots.rs
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json, account_<name>_vaa.json
@@ -1311,16 +1344,24 @@ cargo test
   instructions (including cancel/claim/unlock discriminators), a failed
   transaction, a create without an order-id event or a fill without its event, a
   fill whose take chain is not Solana, and an event printed by an inner program.
-* `tests/mayan_fixtures.rs`: a golden test over a captured mainnet `init_order`.
-  It checks the order hash and amount from `OrderInitialized`, the Solana mint and
-  trader from the instruction accounts, destination chain 4 and its EVM address
-  from the args, and that the row values are `Pending` with the observed tx as
-  `source_tx_hash`. It also resolves the destination through the existing
-  `wormhole` registry mapping and shows a failed tx and one without the event are
-  not transfers. No network. Unit tests in `src/protocols/mayan/mod.rs` cover EVM
-  and Solana addresses, an unknown destination chain, non-`init_order`
-  instructions, a missing event, a failed transaction, truncated data/event, and
-  an event printed by an inner program.
+* `tests/mayan_fixtures.rs`: golden tests over captured mainnet transactions. The
+  `init_order` test checks the order hash and amount from `OrderInitialized`, the
+  Solana mint and trader from the instruction accounts, destination chain 4 and its
+  EVM address from the args, and that the row values are `Pending` with the observed
+  tx as `source_tx_hash`. The `fulfill` test preloads the captured
+  `[b"STATE_DEST", hash]` account the way the fetch step does, then checks the order
+  hash, source chain, token, amount, `Inbound` direction and `Completed` row with
+  the observed tx as `destination_tx_hash`. It also shows a fulfill without its
+  state account is not a transfer, and that a failed tx and one without the source
+  event are not transfers. It resolves the destination through the existing
+  `wormhole` registry mapping. No network. `tests/mayan_persistence.rs` (Postgres)
+  persists a source order and its fill and shows they converge on one row with both
+  tx hashes and `Completed`, in either arrival order. Unit tests in
+  `src/protocols/mayan/mod.rs` cover EVM and Solana addresses, an unknown
+  destination chain, non-`init_order` instructions, a missing event, a failed
+  transaction, truncated data/event, an event printed by an inner program, a fill
+  read from a synthetic state account, a missing or malformed state account, and a
+  fill with truncated args or an unknown source chain.
 * `tests/multi_program_ingestion.rs`: the real ingester against a loopback
   WebSocket stub (Postgres and Redis containers, no live Helius). Two programs
   get one `logsSubscribe` each, their notifications advance separate checkpoints
@@ -1439,9 +1480,9 @@ Each phase adds one protocol, in descending order of Solana bridge volume:
 
 Candidates: LayerZero/Stargate, Allbridge, Hyperlane, Chainlink CCIP, Across.
 Circle CCTP (inbound completions), deBridge DLN (source orders and destination
-fills) and Mayan Swift V2 (source orders only) are indexed; CCTP's send side,
-DLN's cancel/claim/unlock instructions and Swift V2's fulfillment remain
-follow-ups.
+fills) and Mayan Swift V2 (source orders and destination fills) are indexed;
+CCTP's send side, DLN's cancel/claim/unlock instructions and Swift V2's
+settle/cancel/register_order instructions remain follow-ups.
 
 #### Later upgrade: unknown-chain resolution
 
