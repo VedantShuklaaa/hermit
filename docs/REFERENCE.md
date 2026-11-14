@@ -126,7 +126,7 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   registered only when `SOLANA_NFT_BRIDGE_PROGRAM` is set, and that program is
   never also registered to the Token Bridge adapter, so an unset variable keeps
   an existing deployment exact (same subscriptions, same registry, same rows).
-* **Wormhole NTT outbound (opt-in, per deployment).**
+* **Wormhole NTT (opt-in, per deployment).**
   `protocols/wormhole/ntt.rs` implements the same `BridgeAdapter` for Wormhole
   Native Token Transfers. NTT is per-token: each deployment has its own manager
   program and a core emitter PDA derived as `[b"emitter"]`. In both verified
@@ -143,6 +143,15 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   real mainnet transactions: `release_wormhole_outbound = ca5733ad8ea0bccc`,
   `transfer_burn = 4b901ae8270c4bde`, `transfer_lock = b39e9294972eb0c8`.
 
+  The inbound names and account orders are the v1.0.0 manager program's, from
+  `solana/ts/idl/1_0_0/json/example_native_token_transfers.json` and
+  `solana/programs/example-native-token-transfers/src/transceivers/wormhole/instructions/receive_message.rs`
+  at tag `v1.0.0+solana` in the same repository:
+  `receive_wormhole_message = 86d58f44eb66e860`, `redeem = b80c569546c461e1`,
+  `release_inbound_mint = 0ce94a413ca83178`,
+  `release_inbound_unlock = b6a23ecec5895362`, all confirmed on a real WCT
+  inbound transaction.
+
   **Deployments** used to verify and capture fixtures:
 
   | Deployment | Manager program (configured) | Core emitter (Wormhole address) | Verified against |
@@ -150,7 +159,7 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   | WalletConnect WCT | `nttLq3ZsKu9uAFWuBGksdZTPAjkMRyPkxp61CJPsntA` | `5FksLs44iw5TPZ1yngyxKxZyvBXeUCgQM7VQfiRZVK45` | <https://github.com/WalletConnect/contracts/blob/main/ntt/mainnet_deployment.json> |
   | Sky USDS | `STTUVCMPuNbk21y1J6nqEGXSQ8HKvFmFBKnCvKHTrWn` | `4ZQYCg7ZiVeNp9DxUbgc4b9JpLXoX1RXYfMXS5saXpkC` | <https://github.com/sky-ecosystem/sky-ntt-migration/blob/main/docs/UserGuide.md> |
 
-  **Only outbound releases are indexed.** `release_wormhole_outbound` posts the
+  **Outbound.** `release_wormhole_outbound` posts the
   transfer through the core bridge, so it is paired with its `PostMessage` CPI
   exactly as the Token Bridge and NFT Bridge adapters pair theirs (same top-level
   parent, later execution, core emitter account among the instruction's accounts,
@@ -166,6 +175,26 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   is `ntt`, so `/api/v2` shows `protocol_name = "NTT"` and `/api/v1` does not
   represent the row.
 
+  **Inbound receives.** `receive_wormhole_message` is decoded for the same
+  manager programs. Its accounts are payer, config, peer, **vaa** (the posted
+  VAA, index 3), transceiver_message and system_program; the instruction data is
+  only the 8-byte discriminator. The adapter asks the fetch step for account 3
+  through `required_accounts`, then reads that account with `posted_vaa::parse`.
+  The VAA payload is the same `TransceiverMessage`, and its identity (emitter
+  chain, emitter address, sequence) is the outbound `MessageId::Wormhole`, so an
+  inbound and an outbound leg for the same message converge on one
+  `(protocol, message_key)` row. The token is the payload's source token on the
+  origin chain, decoded with the existing chain-address rules; the destination
+  wallet is the payload's recipient and the source wallet is the
+  `NttManagerMessage` sender. `receive_wormhole_message` only attests the
+  message; `redeem` attests it to the transceiver and
+  `release_inbound_mint` / `release_inbound_unlock` move the tokens. When one of
+  those two release instructions is in the receive's own transaction, the
+  adapter marks the detection as delivered, so the row is stored `Completed`
+  with the observed tx as `destination_tx_hash`. A release in a later
+  transaction is not indexed, and a receive without a release in its tx is
+  stored `Pending` with `source_tx_hash` and `destination_tx_hash` NULL.
+
   **Payload.** A `TransceiverMessage` starts with `0x9945FF10`, then the source
   and recipient NTT managers (32 bytes each), a u16 BE manager-message length and
   an `NttManagerMessage` (message id 32, sender 32, u16 BE payload length). Its
@@ -173,16 +202,21 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   `TrimmedAmount` (decimals u8, then amount u64 BE, at most 8 decimals), the
   source token (32), recipient (32) and recipient chain (u16 BE); an optional
   additional payload may follow the fixed 79 bytes. The adapter reads the fixed
-  fields and ignores the optional tail. The source token is always a Solana
-  account, so `token` is `(wormhole, 1, base58(source_token))`; the recipient is
-  decoded with the existing chain-address rules.
+  fields and ignores the optional tail. On an outbound release the source token
+  is a Solana account, so `token` is `(wormhole, 1, base58(source_token))`; on an
+  inbound receive it is the origin chain's token, formatted with the same
+  chain-address rules. The recipient is decoded with the existing chain-address
+  rules.
 
   **Rejections.** Failed transactions are never transfers. A transaction with
   only `transfer_burn` or `transfer_lock` is `not_transfer` (the step moves
-  tokens but carries no message), every other manager instruction is
-  `not_transfer` (admin, configuration or the inbound receive path), and a
-  truncated or mismatched payload is `malformed`. Inbound NTT
-  (`receive_wormhole_message`) is not decoded yet, so inbound NTT is not indexed.
+  tokens but carries no message), a transaction with only `redeem` or
+  `release_inbound_*` is `not_transfer` (the receive already carries the
+  identity), every other manager instruction is `not_transfer` (admin or
+  configuration), and a truncated or mismatched payload is `malformed`. An
+  inbound receive whose posted VAA account was not preloaded is `unsupported`;
+  an account not owned by the core bridge, or a payload not addressed to
+  Solana, is `malformed`.
 
   **Config.** `SOLANA_NTT_PROGRAMS` is a CSV of manager program IDs. It is
   opt-in and empty by default; every ID must be base58 for 32 bytes. When set,
@@ -1191,18 +1225,27 @@ cargo test
   Unit tests in `src/protocols/wormhole/nft_bridge.rs` cover the instruction
   table, both send variants, both completions from synthetic posted VAAs,
   admin/metadata rejection, malformed and short payloads, and outbound pairing.
-* `tests/ntt_fixtures.rs`: golden tests over a captured mainnet WalletConnect
-  WCT `release_wormhole_outbound` transaction (public Solana RPC, no
-  WormholeScan operation). The fixture also contains `transfer_burn`, so the
-  test proves the burn is ignored and the release is paired with its core bridge
-  `PostMessage`. It checks the message key (emitter chain 1, transceiver emitter,
-  sequence 439), amount, source token, destination chain 30 and recipient
-  wallet, plus `program = 'ntt'` and `protocol_name = "NTT"`. Further tests
-  reject a burn-only transaction, a failed transaction and a manager left
-  unconfigured, and show a Token Bridge fixture decodes identically with and
-  without NTT configured. Unit tests in `src/protocols/wormhole/ntt.rs` pin the
-  discriminators, the payload layout, admin/transfer_burn rejection, malformed
-  payloads, sequence pairing and the opt-in registry registration.
+* `tests/ntt_fixtures.rs`: golden tests over captured mainnet WalletConnect
+  WCT transactions (public Solana RPC, no WormholeScan operation). The outbound
+  fixture is a `release_wormhole_outbound`; it also contains `transfer_burn`, so
+  the test proves the burn is ignored and the release is paired with its core
+  bridge `PostMessage`. It checks the message key (emitter chain 1, transceiver
+  emitter, sequence 439), amount, source token, destination chain 30 and
+  recipient wallet, plus `program = 'ntt'` and `protocol_name = "NTT"`. The
+  inbound fixture is a `receive_wormhole_message` from Base (sequence 794) with
+  its posted VAA captured by `getAccountInfo`; the test preloads that account
+  through `required_accounts` and checks the message key, amount, source token on
+  Base, sender and Solana recipient. The same tx carries `release_inbound_mint`,
+  so the row is `Completed` with the observed tx as `destination_tx_hash`;
+  removing the follow-up instructions leaves the receive `Pending` with both tx
+  hashes NULL. Further tests reject a
+  burn-only transaction, a redeem/release-only transaction, a failed transaction,
+  an inbound receive without its VAA, and a manager left unconfigured, and show
+  a Token Bridge fixture decodes identically with and without NTT configured.
+  Unit tests in `src/protocols/wormhole/ntt.rs` pin the discriminators, the
+  payload layout, admin/transfer_burn/redeem rejection, malformed payloads,
+  inbound VAA decoding, sequence pairing, outbound/inbound key convergence and
+  the opt-in registry registration.
 * `tests/debridge_fixtures.rs`: golden tests over captured mainnet
   `createOrderWithNonce` and `fulfillOrder` transactions. The source test checks
   the order id (from `CreatedOrderId`), amount, Solana mint, destination chain
@@ -1314,7 +1357,7 @@ only real adapter.
 * \[x] A1. Adapter trait and registry. `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx`, Wormhole Token Bridge outbound decode, wiring into `analyse_tx`, and A1b inbound redeems via `required_accounts` + `getMultipleAccounts` + in-house posted-VAA parser
 * \[x] A2. Generalised domain model and schema (`protocol`, `via`, `direction`, chain refs, per-protocol message key, `NUMERIC` amounts). `bridge_transfers` split from `wormhole_messages`. Existing rows migrated in place, tested on staged legacy data
 * \[x] A3. DB-backed chain registry seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs stored as `unresolved(protocol, id)`. Registry carries status and provenance for the later LLM-proposal upgrade (not built in this phase). Done: tables, seed, `load_snapshot`, DB tests, SQL `resolve_chain`, unresolved IDs persisted, callers moved off `ChainId` (kept only as the frozen `/api/v1` type), refresh task wired
-* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist. NFT Bridge adapter done (opt-in via `SOLANA_NFT_BRIDGE_PROGRAM`): program ID, instruction order and payload verified against `consts.ts`, `nft_bridge/program/src/lib.rs` and whitepaper 0006; sends and completions decoded, admin/metadata rejected. NTT outbound done (opt-in via `SOLANA_NTT_PROGRAMS`, one manager program per deployment; `release_wormhole_outbound` decoded, inbound not yet) and the other adapters remain, so the item stays open
+* \[ ] A4. All Wormhole programs on Solana (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID (`mentions` accepts a single address), checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` replaced by a configured list. Ingestion plumbing done: `SOLANA_BRIDGE_PROGRAMS` is read and validated, the registry is built from it, per-program subscription/backfill/checkpoint/poll and the `program` discriminator exist. NFT Bridge adapter done (opt-in via `SOLANA_NFT_BRIDGE_PROGRAM`): program ID, instruction order and payload verified against `consts.ts`, `nft_bridge/program/src/lib.rs` and whitepaper 0006; sends and completions decoded, admin/metadata rejected. NTT done (opt-in via `SOLANA_NTT_PROGRAMS`, one manager program per deployment; `release_wormhole_outbound` and `receive_wormhole_message` decoded; an inbound row is `Completed` when `release_inbound_*` is in the same tx, and stays `Pending` when the release arrives in a separate tx, which is not indexed) and the other adapters remain, so the item stays open
 * \[x] A5. Chain-first detection: persisted from Helius data alone (outbound rows now start `Pending`); WormholeScan enriches. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. A5b: destination tx fix, lookups behind `EnrichmentProvider`, background re-enrichment pass. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, router as `via`, and a test that outer + underlying adapters on the same tx produce one row. Partly done: `compose()` with unit tests. The end-to-end test waits for a second adapter
 * \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed (see notes above). `source_tx_hash` nullable in `/api/v1`; repair migration; re-enrichment revisits completed inbound rows via partial index `idx_bt_missing_origin`; every attempt recorded in `last_enrich_attempt_at`; `REENRICH_ORIGIN_SHARE` reserves batch share

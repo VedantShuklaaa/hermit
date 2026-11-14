@@ -38,6 +38,7 @@ fn detected(order_id: &str, direction: Direction, observed_tx: &str) -> Detected
             order_id: order_id.to_string(),
         },
         direction,
+        delivered: direction == Direction::Inbound,
         observed_tx: observed_tx.to_string(),
         event_index: 0,
         source: RawChainRef::debridge("8453"),

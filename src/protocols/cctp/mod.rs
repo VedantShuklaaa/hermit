@@ -165,6 +165,8 @@ fn decode_receive(
             nonce: hex::encode(parsed.nonce),
         },
         direction: Direction::Inbound,
+        // The receive minted on Solana in this tx.
+        delivered: true,
         observed_tx: tx.signature.clone(),
         event_index,
         source: source.clone(),

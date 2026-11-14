@@ -279,6 +279,7 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
                 sequence: message.sequence,
             },
             direction: Direction::Outbound,
+            delivered: false,
             observed_tx: tx.signature.clone(),
             event_index: event_index as u16,
             source: RawChainRef::wormhole(SOLANA),
@@ -367,6 +368,8 @@ fn decode_inbound(
                 sequence: vaa.sequence,
             },
             direction: Direction::Inbound,
+            // The redeem moved the tokens on Solana in this tx.
+            delivered: true,
             observed_tx: tx.signature.clone(),
             event_index: (first_index + n) as u16,
             source: RawChainRef::wormhole(vaa.emitter_chain),

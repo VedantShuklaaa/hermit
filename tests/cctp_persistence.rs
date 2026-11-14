@@ -26,6 +26,7 @@ fn decoded(source_domain: u32, nonce: &str, status: BridgeStatus) -> DecodedTran
             nonce: nonce.to_string(),
         },
         direction: Direction::Inbound,
+        delivered: true,
         observed_tx: HASH.to_string(),
         event_index: 0,
         source: RawChainRef::cctp(source_domain),

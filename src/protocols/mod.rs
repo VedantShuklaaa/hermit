@@ -175,6 +175,12 @@ pub struct DetectedTransfer {
     pub program: String,
     pub message: MessageId,
     pub direction: Direction,
+    /// True when the observed tx itself finished the destination side: a Token Bridge
+    /// or NFT redeem, a CCTP receive or a deBridge fill, or an NTT receive whose tx
+    /// also carries `release_inbound_mint` / `release_inbound_unlock`. An outbound send
+    /// and a bare NTT receive leave it false.
+    #[serde(default)]
+    pub delivered: bool,
     /// The Solana signature this was decoded from.
     pub observed_tx: String,
     /// Position among the transfers of one tx, so several can coexist.
