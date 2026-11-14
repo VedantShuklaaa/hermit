@@ -240,13 +240,20 @@ impl Drop for FakeUpstream {
     }
 }
 
-fn spawn_fake_upstream(port: u16, envs: &[(&str, &str)]) -> Child {
+fn spawn_fake_upstream(
+    port: u16,
+    envs: &[(&str, &str)],
+    fixtures: Option<&std::path::Path>,
+) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fake_upstream"));
     command
         .env("FAKE_PORT", port.to_string())
         .env("FAKE_LATENCY_MS", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    if let Some(dir) = fixtures {
+        command.arg("--fixtures").arg(dir);
+    }
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -260,6 +267,19 @@ pub async fn start_fake_upstream() -> FakeUpstream {
 /// Starts the fake upstream with extra environment, for tests that need injected
 /// latency or 429s. The defaults keep it instant and always answering.
 pub async fn start_fake_upstream_with(envs: &[(&str, &str)]) -> FakeUpstream {
+    start_fake_upstream_opts(envs, None).await
+}
+
+/// Starts the fake upstream over a fixture directory other than `tests/fixtures`, so
+/// a test can replay a minimal captured pair without changing the shared set.
+pub async fn start_fake_upstream_with_fixtures(fixtures: &std::path::Path) -> FakeUpstream {
+    start_fake_upstream_opts(&[], Some(fixtures)).await
+}
+
+async fn start_fake_upstream_opts(
+    envs: &[(&str, &str)],
+    fixtures: Option<&std::path::Path>,
+) -> FakeUpstream {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind a free port")
         .local_addr()
@@ -267,7 +287,7 @@ pub async fn start_fake_upstream_with(envs: &[(&str, &str)]) -> FakeUpstream {
         .port();
     // The guard owns the child from here, so the panic below still kills it.
     let fake = FakeUpstream {
-        child: spawn_fake_upstream(port, envs),
+        child: spawn_fake_upstream(port, envs, fixtures),
         base_url: format!("http://127.0.0.1:{port}"),
     };
 

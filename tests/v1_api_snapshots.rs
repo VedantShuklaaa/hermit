@@ -125,7 +125,7 @@ fn current_v1(name: &str) -> Current {
     let mut transfer = detect::to_bridge_transfer(&first, None, &chains())
         .unwrap_or_else(|e| panic!("{name}: to_bridge_transfer failed: {e}"));
     if detect::apply_wormholescan(&mut transfer, &op, &chains()) == Enrichment::Applied {
-        tx.bridge_event = normaliser::wormhole::normalise(op).ok();
+        tx.bridge_event = normaliser::wormhole::normalise(op).ok().flatten();
     }
     tx.bridge_transfer = Some(transfer);
     Current {

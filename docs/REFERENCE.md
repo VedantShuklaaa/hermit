@@ -264,6 +264,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   assigns the real nonce off-chain. Without Iris there is no chain-derived
   message identity for a send, so it is rejected
   `unsupported` ("cctp send: nonce is assigned offchain") and **not stored**.
+  `analyse_tx` treats that rejection as final and does not ask WormholeScan: a
+  CCTP send has no Wormhole message for it to return, and WormholeScan's CCTP
+  operations are not Wormhole operations.
   Indexing outbound sends needs a follow-up that resolves the nonce through
   Circle's Iris API (or reads a later message that carries it); the event
   account pubkey must never be used as a nonce. Admin and utility instructions
@@ -808,10 +811,11 @@ hermit/
 
 ## Read path
 
-`GET /api/v1/transactions/analyse`. A cold analysis is expensive: Helius and
-WormholeScan are called in parallel, the VAA is decoded, and the transfer is
-correlated with its destination chain (about 360 ms median, and both providers
-rate-limit). The read path exists so almost no request pays that cost.
+`GET /api/v1/transactions/analyse`. A cold analysis is expensive: Helius is
+read first, WormholeScan is asked only when the chain-first adapters need it,
+the VAA is decoded, and the transfer is correlated with its destination chain
+(about 360 ms median when both providers are needed, and both rate-limit). The
+read path exists so almost no request pays that cost.
 
 ```mermaid
 flowchart TD
@@ -898,7 +902,10 @@ and the miss is not cached, so a later request retries.
   window are served from Postgres while a background task refreshes them.
 * **Enrichment never gates persistence.** A transfer decoded from Solana data is
   stored even if WormholeScan is down (outbound as `Pending`, inbound as
-  `Completed`), and a status never moves backwards.
+  `Completed`), and a status never moves backwards. An `Unsupported` rejection
+  from a non-Wormhole adapter (CCTP, deBridge, Mayan) is final: analysis returns
+  no transfer without asking WormholeScan, so a CCTP send is acknowledged rather
+  than dead-lettered on an operation that is not a Wormhole message.
 * **Account preloads fail loud on the live path.** Adapter-requested accounts
   (the posted VAA of a redeem) are read in one `getMultipleAccounts` call through
   the Helius limiter. A live message whose preload fails transiently is left

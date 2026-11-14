@@ -61,45 +61,46 @@ async fn analyse_tx_inner(
         false
     };
 
-    let (source_result, wormhole_result) = tokio::join!(
-        async {
-            let t = std::time::Instant::now();
-            let r = fetch_source_transaction(state, chain, hash, first_attempt_paid).await;
-            tracing::info!(helius_ms = t.elapsed().as_millis() as u64, "source fetch");
-            r
-        },
-        async {
-            let t = std::time::Instant::now();
-            let operation = || {
-                wormhole::get_operation_by_tx_hash(
-                    &state.http_client,
-                    &state.config.wormhole_url,
-                    hash,
-                )
-            };
-            let labels = UpstreamLabels::wormhole();
-            let r = if prepaid {
-                call_upstream_after_token(&state.wormhole_limiter, labels, operation).await
-            } else {
-                call_upstream(&state.wormhole_limiter, labels, operation).await
-            };
-            tracing::info!(wormhole_ms = t.elapsed().as_millis() as u64, "wormholescan");
-            r
-        },
+    let source_started = std::time::Instant::now();
+    let (mut tx, solana_tx) =
+        fetch_source_transaction(state, chain, hash, first_attempt_paid).await?;
+    tracing::info!(
+        helius_ms = source_started.elapsed().as_millis() as u64,
+        "source fetch"
     );
-
-    let (mut tx, solana_tx) = source_result?;
     tx.bridge_transfer = None;
+
+    // The registry is asked before WormholeScan: a definite "not a transfer" answer
+    // must not spend an upstream call whose result is then discarded.
+    let detection = solana_tx
+        .as_ref()
+        .map(|view| detect::detect_all(&state.protocols, view))
+        .unwrap_or_default();
 
     // Chain first: if an adapter decodes a transfer from the Solana tx alone, it is
     // stored whatever WormholeScan says (outbound as `Pending`, inbound as
     // `Completed`). WormholeScan only enriches.
-    if let Some(solana_tx) = &solana_tx {
+    if solana_tx.is_some() {
         // Sends out of Solana and redeems into it are both stored (A7). For a redeem the
         // observed Solana tx is the destination side, see `detect::to_bridge_transfer`.
-        let detected = detect::detect(&state.protocols, solana_tx);
+        let detected = &detection.transfers;
+
+        // A non-Wormhole adapter matched and said it does not decode this transfer
+        // yet. WormholeScan cannot add a Wormhole message the tx does not have, so
+        // this is a final no-transfer, not a failure to dead-letter.
+        if detection.unsupported_outside_wormhole() {
+            tracing::info!(
+                signature = %hash,
+                "adapter rejected the transaction as unsupported; not asking WormholeScan"
+            );
+            return Ok(Analysis {
+                tx,
+                transfers: Vec::new(),
+            });
+        }
 
         if !detected.is_empty() {
+            let wormhole_result = fetch_wormhole_operation(state, hash, prepaid).await;
             if detected.len() > 1 {
                 tracing::info!(
                     signature = %hash,
@@ -191,11 +192,23 @@ async fn analyse_tx_inner(
         }
     }
 
-    // No adapter recognised the tx (inbound redeem, another Wormhole program, ...):
+    // No adapter produced a transfer (inbound redeem, another Wormhole program, ...):
     // keep the WormholeScan-driven path until those adapters exist.
+    let wormhole_result = fetch_wormhole_operation(state, hash, prepaid).await;
     match wormhole_result {
         Ok(wh_raw) => {
-            let bridge_event = normaliser::wormhole::normalise(wh_raw.clone())?;
+            // WormholeScan also indexes operations that are not Wormhole messages
+            // (CCTP, executor requests). They have no VAA and no transfer to store.
+            let Some(bridge_event) = normaliser::wormhole::normalise(wh_raw.clone())? else {
+                tracing::info!(
+                    signature = %hash,
+                    "WormholeScan operation is not a Wormhole message; not a transfer"
+                );
+                return Ok(Analysis {
+                    tx,
+                    transfers: Vec::new(),
+                });
+            };
 
             let vaa_b64 = wh_raw
                 .get("vaa")
@@ -312,6 +325,30 @@ async fn analyse_tx_inner(
         tx,
         transfers: Vec::new(),
     })
+}
+
+/// The WormholeScan operation for a tx, through the shared limiter. Called only when
+/// the chain-first adapters need it: to enrich a decoded transfer, or when no adapter
+/// could decide.
+async fn fetch_wormhole_operation(
+    state: &AppState,
+    hash: &str,
+    prepaid: bool,
+) -> Result<Value, AppError> {
+    let started = std::time::Instant::now();
+    let operation =
+        || wormhole::get_operation_by_tx_hash(&state.http_client, &state.config.wormhole_url, hash);
+    let labels = UpstreamLabels::wormhole();
+    let result = if prepaid {
+        call_upstream_after_token(&state.wormhole_limiter, labels, operation).await
+    } else {
+        call_upstream(&state.wormhole_limiter, labels, operation).await
+    };
+    tracing::info!(
+        wormhole_ms = started.elapsed().as_millis() as u64,
+        "wormholescan"
+    );
+    result
 }
 
 fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {

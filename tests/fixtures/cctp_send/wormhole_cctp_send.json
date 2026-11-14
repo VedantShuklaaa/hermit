@@ -1,0 +1,22 @@
+{
+  "sequence": "synthetic-signature-0",
+  "emitterChain": 1,
+  "emitterAddress": {
+    "hex": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "content": {
+    "standarizedProperties": {
+      "appIds": ["MESSAGING_EXECUTOR", "CCTP_V2"],
+      "fromChain": 1,
+      "toChain": 30,
+      "tokenChain": 1,
+      "tokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "amount": "1000000"
+    }
+  },
+  "data": {
+    "symbol": "USDC",
+    "tokenAmount": "1.0",
+    "usdAmount": "1.0"
+  }
+}

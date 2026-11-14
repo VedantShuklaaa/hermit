@@ -1,0 +1,45 @@
+{
+  "slot": 1,
+  "blockTime": 1700000000,
+  "transaction": {
+    "message": {
+      "accountKeys": [
+        {
+          "pubkey": "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+          "signer": true,
+          "writable": true
+        }
+      ],
+      "instructions": [
+        {
+          "programId": "air1fXDWHAMwwQycxHfWafy4NaJe6gmzNfgadDHvgPk",
+          "accounts": [],
+          "data": ""
+        }
+      ]
+    }
+  },
+  "meta": {
+    "err": null,
+    "innerInstructions": [
+      {
+        "index": 0,
+        "instructions": [
+          {
+            "programId": "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe",
+            "accounts": [],
+            "data": "d142HqN88u5"
+          }
+        ]
+      }
+    ],
+    "logMessages": [
+      "Program air1fXDWHAMwwQycxHfWafy4NaJe6gmzNfgadDHvgPk invoke [1]",
+      "Program log: Instruction: Send",
+      "Program CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe invoke [2]",
+      "Program log: Instruction: DepositForBurn",
+      "Program CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe success",
+      "Program air1fXDWHAMwwQycxHfWafy4NaJe6gmzNfgadDHvgPk success"
+    ]
+  }
+}

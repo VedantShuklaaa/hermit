@@ -77,8 +77,11 @@ fn wormhole_fixtures_are_self_consistent() {
     for path in files {
         let n = name(&path);
         let raw = load(&path);
-        let event = normaliser::wormhole::normalise(raw.clone())
-            .unwrap_or_else(|e| panic!("{n}: normalise failed: {e}"));
+        let Some(event) = normaliser::wormhole::normalise(raw.clone())
+            .unwrap_or_else(|e| panic!("{n}: normalise failed: {e}"))
+        else {
+            panic!("{n}: not a Wormhole operation");
+        };
 
         // id is "<emitter chain>/<emitter address hex>/<sequence>"
         let id = raw["id"]
