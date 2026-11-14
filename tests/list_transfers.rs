@@ -208,6 +208,61 @@ fn query(limit: &str) -> ListQuery {
 }
 
 #[tokio::test]
+async fn list_items_carry_first_seen_and_updated_timestamps_in_milliseconds() {
+    let db = test_db().await;
+    let first_seen = at(10);
+    for seq in 1..=3 {
+        insert_row(
+            &db.pool,
+            seq,
+            "Outbound",
+            "Completed",
+            Some(1),
+            "1",
+            Some(2),
+            "2",
+            None,
+            first_seen,
+        )
+        .await;
+    }
+    // Enrichment rewrites the row, which moves updated_at past created_at.
+    let updated = at(25);
+    sqlx::query("UPDATE bridge_transfers SET updated_at = $1 WHERE source_tx_hash = $2")
+        .bind(updated)
+        .bind("list-tx-2")
+        .execute(&db.pool)
+        .await
+        .expect("advance updated_at");
+
+    let snapshot = load_snapshot(&db.pool).await.expect("snapshot");
+    let response = list(&db.pool, &snapshot, query("10")).await;
+    assert_eq!(response.items.len(), 3);
+
+    for item in &response.items {
+        let first_seen_at = item
+            .first_seen_at
+            .expect("first_seen_at on every list item");
+        let updated_at = item.updated_at.expect("updated_at on every list item");
+        assert_eq!(first_seen_at, first_seen.timestamp_millis());
+        assert!(
+            updated_at >= first_seen_at,
+            "updated_at must not precede first_seen_at"
+        );
+    }
+
+    // Field names and millisecond encoding match the live feed's items.
+    let item = response
+        .items
+        .iter()
+        .find(|item| item.source_tx_hash.as_deref() == Some("list-tx-2"))
+        .expect("updated row");
+    let json = serde_json::to_value(item).expect("item json");
+    assert_eq!(json["first_seen_at"], first_seen.timestamp_millis());
+    assert_eq!(json["updated_at"], updated.timestamp_millis());
+}
+
+#[tokio::test]
 async fn pagination_visits_every_row_once_including_duplicate_timestamps() {
     let db = test_db().await;
     for seq in 1..=23_i64 {

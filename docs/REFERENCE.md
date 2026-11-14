@@ -1023,8 +1023,16 @@ GET /api/v2/transfers?limit=50&direction=Inbound&status=Completed&chain=ethereum
 
 Pagination is keyset over `(created_at DESC, id DESC)`: no `OFFSET`, and rows
 with identical `created_at` are visited exactly once. The ordering key is the
-time the indexer stored the row, not block time. `from`/`to` combine with the
-cursor as additional bounds. Errors: 400 `BAD_REQUEST` (invalid limit, cursor,
+time the indexer stored the row, not block time.
+
+Each item also carries `first_seen_at` and `updated_at`, in epoch milliseconds,
+under the same names the live feed uses. `first_seen_at` is
+`bridge_transfers.created_at` (the same instant as the ordering key) and
+`updated_at` is the last write to the row, so `updated_at >= first_seen_at`
+always holds. `/api/v2/transactions/analyse` returns the same transfer object:
+both fields are integers when the response is built from a stored row, and
+`null` on the v1-analysis fallback, where no row has been stored yet. `from`/`to`
+combine with the cursor as additional bounds. Errors: 400 `BAD_REQUEST` (invalid limit, cursor,
 timestamp; unknown chain, direction, status, protocol; `from >= to`), 500 `INTERNAL_ERROR`.
 No cache on this path. Plans and the one added index:
 [3g-list-endpoint.md](3g-list-endpoint.md).

@@ -801,6 +801,10 @@ pub struct StoredTransfer {
     pub sequence: Option<String>,
     pub cctp_source_domain: Option<i32>,
     pub cctp_nonce: Option<String>,
+    /// `bridge_transfers.created_at`: when the indexer first stored the row.
+    pub first_seen_at: DateTime<Utc>,
+    /// `bridge_transfers.updated_at`: the last write to the row.
+    pub updated_at: DateTime<Utc>,
 }
 
 pub struct StoredTransactionWithTransfers {
@@ -818,6 +822,7 @@ pub async fn get_transaction_with_transfers(
         r#"
         SELECT t.hash, t.chain, t.status AS tx_status, t.slot, t.timestamp,
                t.fee_lamports, t.signer,
+               b.created_at AS first_seen_at, b.updated_at,
                b.program, b.protocol, b.message_key, b.direction, b.observed_tx_hash, b.event_index,
                b.via, b.via_ref,
                b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
@@ -891,6 +896,8 @@ pub async fn get_transaction_with_transfers(
             sequence: row.try_get("sequence")?,
             cctp_source_domain: row.try_get("cctp_source_domain")?,
             cctp_nonce: row.try_get("cctp_nonce")?,
+            first_seen_at: row.try_get("first_seen_at")?,
+            updated_at: row.try_get("updated_at")?,
         });
     }
 
@@ -927,7 +934,7 @@ pub struct ListedTransfer {
 }
 
 const LIST_SELECT: &str = r#"
-SELECT b.id, b.created_at,
+SELECT b.id, b.created_at, b.created_at AS first_seen_at, b.updated_at,
        b.program, b.protocol, b.message_key, b.direction, b.observed_tx_hash, b.event_index,
        b.via, b.via_ref,
        b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
@@ -1024,6 +1031,8 @@ pub async fn list_transfers(
             sequence: row.try_get("sequence")?,
             cctp_source_domain: row.try_get("cctp_source_domain")?,
             cctp_nonce: row.try_get("cctp_nonce")?,
+            first_seen_at: row.try_get("first_seen_at")?,
+            updated_at: row.try_get("updated_at")?,
         };
         listed.push(ListedTransfer {
             id: row.try_get("id")?,

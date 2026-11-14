@@ -170,6 +170,8 @@ fn the_v2_message_id_is_the_origin_domain_and_the_32_byte_nonce() {
             sequence: None,
             cctp_source_domain: Some(0),
             cctp_nonce: Some(nonce.clone()),
+            first_seen_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
         }],
     };
 

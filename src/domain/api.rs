@@ -61,6 +61,12 @@ pub struct TransferView {
     pub amount_raw: Option<String>,
     pub amount_formatted: Option<String>,
     pub status: TransferStatus,
+    /// When the indexer first stored this row, in epoch milliseconds. Always present
+    /// on list items; `null` only on the analyse path when no row has been stored.
+    pub first_seen_at: Option<i64>,
+    /// Last write to the stored row, in epoch milliseconds. Always `>= first_seen_at`
+    /// and always present on list items; `null` only when `first_seen_at` is.
+    pub updated_at: Option<i64>,
 }
 
 /// A chain as the protocol wrote it, plus the registry's answer when it knows one.

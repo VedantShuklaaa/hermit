@@ -186,6 +186,8 @@ fn stored(name: &str, current: &Current) -> StoredTransactionWithTransfers {
             sequence: Some(bridge.message_id.sequence.to_string()),
             cctp_source_domain: None,
             cctp_nonce: None,
+            first_seen_at: DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            updated_at: DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
         }],
     }
 }
