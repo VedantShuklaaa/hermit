@@ -82,6 +82,8 @@ fn test_config(
             rewind_slots: 20,
             dedupe_ttl_secs: 0,
             ping_secs: 30,
+            connect_stagger_ms: 0,
+            max_ws_connections: None,
             watchdog_secs: 90,
             poll_secs: 300,
             poll_overlap_secs: 600,

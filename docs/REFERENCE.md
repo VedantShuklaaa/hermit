@@ -1196,7 +1196,14 @@ scrape_configs:
 * **Ingestion (A8):** `INGEST_ENABLED` (default on, `0` is a kill switch),
   `LIVE_BACKFILL` (default on), `INGEST_BACKFILL_MAX` (5000),
   `INGEST_BACKFILL_PACE_MS` (750), `INGEST_REWIND_SLOTS` (20),
-  `INGEST_DEDUPE_TTL_SECS` (7200, `0` disables). On every (re)connect the
+  `INGEST_DEDUPE_TTL_SECS` (7200, `0` disables). Startup connects each
+  program's subscription `INGEST_CONNECT_STAGGER_MS` (500, `0` connects them
+  together) after the one before it, and `INGEST_MAX_WS_CONNECTIONS` (unset is
+  unlimited, `0` keeps none) caps how many programs hold a live connection; a
+  program past the cap warns once at startup and is left to the reconciliation
+  poll. A dropped
+  connection reconnects after 5 s plus up to 2.5 s of jitter, so programs that
+  dropped together do not reconnect together. On every (re)connect the
   backfill runs concurrently with the read loop (4c) as a task owned by that
   connection, starting `INGEST_REWIND_SLOTS` slots before the checkpoint (floored
   at 0). While it is unfinished, live notifications publish normally but do not
@@ -1209,7 +1216,8 @@ scrape_configs:
   minutes, hence the 2 h dedupe TTL. See [4c-concurrent-backfill.md](4c-concurrent-backfill.md).
 * **Poll (4f):** `INGEST_POLL_SECS` (300, min 30), `INGEST_POLL_OVERLAP_SECS`
   (600), `INGEST_POLL_OFFSET_SECS` (180), `INGEST_POLL_MAX_PUBLISH` (500). Only
-  active when `INGEST_ENABLED` is on.
+  active when `INGEST_ENABLED` is on. It scans every registered program, so a
+  program over the `INGEST_MAX_WS_CONNECTIONS` cap is still reconciled.
 * **Worker patience:** `HELIUS_LIVE_TOKEN_WAIT_MS` (20000), `WORKER_MAX_DELIVERIES`
   (10), `WORKER_RECLAIM_IDLE_MS` (300000), `WORKER_RECLAIM_INTERVAL_SECS` (30),
   `CONSUMER_COUNT` (5), `CONSUMER_READ_COUNT` (10), `DB_POOL_MAX` (20). The 3f

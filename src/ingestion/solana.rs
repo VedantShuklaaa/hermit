@@ -224,6 +224,40 @@ fn redact_ws_url(text: &str, ws_url: &str) -> String {
     }
 }
 
+/// Base wait before reconnecting a dropped WebSocket. Programs that dropped together
+/// would otherwise reconnect in lockstep, so a jitter is added on top.
+const RECONNECT_BASE: Duration = Duration::from_secs(5);
+
+/// Reconnect delay: the base plus up to half of it, the jitter style the Helius retry
+/// loop already uses.
+fn reconnect_backoff(base: Duration) -> Duration {
+    let jitter = rand::random::<u64>() % (base.as_millis() as u64 / 2 + 1);
+    base + Duration::from_millis(jitter)
+}
+
+/// Splits the configured programs into the ones that get a live connection and the
+/// ones `INGEST_MAX_WS_CONNECTIONS` skips, and gives each live one its startup delay.
+/// Config order decides the cut, so the same programs are kept on every restart.
+fn plan_connections(
+    programs: &[String],
+    max_connections: Option<usize>,
+    stagger_ms: u64,
+) -> (Vec<(&str, Duration)>, Vec<&str>) {
+    let cut = max_connections.map_or(programs.len(), |max| max.min(programs.len()));
+    let (live, skipped) = programs.split_at(cut);
+
+    let live = live
+        .iter()
+        .enumerate()
+        .map(|(index, program)| {
+            let delay = Duration::from_millis(stagger_ms.saturating_mul(index as u64));
+            (program.as_str(), delay)
+        })
+        .collect();
+
+    (live, skipped.iter().map(String::as_str).collect())
+}
+
 #[derive(Clone)]
 pub struct SolanaIngester {
     ws_url: String,
@@ -266,12 +300,33 @@ impl SolanaIngester {
             return Ok(());
         }
 
-        for program in &self.programs {
+        let (live, skipped) = plan_connections(
+            &self.programs,
+            self.config.max_ws_connections,
+            self.config.connect_stagger_ms,
+        );
+
+        for program in skipped {
+            warn!(
+                program,
+                max = ?self.config.max_ws_connections,
+                "no live WebSocket connection: INGEST_MAX_WS_CONNECTIONS was reached; the reconciliation poll still covers this program"
+            );
+        }
+
+        for (program, delay) in live {
             let ingester = self.clone();
-            let program = program.clone();
+            let program = program.to_string();
             let program_stop = stop.clone();
 
             tokio::spawn(async move {
+                // Spread the first connects: a provider can refuse the whole key when
+                // every program connects inside the same instant.
+                tokio::select! {
+                    _ = program_stop.cancelled() => return,
+                    _ = sleep(delay) => {}
+                }
+
                 loop {
                     let task_ingester = ingester.clone();
                     let task_program = program.clone();
@@ -335,7 +390,7 @@ impl SolanaIngester {
 
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
-                _ = sleep(Duration::from_secs(5)) => {}
+                _ = sleep(reconnect_backoff(RECONNECT_BASE)) => {}
             }
         }
     }
@@ -889,6 +944,62 @@ mod tests {
 
     fn frame(text: &str) -> Message {
         Message::Text(text.to_owned())
+    }
+
+    fn programs(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn staggers_connections_by_config_order() {
+        let programs = programs(&["a", "b", "c"]);
+
+        let (live, skipped) = plan_connections(&programs, None, 500);
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            live,
+            vec![
+                ("a", Duration::ZERO),
+                ("b", Duration::from_millis(500)),
+                ("c", Duration::from_millis(1000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn caps_live_connections_to_the_first_programs_in_config_order() {
+        let programs = programs(&["a", "b", "c", "d"]);
+
+        let (live, skipped) = plan_connections(&programs, Some(2), 500);
+
+        assert_eq!(
+            live,
+            vec![("a", Duration::ZERO), ("b", Duration::from_millis(500))]
+        );
+        assert_eq!(skipped, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn a_cap_wider_than_the_list_skips_nothing() {
+        let programs = programs(&["a", "b"]);
+
+        let (live, skipped) = plan_connections(&programs, Some(10), 500);
+
+        assert_eq!(live.len(), 2);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn reconnect_backoff_stays_inside_its_jitter_window() {
+        let base = Duration::from_secs(5);
+
+        for _ in 0..100 {
+            let delay = reconnect_backoff(base);
+
+            assert!(delay >= base, "{delay:?}");
+            assert!(delay <= base + Duration::from_millis(2500), "{delay:?}");
+        }
     }
 
     #[test]
