@@ -31,6 +31,7 @@ fn transfer(sequence: u64, event_index: u16, destination: ChainId) -> DecodedTra
                 sequence,
             },
             direction: Direction::Outbound,
+            delivered: false,
             observed_tx: HASH.to_string(),
             event_index,
             source: RawChainRef::wormhole(1),

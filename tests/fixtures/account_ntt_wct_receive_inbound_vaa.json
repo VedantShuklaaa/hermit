@@ -1,0 +1,17 @@
+{
+  "context": {
+    "apiVersion": "4.4.0",
+    "slot": 469276473
+  },
+  "value": {
+    "data": [
+      "dmFhAcpvYfBqWWJV5C8iEwZGCR589XriaV+XBGmPV4vnOoMaOHMC0782ZvBqAAAAABoDAAAAAAAAHgAAAAAAAAAAAAAAAAA8sdOkSaho3Yv4+JKECINlQ/4qaNkAAACZRf8QAAAAAAAAAAAAAAAAFkvjA0gPVCM2vgu+BDKhO4Xm/RsLwc2eRWmd/YfAClYpjcci+QEycV6lunpQXkW8W8EpewCRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+MAAAAAAAAAAAAAAAD88xp293FUf3UXU/RAFEM5Ut/X+ABPmU5UVAgAAABC/KlB3wAAAAAAAAAAAAAAAO9EYYkd+zrIVyzPfHlGZKjdknlFfqdM9YDELTU569LolZ/ClSK8Cpb5bjEXk60+Ra1vVRsAAQAA",
+      "base64"
+    ],
+    "executable": false,
+    "lamports": 2235200,
+    "owner": "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth",
+    "rentEpoch": 18446744073709551615,
+    "space": 312
+  }
+}

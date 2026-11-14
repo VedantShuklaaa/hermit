@@ -62,6 +62,11 @@ fn wormhole_id(chain: &RawChainRef) -> Result<u16, AppError> {
 /// detection: the observed Solana tx succeeded (adapters reject a failed tx) and it is
 /// the destination side of the transfer, so there is nothing left to wait for. Its source
 /// tx is on the origin chain and unknown until enrichment or the EVM log watcher learns it.
+///
+/// An NTT receive is `Completed` only when the same tx also carries
+/// `release_inbound_mint` or `release_inbound_unlock`: the adapter sets `delivered` for
+/// that. A receive on its own only attests the message, so its row stays `Pending` and
+/// keeps both tx hashes empty, as does a release that arrives in a later tx (not indexed).
 pub fn to_bridge_transfer(
     d: &DetectedTransfer,
     metadata: Option<TokenMetadata>,
@@ -85,6 +90,8 @@ pub fn to_bridge_transfer(
     let raw_amount: Option<u128> = d.amount_raw.as_ref().and_then(|a| a.as_str().parse().ok());
     let decimals = metadata.as_ref().and_then(|m| m.decimals);
     let inbound = d.direction == Direction::Inbound;
+    // Only an inbound leg whose tx moved the tokens on Solana is complete.
+    let completed_inbound = inbound && d.delivered;
 
     Ok(BridgeTransfer {
         program: d.program.clone(),
@@ -96,8 +103,8 @@ pub fn to_bridge_transfer(
             .flatten(),
         destination_chain: ChainId::from_wormhole_id(destination_id),
         destination_wallet: d.destination_wallet.clone(),
-        destination_tx_hash: inbound.then(|| d.observed_tx.clone()),
-        destination_explorer_url: inbound
+        destination_tx_hash: completed_inbound.then(|| d.observed_tx.clone()),
+        destination_explorer_url: completed_inbound
             .then(|| chains.explorer_tx_url_for(&d.destination, &d.observed_tx))
             .flatten(),
         token: d.token.as_ref().map(|t| t.address.clone()),
@@ -113,7 +120,7 @@ pub fn to_bridge_transfer(
             emitter_address: emitter_address.clone(),
             sequence: *sequence,
         },
-        status: if inbound {
+        status: if completed_inbound {
             BridgeStatus::Completed
         } else {
             BridgeStatus::Pending
@@ -405,6 +412,7 @@ mod tests {
                 sequence: 42,
             },
             direction: Direction::Outbound,
+            delivered: false,
             observed_tx: "sig".into(),
             event_index: 0,
             source: RawChainRef::wormhole(1),
@@ -748,6 +756,7 @@ mod tests {
     fn inbound() -> DetectedTransfer {
         DetectedTransfer {
             direction: Direction::Inbound,
+            delivered: true,
             observed_tx: "redeem".into(),
             source: RawChainRef::wormhole(2),
             destination: RawChainRef::wormhole(1),

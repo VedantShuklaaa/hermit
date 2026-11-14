@@ -555,6 +555,7 @@ fn decoded(
             sequence: SEQUENCE,
         },
         direction,
+        delivered: direction == Direction::Inbound,
         observed_tx: observed_tx.to_string(),
         event_index: 0,
         source: bridge::chains::RawChainRef::wormhole(source),

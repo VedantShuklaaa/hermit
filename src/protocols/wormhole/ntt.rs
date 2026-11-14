@@ -1,5 +1,5 @@
-//! Wormhole Native Token Transfers (NTT) outbound adapter for Solana. Pure: no IO,
-//! no clock, no database.
+//! Wormhole Native Token Transfers (NTT) adapter for Solana, both directions. Pure: no
+//! IO, no clock, no database.
 //!
 //! Verification sources:
 //!
@@ -26,12 +26,20 @@
 //! namespace as the Token Bridge. The adapter takes the emitter address from the
 //! core bridge `PostMessage` accounts instead of re-deriving it, so the key matches
 //! the signed VAA. `transfer_burn` and `transfer_lock` are part of the same flow but
-//! carry no message, and every other instruction is admin or the inbound receive
-//! path.
+//! carry no message, and every other instruction is admin.
 //!
-//! Inbound NTT (`receive_wormhole_message`) is not indexed yet.
+//! Inbound transfers are decoded from `receive_wormhole_message`. Its fourth account
+//! is the posted VAA (owned by the core bridge), which the fetch step preloads after
+//! asking [`BridgeAdapter::required_accounts`]. The VAA carries the TransceiverMessage
+//! and NativeTokenTransfer, and its identity (emitter chain, emitter address, sequence)
+//! is the same one the outbound side uses, so the two legs converge on one row.
+//! `receive_wormhole_message` only attests the message; `redeem` attests it to the
+//! transceiver and `release_inbound_mint` / `release_inbound_unlock` move the tokens.
+//! A release in the receive's own tx marks the detection delivered, so the row is
+//! Completed. A release in a later tx is not indexed, so that row stays Pending (see
+//! the README's known gaps).
 
-use super::{SOLANA, pair_post_messages};
+use super::{CORE_BRIDGE, SOLANA, exec_key, pair_post_messages, posted_vaa};
 use crate::chains::RawChainRef;
 use crate::protocols::amount::RawAmount;
 use crate::protocols::{
@@ -46,6 +54,18 @@ const RELEASE_WORMHOLE_OUTBOUND: [u8; 8] = [0xca, 0x57, 0x33, 0xad, 0x8e, 0xa0, 
 const TRANSFER_BURN: [u8; 8] = [0x4b, 0x90, 0x1a, 0xe8, 0x27, 0x0c, 0x4b, 0xde];
 /// Anchor discriminator for `transfer_lock` (the first step of a lock-mode send).
 const TRANSFER_LOCK: [u8; 8] = [0xb3, 0x9e, 0x92, 0x94, 0x97, 0x2e, 0xb0, 0xc8];
+/// Anchor discriminator for `receive_wormhole_message` (the inbound attest step).
+const RECEIVE_WORMHOLE_MESSAGE: [u8; 8] = [0x86, 0xd5, 0x8f, 0x44, 0xeb, 0x66, 0xe8, 0x60];
+/// Anchor discriminator for `redeem` (validates an attested inbound message).
+const REDEEM: [u8; 8] = [0xb8, 0x0c, 0x56, 0x95, 0x46, 0xc4, 0x61, 0xe1];
+/// Anchor discriminator for `release_inbound_mint`.
+const RELEASE_INBOUND_MINT: [u8; 8] = [0x0c, 0xe9, 0x4a, 0x41, 0x3c, 0xa8, 0x31, 0x78];
+/// Anchor discriminator for `release_inbound_unlock`.
+const RELEASE_INBOUND_UNLOCK: [u8; 8] = [0xb6, 0xa2, 0x3e, 0xce, 0xc5, 0x89, 0x53, 0x62];
+
+/// Index of the posted VAA among `receive_wormhole_message` accounts:
+/// payer, config, peer, vaa, transceiver_message, system_program.
+const RECEIVE_VAA_ACCOUNT: usize = 3;
 
 /// TransceiverMessage prefix: `0x9945FF10`.
 const TRANSCEIVER_PREFIX: [u8; 4] = [0x99, 0x45, 0xFF, 0x10];
@@ -104,7 +124,10 @@ impl BridgeAdapter for NttAdapter {
         }
 
         let mut outbound = Vec::new();
+        let mut inbound = Vec::new();
         let mut prepared = false;
+        let mut followup = false;
+        let mut released = false;
         let mut other = false;
         for &pos in &ntt_ixs {
             let Some(discriminator) = tx.instructions[pos].data.get(..8) else {
@@ -112,29 +135,71 @@ impl BridgeAdapter for NttAdapter {
             };
             if discriminator == RELEASE_WORMHOLE_OUTBOUND {
                 outbound.push(pos);
+            } else if discriminator == RECEIVE_WORMHOLE_MESSAGE {
+                inbound.push(pos);
             } else if discriminator == TRANSFER_BURN || discriminator == TRANSFER_LOCK {
                 // The burn or lock step of a send. It moves tokens but posts no
                 // message, so on its own it is not an indexed transfer.
                 prepared = true;
+            } else if discriminator == RELEASE_INBOUND_MINT
+                || discriminator == RELEASE_INBOUND_UNLOCK
+            {
+                // The token-moving step of an already-attested inbound message. It
+                // carries no message of its own; the receive is what is indexed, and
+                // its presence in the same tx is what makes that row `Completed`.
+                followup = true;
+                released = true;
+            } else if discriminator == REDEEM {
+                // Attests the message to the transceiver. It moves no tokens, so on
+                // its own it does not complete the receive.
+                followup = true;
             } else {
                 other = true;
             }
         }
 
-        if outbound.is_empty() {
+        if outbound.is_empty() && inbound.is_empty() {
             return Classification::Rejected(Reject::NotTransfer(if prepared {
                 "ntt transfer_burn or transfer_lock is not a message"
+            } else if followup {
+                "ntt redeem or release_inbound is not a receive_wormhole_message"
             } else if other {
-                "ntt instruction is not a release_wormhole_outbound"
+                "ntt instruction is neither a release_wormhole_outbound nor a receive_wormhole_message"
             } else {
-                "no release_wormhole_outbound instruction"
+                "no ntt message instruction"
             }));
         }
 
-        match decode_outbound(tx, &outbound) {
-            Ok(transfers) => Classification::Transfers(transfers),
-            Err(reject) => Classification::Rejected(reject),
+        let mut transfers = Vec::new();
+        if !outbound.is_empty() {
+            match decode_outbound(tx, &outbound) {
+                Ok(found) => transfers.extend(found),
+                Err(reject) => return Classification::Rejected(reject),
+            }
         }
+        if !inbound.is_empty() {
+            match decode_inbound(tx, &inbound, transfers.len(), released) {
+                Ok(found) => transfers.extend(found),
+                Err(reject) => return Classification::Rejected(reject),
+            }
+        }
+        Classification::Transfers(transfers)
+    }
+
+    fn required_accounts(&self, tx: &SolanaTx) -> Vec<String> {
+        if tx.failed {
+            return Vec::new();
+        }
+        let mut keys: Vec<String> = tx
+            .instructions
+            .iter()
+            .filter(|ix| self.programs.iter().any(|p| p == &ix.program_id))
+            .filter(|ix| ix.data.get(..8) == Some(RECEIVE_WORMHOLE_MESSAGE.as_slice()))
+            .filter_map(|ix| ix.accounts.get(RECEIVE_VAA_ACCOUNT).cloned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 }
 
@@ -154,6 +219,7 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
                 sequence: message.sequence,
             },
             direction: Direction::Outbound,
+            delivered: false,
             observed_tx: tx.signature.clone(),
             event_index: event_index as u16,
             source: RawChainRef::wormhole(SOLANA),
@@ -173,8 +239,86 @@ fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTran
     Ok(transfers)
 }
 
+/// Receives into Solana. The identity and transfer come from the posted VAA account
+/// the instruction was given. `first_index` continues the event index after any
+/// outbound transfers decoded from the same tx.
+fn decode_inbound(
+    tx: &SolanaTx,
+    inbound: &[usize],
+    first_index: usize,
+    released: bool,
+) -> Result<Vec<DetectedTransfer>, Reject> {
+    let mut ordered = inbound.to_vec();
+    ordered.sort_by_key(|&pos| exec_key(tx, pos));
+
+    let mut transfers = Vec::with_capacity(ordered.len());
+    for (n, &pos) in ordered.iter().enumerate() {
+        let vaa_key = tx.instructions[pos]
+            .accounts
+            .get(RECEIVE_VAA_ACCOUNT)
+            .ok_or(Reject::Malformed(
+                "receive_wormhole_message without a VAA account",
+            ))?;
+        let account = tx.account(vaa_key).ok_or(Reject::Unsupported(
+            "inbound receive: posted VAA account was not loaded",
+        ))?;
+        // The manager accepts only a core bridge account, so this is a consistency
+        // check on what the fetch step returned.
+        if account.owner != CORE_BRIDGE {
+            return Err(Reject::Malformed(
+                "VAA account is not owned by the core bridge",
+            ));
+        }
+        let vaa = posted_vaa::parse(&account.data)
+            .ok_or(Reject::Malformed("VAA account does not parse"))?;
+        let decoded = parse_payload(vaa.payload)?;
+        if decoded.to_chain != SOLANA {
+            return Err(Reject::Malformed(
+                "receive payload is not addressed to Solana",
+            ));
+        }
+
+        let source_chain = vaa.emitter_chain;
+        let to_hex = hex::encode(decoded.to);
+        let sender_hex = hex::encode(decoded.sender);
+        let token_hex = hex::encode(decoded.source_token);
+
+        transfers.push(DetectedTransfer {
+            program: NTT_PROGRAM.to_string(),
+            message: MessageId::Wormhole {
+                emitter_chain: source_chain,
+                emitter_address: hex::encode(vaa.emitter_address),
+                sequence: vaa.sequence,
+            },
+            direction: Direction::Inbound,
+            // The receive only attests the message. The tokens moved here only if the
+            // same tx also carries release_inbound_mint or release_inbound_unlock.
+            delivered: released,
+            observed_tx: tx.signature.clone(),
+            event_index: (first_index + n) as u16,
+            source: RawChainRef::wormhole(source_chain),
+            destination: RawChainRef::wormhole(SOLANA),
+            // The NttManagerMessage carries the sender on the origin chain.
+            source_wallet: decode_destination_address(source_chain, &sender_hex),
+            destination_wallet: decode_destination_address(SOLANA, &to_hex),
+            // The payload names the token on the origin chain, as the Token Bridge
+            // payload does. The local mint is the deployment's and is not in the VAA.
+            token: decode_destination_address(source_chain, &token_hex).map(|address| TokenRef {
+                chain: RawChainRef::wormhole(source_chain),
+                address,
+            }),
+            token_symbol: None,
+            amount_raw: Some(RawAmount::from_u128(u128::from(decoded.amount))),
+            via: None,
+        });
+    }
+    Ok(transfers)
+}
+
 struct NativeTransfer {
     amount: u64,
+    /// The sender on the source chain, from the NttManagerMessage.
+    sender: [u8; 32],
     source_token: [u8; 32],
     to: [u8; 32],
     to_chain: u16,
@@ -241,6 +385,7 @@ fn parse_payload(p: &[u8]) -> Result<NativeTransfer, Reject> {
 
     Ok(NativeTransfer {
         amount,
+        sender: word(manager, 32)?,
         source_token: word(native, 13)?,
         to: word(native, 45)?,
         to_chain: u16::from_be_bytes([native[77], native[78]]),
@@ -263,9 +408,9 @@ fn word(data: &[u8], at: usize) -> Result<[u8; 32], Reject> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::Instruction;
     use crate::protocols::registry::ProtocolRegistry;
-    use crate::protocols::wormhole::{CORE_BRIDGE, CORE_POST_MESSAGE};
+    use crate::protocols::wormhole::{CORE_BRIDGE, CORE_POST_MESSAGE, TOKEN_BRIDGE};
+    use crate::protocols::{AccountData, Instruction};
     use std::sync::Arc;
 
     const MANAGER: &str = "nttLq3ZsKu9uAFWuBGksdZTPAjkMRyPkxp61CJPsntA";
@@ -335,6 +480,57 @@ mod tests {
         data.extend_from_slice(payload);
         data.push(1); // consistency level
         data
+    }
+
+    const VAA_KEY: &str = "PostedVaa1111111111111111111111111111111";
+
+    fn receive_data() -> Vec<u8> {
+        RECEIVE_WORMHOLE_MESSAGE.to_vec()
+    }
+
+    /// A core bridge posted VAA account around an NTT transceiver payload.
+    fn posted_vaa_bytes(sequence: u64, chain: u16, emitter: [u8; 32], payload: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"vaa");
+        d.push(1); // version
+        d.push(1); // consistency level
+        d.extend_from_slice(&1u32.to_le_bytes()); // vaa time
+        d.extend_from_slice(&[7; 32]); // signature set
+        d.extend_from_slice(&2u32.to_le_bytes()); // submission time
+        d.extend_from_slice(&3u32.to_le_bytes()); // nonce
+        d.extend_from_slice(&sequence.to_le_bytes());
+        d.extend_from_slice(&chain.to_le_bytes());
+        d.extend_from_slice(&emitter);
+        d.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        d.extend_from_slice(payload);
+        d
+    }
+
+    fn receive_tx(payload: Vec<u8>, sequence: u64, chain: u16, emitter: [u8; 32]) -> SolanaTx {
+        let mut t = tx(
+            vec![ix(
+                MANAGER,
+                &[
+                    USER,
+                    "config",
+                    "peer",
+                    VAA_KEY,
+                    "transceiverMessage",
+                    "system",
+                ],
+                receive_data(),
+                None,
+            )],
+            vec![],
+        );
+        t.accounts.insert(
+            VAA_KEY.into(),
+            AccountData {
+                owner: CORE_BRIDGE.into(),
+                data: posted_vaa_bytes(sequence, chain, emitter, &payload),
+            },
+        );
+        t
     }
 
     fn core_accounts(emitter: &str) -> [&str; 9] {
@@ -475,8 +671,6 @@ mod tests {
 
     #[test]
     fn another_program_is_not_an_ntt_instruction() {
-        use crate::protocols::wormhole::TOKEN_BRIDGE;
-
         let t = tx(vec![ix(TOKEN_BRIDGE, &[USER], vec![5], None)], vec![]);
         assert_eq!(
             adapter().classify(&t),
@@ -575,6 +769,10 @@ mod tests {
         assert_eq!(hex::encode(RELEASE_WORMHOLE_OUTBOUND), "ca5733ad8ea0bccc");
         assert_eq!(hex::encode(TRANSFER_BURN), "4b901ae8270c4bde");
         assert_eq!(hex::encode(TRANSFER_LOCK), "b39e9294972eb0c8");
+        assert_eq!(hex::encode(RECEIVE_WORMHOLE_MESSAGE), "86d58f44eb66e860");
+        assert_eq!(hex::encode(REDEEM), "b80c569546c461e1");
+        assert_eq!(hex::encode(RELEASE_INBOUND_MINT), "0ce94a413ca83178");
+        assert_eq!(hex::encode(RELEASE_INBOUND_UNLOCK), "b6a23ecec5895362");
     }
 
     #[test]
@@ -639,5 +837,185 @@ mod tests {
         // 79 fixed bytes: 4 prefix, 1 decimals, 8 amount, 32 source token, 32 to, 2 chain.
         assert_eq!(NATIVE_TRANSFER_FIXED, 79);
         assert_eq!(NATIVE_TRANSFER_AT + 2 + NATIVE_TRANSFER_FIXED, 145);
+    }
+
+    #[test]
+    fn decodes_a_receive_wormhole_message_as_inbound() {
+        let token = [0x07; 32];
+        let to = [0x2b; 32];
+        let t = only_transfer(adapter().classify(&receive_tx(
+            native_payload(8, 15_585_875_623, token, to, 1),
+            794,
+            30,
+            [0xAA; 32],
+        )));
+
+        assert_eq!(t.program, NTT_PROGRAM);
+        assert_eq!(t.direction, Direction::Inbound);
+        assert_eq!(t.observed_tx, "sig");
+        assert_eq!(t.event_index, 0);
+        assert_eq!(t.source, RawChainRef::wormhole(30));
+        assert_eq!(t.destination, RawChainRef::wormhole(1));
+        let expected_sender = format!("0x{}", "22".repeat(20));
+        let expected_recipient = bs58::encode(to).into_string();
+        assert_eq!(t.source_wallet.as_deref(), Some(expected_sender.as_str()));
+        assert_eq!(
+            t.destination_wallet.as_deref(),
+            Some(expected_recipient.as_str())
+        );
+        assert_eq!(t.amount_raw.unwrap().as_str(), "15585875623");
+        assert_eq!(t.token_symbol, None);
+        assert_eq!(t.via, None);
+        assert!(!t.delivered, "a bare receive has not released the tokens");
+        let token_ref = t.token.unwrap();
+        assert_eq!(token_ref.chain, RawChainRef::wormhole(30));
+        assert_eq!(token_ref.address, format!("0x{}", "07".repeat(20)));
+        assert_eq!(
+            t.message,
+            MessageId::Wormhole {
+                emitter_chain: 30,
+                emitter_address: "aa".repeat(32),
+                sequence: 794,
+            }
+        );
+    }
+
+    #[test]
+    fn a_receive_without_a_loaded_vaa_account_is_unsupported() {
+        let mut t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 1), 1, 2, [3; 32]);
+        t.accounts.clear();
+        assert_eq!(
+            adapter().classify(&t),
+            Classification::Rejected(Reject::Unsupported(
+                "inbound receive: posted VAA account was not loaded"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_vaa_account_owned_by_another_program_is_malformed() {
+        let mut t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 1), 1, 2, [3; 32]);
+        t.accounts.get_mut(VAA_KEY).unwrap().owner = TOKEN_BRIDGE.into();
+        assert_eq!(
+            adapter().classify(&t),
+            Classification::Rejected(Reject::Malformed(
+                "VAA account is not owned by the core bridge"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_receive_payload_for_another_chain_is_malformed() {
+        let t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 30), 1, 2, [3; 32]);
+        assert_eq!(
+            adapter().classify(&t),
+            Classification::Rejected(Reject::Malformed(
+                "receive payload is not addressed to Solana"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_receive_with_broken_vaa_data_is_malformed() {
+        let mut t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 1), 1, 2, [3; 32]);
+        t.accounts.get_mut(VAA_KEY).unwrap().data = vec![1, 2, 3];
+        assert_eq!(
+            adapter().classify(&t),
+            Classification::Rejected(Reject::Malformed("VAA account does not parse"))
+        );
+    }
+
+    #[test]
+    fn required_accounts_asks_for_the_posted_vaa() {
+        let t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 1), 1, 2, [3; 32]);
+        assert_eq!(adapter().required_accounts(&t), vec![VAA_KEY.to_string()]);
+
+        let mut failed = t.clone();
+        failed.failed = true;
+        assert!(adapter().required_accounts(&failed).is_empty());
+        assert!(
+            adapter()
+                .required_accounts(&simple_release(
+                    native_payload(8, 1, [1; 32], [2; 32], 30),
+                    1
+                ))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_redeem_or_release_without_a_receive_is_not_a_transfer() {
+        for discriminator in [REDEEM, RELEASE_INBOUND_MINT, RELEASE_INBOUND_UNLOCK] {
+            let t = tx(
+                vec![ix(MANAGER, &[USER], discriminator.to_vec(), None)],
+                vec![],
+            );
+            assert_eq!(
+                adapter().classify(&t),
+                Classification::Rejected(Reject::NotTransfer(
+                    "ntt redeem or release_inbound is not a receive_wormhole_message"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_receive_alongside_its_redeem_and_release_is_one_inbound_transfer() {
+        let mut t = receive_tx(native_payload(8, 5, [1; 32], [2; 32], 1), 794, 30, [3; 32]);
+        t.instructions
+            .push(ix(MANAGER, &[USER], REDEEM.to_vec(), None));
+        let mut release = RELEASE_INBOUND_MINT.to_vec();
+        release.push(1); // ReleaseStatus::Released
+        t.instructions.push(ix(MANAGER, &[USER], release, None));
+
+        let t = only_transfer(adapter().classify(&t));
+        assert_eq!(t.direction, Direction::Inbound);
+        assert_eq!(t.amount_raw.unwrap().as_str(), "5");
+        assert!(t.delivered, "the release in the same tx moved the tokens");
+    }
+
+    #[test]
+    fn a_redeem_without_a_release_does_not_complete_the_receive() {
+        let mut t = receive_tx(native_payload(8, 5, [1; 32], [2; 32], 1), 794, 30, [3; 32]);
+        t.instructions
+            .push(ix(MANAGER, &[USER], REDEEM.to_vec(), None));
+
+        let t = only_transfer(adapter().classify(&t));
+        assert!(
+            !t.delivered,
+            "redeem attests the message but moves no tokens"
+        );
+    }
+
+    #[test]
+    fn a_failed_receive_is_never_a_transfer() {
+        let mut t = receive_tx(native_payload(8, 1, [1; 32], [2; 32], 1), 1, 2, [3; 32]);
+        t.failed = true;
+        assert_eq!(
+            adapter().classify(&t),
+            Classification::Rejected(Reject::NotTransfer("transaction failed"))
+        );
+    }
+
+    #[test]
+    fn an_outbound_and_an_inbound_with_the_same_identity_share_one_row_key() {
+        // The row is keyed by (protocol, message_key). Both directions build the same
+        // Wormhole identity, so the two legs converge instead of writing two rows.
+        let emitter = [0x09; 32];
+        let outbound = only_transfer(adapter().classify(&simple_release(
+            native_payload(8, 5, emitter, [0x2b; 32], 30),
+            439,
+        )));
+        let inbound = only_transfer(adapter().classify(&receive_tx(
+            native_payload(8, 5, [0x07; 32], [0x2b; 32], 1),
+            439,
+            1,
+            emitter,
+        )));
+
+        assert_eq!(outbound.message.key(), inbound.message.key());
+        assert_eq!(outbound.program, inbound.program);
+        assert_eq!(outbound.direction, Direction::Outbound);
+        assert_eq!(inbound.direction, Direction::Inbound);
     }
 }

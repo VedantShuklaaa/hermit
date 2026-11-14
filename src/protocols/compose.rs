@@ -23,6 +23,8 @@ pub fn compose(transfers: Vec<DetectedTransfer>) -> Vec<DetectedTransfer> {
                 if kept.via.is_none() {
                     kept.via = t.via;
                 }
+                // A second observation may be the one that saw the delivery.
+                kept.delivered |= t.delivered;
                 // Fill gaps only; never overwrite what the rail's adapter decoded.
                 if kept.source_wallet.is_none() {
                     kept.source_wallet = t.source_wallet;
@@ -64,6 +66,7 @@ mod tests {
                 sequence: seq,
             },
             direction: Direction::Outbound,
+            delivered: false,
             observed_tx: "sig".into(),
             event_index: 0,
             source: RawChainRef::wormhole(1),

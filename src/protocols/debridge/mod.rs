@@ -187,6 +187,7 @@ fn build_transfer(
             order_id: hex::encode(order_id),
         },
         direction: Direction::Outbound,
+        delivered: false,
         observed_tx: tx.signature.clone(),
         event_index,
         source: source.clone(),
@@ -239,6 +240,8 @@ fn build_fill(
             order_id: hex::encode(order_id),
         },
         direction: Direction::Inbound,
+        // The fill delivered on Solana in this tx.
+        delivered: true,
         observed_tx: tx.signature.clone(),
         event_index,
         source,
