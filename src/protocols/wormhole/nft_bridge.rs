@@ -22,10 +22,7 @@
 //! owned by the core bridge. Without that account an inbound redeem is `Unsupported`.
 
 use super::posted_vaa;
-use super::{
-    CORE_BRIDGE, CORE_EMITTER_ACCOUNT, CORE_POST_MESSAGE, SOLANA, core_sequences, exec_key, parent,
-    post_message_payload,
-};
+use super::{CORE_BRIDGE, SOLANA, exec_key, pair_post_messages};
 use crate::chains::RawChainRef;
 use crate::protocols::amount::RawAmount;
 use crate::protocols::{
@@ -166,80 +163,22 @@ fn redeems(tx: &SolanaTx) -> impl Iterator<Item = &Instruction> {
 }
 
 fn decode_outbound(tx: &SolanaTx, outbound: &[usize]) -> Result<Vec<DetectedTransfer>, Reject> {
-    // Every PostMessage in the tx, in execution order, whoever emitted it. The core
-    // bridge logs one `Sequence:` line per PostMessage, so the k-th message pairs
-    // with the k-th line.
-    let mut core: Vec<usize> = tx
-        .instructions
-        .iter()
-        .enumerate()
-        .filter(|(_, ix)| {
-            ix.program_id == CORE_BRIDGE && ix.data.first() == Some(&CORE_POST_MESSAGE)
-        })
-        .map(|(pos, _)| pos)
-        .collect();
-    core.sort_by_key(|&pos| exec_key(tx, pos));
+    let messages = pair_post_messages(
+        tx,
+        outbound,
+        "no PostMessage under the nft bridge instruction",
+    )?;
+    let mut transfers = Vec::with_capacity(messages.len());
 
-    let sequences = core_sequences(&tx.logs);
-    if sequences.len() != core.len() {
-        return Err(Reject::Malformed(
-            "Sequence log lines do not match PostMessage instructions",
-        ));
-    }
-
-    let mut ordered: Vec<usize> = outbound.to_vec();
-    ordered.sort_by_key(|&pos| exec_key(tx, pos));
-
-    let mut claimed = vec![false; core.len()];
-    let mut transfers = Vec::with_capacity(ordered.len());
-
-    for (event_index, &token_pos) in ordered.iter().enumerate() {
-        let token_ix = &tx.instructions[token_pos];
-        let token_key = exec_key(tx, token_pos);
-        let token_parent = parent(tx, token_pos);
-
-        // The PostMessage this NFT instruction made: same top-level parent, executed
-        // after it, emitted by an account the instruction was given.
-        let rank = core
-            .iter()
-            .enumerate()
-            .find(|&(rank, &core_pos)| {
-                !claimed[rank]
-                    && parent(tx, core_pos) == token_parent
-                    && exec_key(tx, core_pos) > token_key
-                    && tx.instructions[core_pos]
-                        .accounts
-                        .get(CORE_EMITTER_ACCOUNT)
-                        .is_some_and(|emitter| token_ix.accounts.contains(emitter))
-            })
-            .map(|(rank, _)| rank)
-            .ok_or(Reject::Malformed(
-                "no PostMessage under the nft bridge instruction",
-            ))?;
-        claimed[rank] = true;
-
-        let core_ix = &tx.instructions[core[rank]];
-        let emitter = core_ix
-            .accounts
-            .get(CORE_EMITTER_ACCOUNT)
-            .ok_or(Reject::Malformed("PostMessage without an emitter account"))?;
-        let emitter_address = bs58::decode(emitter)
-            .into_vec()
-            .ok()
-            .filter(|b| b.len() == 32)
-            .map(hex::encode)
-            .ok_or(Reject::Malformed("emitter is not a 32 byte address"))?;
-
-        let payload = post_message_payload(&core_ix.data)
-            .ok_or(Reject::Malformed("PostMessage data does not parse"))?;
-        let decoded = parse_payload(payload)?;
+    for (event_index, message) in messages.into_iter().enumerate() {
+        let decoded = parse_payload(message.payload)?;
 
         transfers.push(DetectedTransfer {
             program: NFT_BRIDGE_PROGRAM.to_string(),
             message: MessageId::Wormhole {
                 emitter_chain: SOLANA,
-                emitter_address,
-                sequence: sequences[rank],
+                emitter_address: message.emitter_address,
+                sequence: message.sequence,
             },
             direction: Direction::Outbound,
             observed_tx: tx.signature.clone(),
@@ -409,7 +348,7 @@ fn token_ref(payload: &NftPayload) -> Option<TokenRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::wormhole::TOKEN_BRIDGE;
+    use crate::protocols::wormhole::{CORE_POST_MESSAGE, TOKEN_BRIDGE};
 
     const USER: &str = "UserWallet1111111111111111111111111111111111";
     const OTHER_PROGRAM: &str = "RouterProgram11111111111111111111111111111";

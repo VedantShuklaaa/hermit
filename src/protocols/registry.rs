@@ -5,6 +5,7 @@ use super::cctp::CctpAdapter;
 use super::debridge::DebridgeAdapter;
 use super::wormhole::WormholeAdapter;
 use super::wormhole::nft_bridge::NftBridgeAdapter;
+use super::wormhole::ntt::NttAdapter;
 use super::{BridgeAdapter, Classification, Protocol, SolanaTx};
 
 /// Routes a transaction to every adapter whose program appears anywhere in it,
@@ -122,23 +123,30 @@ pub fn default_registry() -> ProtocolRegistry {
 /// CCTP V2 is opt-in the same way, as a `(message transmitter, token messenger minter)`
 /// pair. Its programs are removed from the Wormhole adapter's set, so a tx is never
 /// classified twice.
+///
+/// NTT is opt-in per deployment: `ntt_programs` lists the programs that host
+/// `release_wormhole_outbound`, and each is removed from the Wormhole adapter's set
+/// for the same reason. An empty list registers no NTT adapter.
 pub fn configured_registry(
     overrides: &[(Protocol, String)],
     token_bridge: &str,
     nft_bridge: Option<&str>,
     cctp: Option<(&str, &str)>,
+    ntt_programs: &[String],
 ) -> ProtocolRegistry {
     let mut registry = ProtocolRegistry::new();
 
     let cctp_ids: Vec<&str> = cctp
         .map(|(transmitter, minter)| vec![transmitter, minter])
         .unwrap_or_default();
+    let ntt_ids: Vec<&str> = ntt_programs.iter().map(String::as_str).collect();
     let mut ids: Vec<String> = overrides
         .iter()
         .filter(|(protocol, id)| {
             *protocol == Protocol::Wormhole
                 && nft_bridge != Some(id.as_str())
                 && !cctp_ids.contains(&id.as_str())
+                && !ntt_ids.contains(&id.as_str())
         })
         .map(|(_, id)| id.clone())
         .collect();
@@ -153,6 +161,13 @@ pub fn configured_registry(
 
     if let Some(id) = nft_bridge {
         registry.register_with_programs(Arc::new(NftBridgeAdapter), vec![id.to_string()]);
+    }
+
+    if !ntt_programs.is_empty() {
+        registry.register_with_programs(
+            Arc::new(NttAdapter::new(ntt_programs.to_vec())),
+            ntt_programs.to_vec(),
+        );
     }
 
     if let Some((transmitter, minter)) = cctp {
@@ -336,7 +351,7 @@ mod tests {
             (Protocol::Wormhole, "ProgramB".to_string()),
         ];
         assert_eq!(
-            configured_registry(&ids, "TokenBridge", None, None).program_ids(),
+            configured_registry(&ids, "TokenBridge", None, None, &[]).program_ids(),
             vec![
                 "ProgramA".to_string(),
                 "ProgramB".to_string(),
@@ -348,7 +363,7 @@ mod tests {
         );
 
         assert_eq!(
-            configured_registry(&[], "TokenBridge", None, None).program_ids(),
+            configured_registry(&[], "TokenBridge", None, None, &[]).program_ids(),
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
@@ -361,7 +376,7 @@ mod tests {
     #[test]
     fn the_nft_bridge_is_registered_only_when_configured() {
         assert_eq!(
-            configured_registry(&[], "TokenBridge", None, None).program_ids(),
+            configured_registry(&[], "TokenBridge", None, None, &[]).program_ids(),
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
@@ -375,6 +390,7 @@ mod tests {
             "TokenBridge",
             Some("NftBridge"),
             None,
+            &[],
         );
         assert_eq!(
             registry.program_ids(),
@@ -394,7 +410,7 @@ mod tests {
     #[test]
     fn the_cctp_programs_are_registered_only_when_configured() {
         assert_eq!(
-            configured_registry(&[], "TokenBridge", None, None).program_ids(),
+            configured_registry(&[], "TokenBridge", None, None, &[]).program_ids(),
             vec![
                 "TokenBridge".to_string(),
                 DLN_DESTINATION.to_string(),
@@ -408,6 +424,7 @@ mod tests {
             "TokenBridge",
             None,
             Some(("MessageTransmitter", "TokenMessenger")),
+            &[],
         );
         assert_eq!(
             registry.program_ids(),
@@ -435,8 +452,56 @@ mod tests {
     }
 
     #[test]
+    fn the_ntt_programs_are_registered_only_when_configured() {
+        assert_eq!(
+            configured_registry(&[], "TokenBridge", None, None, &[]).program_ids(),
+            vec![
+                "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
+                DLN_SOURCE.to_string(),
+            ],
+            "an empty NTT list adds nothing"
+        );
+
+        let ntt = vec!["NttManager".to_string()];
+        let registry = configured_registry(
+            &[(Protocol::Wormhole, "NttManager".to_string())],
+            "TokenBridge",
+            None,
+            None,
+            &ntt,
+        );
+        assert_eq!(
+            registry.program_ids(),
+            vec![
+                "NttManager".to_string(),
+                "TokenBridge".to_string(),
+                DLN_DESTINATION.to_string(),
+                DLN_SOURCE.to_string(),
+            ]
+        );
+        assert_eq!(
+            registry.protocols_for("NttManager"),
+            vec![Protocol::Wormhole]
+        );
+        assert_eq!(
+            registry.protocols_for("TokenBridge"),
+            vec![Protocol::Wormhole]
+        );
+
+        // The manager belongs to the NTT adapter only. If the Wormhole adapter had
+        // claimed it too, the tx would match two adapters.
+        let results = registry.classify(&tx_calling(&[("NttManager", None)]));
+        assert_eq!(results.len(), 1, "adapters that matched: {results:?}");
+        assert_eq!(
+            results[0].1,
+            Classification::Rejected(Reject::Malformed("ntt instruction without data"))
+        );
+    }
+
+    #[test]
     fn the_debridge_programs_are_always_registered() {
-        let registry = configured_registry(&[], "TokenBridge", None, None);
+        let registry = configured_registry(&[], "TokenBridge", None, None, &[]);
         assert_eq!(registry.protocols_for(DLN_SOURCE), vec![Protocol::Debridge]);
         assert_eq!(
             registry.protocols_for(DLN_DESTINATION),
