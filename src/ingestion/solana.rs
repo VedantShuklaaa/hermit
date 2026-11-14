@@ -208,6 +208,22 @@ where
     }
 }
 
+/// Renders an error chain for a log line with the WebSocket URL's query string
+/// removed. A connect error can echo the request URI, and the query carries the
+/// API key.
+fn redact_ws_url(text: &str, ws_url: &str) -> String {
+    let Some((host, query)) = ws_url.split_once('?') else {
+        return text.to_string();
+    };
+
+    let text = text.replace(ws_url, host);
+    if query.is_empty() {
+        text
+    } else {
+        text.replace(query, "[redacted]")
+    }
+}
+
 #[derive(Clone)]
 pub struct SolanaIngester {
     ws_url: String,
@@ -300,6 +316,7 @@ impl SolanaIngester {
             }
 
             if let ConnectionEnd::Error(error) = &end {
+                let error = redact_ws_url(&format!("{error:#}"), &self.ws_url);
                 error!(program, %error, "Solana ingestion connection failed");
             } else {
                 warn!(
@@ -953,6 +970,40 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error() {
         assert!(parse_subscribe_reply("not json", ID).is_err());
+    }
+
+    #[test]
+    fn redacts_the_query_string_from_a_connect_error_url() {
+        let ws_url = "wss://mainnet.helius-rpc.com/?api-key=SECRET";
+        let text = format!(
+            "failed to connect to Solana WebSocket: URL error: Unable to connect to {ws_url}"
+        );
+
+        let redacted = redact_ws_url(&text, ws_url);
+
+        assert!(
+            redacted.contains("wss://mainnet.helius-rpc.com/"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("URL error"), "{redacted}");
+        assert!(!redacted.contains("SECRET"), "{redacted}");
+        assert!(!redacted.contains("api-key"), "{redacted}");
+    }
+
+    #[test]
+    fn redacts_a_query_string_without_the_host() {
+        let ws_url = "wss://mainnet.helius-rpc.com/?api-key=SECRET";
+
+        let redacted = redact_ws_url("request to ?api-key=SECRET failed", ws_url);
+
+        assert_eq!(redacted, "request to ?[redacted] failed");
+    }
+
+    #[test]
+    fn leaves_errors_without_a_query_string_alone() {
+        let text = "failed to connect to Solana WebSocket: HTTP error: 403 Forbidden";
+
+        assert_eq!(redact_ws_url(text, "wss://mainnet.helius-rpc.com/"), text);
     }
 
     #[tokio::test]
