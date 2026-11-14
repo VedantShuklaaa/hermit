@@ -50,11 +50,12 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   resolves it to a canonical chain, or to `ChainRef::Unresolved`, never an error.
   Only `active` rows resolve, in both tables, and a mapping must point at an
   active chain, so a `pending_review` proposal can never label a real transfer.
-* The migration seeds the 10 current chains plus the `wormhole` namespace (checked
-  against `sdk/vaa/structs.go` in wormhole-foundation/wormhole), the `evm`
-  namespace (checked against ethereum-lists/chains), the CCTP domains and the
-  `debridge` internal chain IDs. Each mapping row carries `status`, `origin`
-  (`seed`, `manual`, `llm`), `evidence` and `verified_at`.
+* The migrations seed the 10 original chains plus Monad, Arc and HyperEVM (added
+  with their CCTP domains), the `wormhole` namespace (checked against
+  `sdk/vaa/structs.go` in wormhole-foundation/wormhole), the `evm` namespace
+  (checked against ethereum-lists/chains), the CCTP domains and the `debridge`
+  internal chain IDs. Each mapping row carries `status`, `origin` (`seed`,
+  `manual`, `llm`), `evidence` and `verified_at`.
 * `protocols::wormhole::WormholeAdapter` decodes Token Bridge outbound transfers
   (`transfer_native`, `transfer_wrapped` and the with-payload variants) from the tx
   alone. The Token Bridge CPIs the core bridge `PostMessage`: its instruction data
@@ -203,7 +204,8 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   `TrimmedAmount` (decimals u8, then amount u64 BE, at most 8 decimals), the
   source token (32), recipient (32) and recipient chain (u16 BE); an optional
   additional payload may follow the fixed 79 bytes. The adapter reads the fixed
-  fields and ignores the optional tail. On an outbound release the source token
+  fields and ignores the optional tail. A payload without the standard
+  transceiver prefix (a custom transceiver) is rejected `not_transfer`. On an outbound release the source token
   is a Solana account, so `token` is `(wormhole, 1, base58(source_token))`; on an
   inbound receive it is the origin chain's token, formatted with the same
   chain-address rules. The recipient is decoded with the existing chain-address
@@ -268,7 +270,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   (for example `reclaim_event_account`, `update_attester_manager`,
   `set_min_fee`) are rejected `not_transfer` ("cctp admin instruction").
 
-  **Domains seeded** by `20261115120000_cctp_messages.sql`, checked against
+  **Domains seeded** by `20261115120000_cctp_messages.sql`,
+  `20261113130000_cctp_domains_7_15_26.sql` and
+  `20261113140000_cctp_domain_19_hyperevm.sql`, checked against
   <https://developers.circle.com/cctp/concepts/supported-chains-and-domains>:
 
   | Domain | Chain |
@@ -278,9 +282,15 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   | 3 | Arbitrum |
   | 5 | Solana |
   | 6 | Base |
+  | 7 | Polygon |
+  | 15 | Monad |
+  | 19 | HyperEVM |
+  | 26 | Arc |
 
-  Any other domain is stored as an unresolved `cctp` reference, never an
-  error. The origin sender and token are decoded only for Solana (base58) and
+  Domain 27 (Stellar) is not mapped because its addresses are StrKey, not EVM
+  words, so it needs a decoding arm; domains 22, 25, 29, 31 and 37 are also
+  unmapped. Any other domain is stored as an unresolved `cctp` reference, never
+  an error. The origin sender and token are decoded only for Solana (base58) and
   the seeded EVM domains (`0x` + the last 20 bytes); an unseeded origin keeps
   the raw reference and leaves the wallet/token absent. CCTP has no `/api/v1`
   representation (v1 is frozen to the Wormhole Token Bridge); `/api/v2`
@@ -357,8 +367,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   | 100000030 | Monad |
 
   HyperEVM and Monad use DLN's internal IDs, not their EVM chain IDs. Gnosis is
-  not on DLN's supported list; Linea and the other listed chains are not in this
-  registry yet. Any other ID is stored as an unresolved `debridge` reference.
+  not on DLN's supported list; Linea, NEAR, TRON and the other chains DLN lists
+  have no `debridge` mapping here and are stored unresolved. Any other ID is
+  stored as an unresolved `debridge` reference.
   Addresses are decoded for the seeded chains: 32-byte Solana addresses as
   base58, 20-byte EVM addresses as `0x` + hex. An unknown chain leaves the
   wallet absent, never an error. The amount and token come from the order's
@@ -428,8 +439,9 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
   The source chain, token and amount matched the actual balance changes and the
   `fulfill` args in every sample. A fill carries only the unlocker, so the fetch
   step preloads the state account through `required_accounts`; without it the
-  instruction is reported unsupported rather than guessed. The adapter does not
-  decode `settle`, `cancel` or `register_order`, and it rejects failed
+  instruction is reported unsupported rather than guessed, so a fill whose state
+  account has already closed is not decodable and is not backfilled. The adapter
+  does not decode `settle`, `cancel` or `register_order`, and it rejects failed
   transactions.
 
   **Chains.** `source` is the `wormhole` namespace at Solana's ID 1 and
@@ -480,6 +492,13 @@ Contents: [Domain model](#domain-model-and-implementation-notes) · [Project str
     `evm_watch_targets` for Base, Arbitrum and Avalanche with the verified Core
     and Token Bridge addresses, `evm_chain_id`, `finality_mode = 'finalized'`
     and fallback depths 6500, 5000 and 32.
+  * `20261113130000_cctp_domains_7_15_26.sql` adds the Monad and Arc chains and
+    the CCTP mappings for domains 7 (Polygon), 15 (Monad) and 26 (Arc), then
+    resolves rows previously stored unresolved for those origins. The two new
+    chains have no `explorer_tx_url`.
+  * `20261113140000_cctp_domain_19_hyperevm.sql` adds the HyperEVM chain and the
+    CCTP mapping for domain 19, then resolves rows previously stored unresolved
+    for that origin. The new chain has no `explorer_tx_url`.
   * `20261114120000_bridge_transfer_program.sql` adds
     `bridge_transfers.program` (`TEXT NOT NULL DEFAULT 'token_bridge'`) and
     backfills every existing row to `token_bridge`. The column records which
@@ -650,6 +669,8 @@ hermit/
 │   ├── 20261111120000_evm_watch_target_chain_id.sql
 │   ├── 20261112120000_evm_watch_target_finality_mode.sql
 │   ├── 20261113120000_enable_base_arbitrum_avalanche.sql
+│   ├── 20261113130000_cctp_domains_7_15_26.sql
+│   ├── 20261113140000_cctp_domain_19_hyperevm.sql
 │   ├── 20261114120000_bridge_transfer_program.sql
 │   ├── 20261115120000_cctp_messages.sql
 │   └── 20261115130000_debridge_chain_ids.sql
@@ -701,13 +722,14 @@ hermit/
 │   │   ├── wormhole/
 │   │   │   ├── mod.rs                  # Token Bridge adapter, outbound and inbound
 │   │   │   ├── nft_bridge.rs           # NFT Bridge adapter, opt-in via SOLANA_NFT_BRIDGE_PROGRAM
+│   │   │   ├── ntt.rs                  # NTT adapter, opt-in via SOLANA_NTT_PROGRAMS
 │   │   │   └── posted_vaa.rs           # core bridge posted VAA account parser
 │   │   ├── cctp/
 │   │   │   └── mod.rs                  # CCTP V2 inbound completion adapter, opt-in
 │   │   ├── debridge/
 │   │   │   └── mod.rs                  # DLN source createOrder + destination fulfillOrder
 │   │   └── mayan/
-│   │       └── mod.rs                  # Swift V2 source init_order
+│   │       └── mod.rs                  # Swift V2 source init_order + destination fulfill
 │   ├── chains/
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve
 │   │   └── db.rs                       # load_snapshot
@@ -767,6 +789,7 @@ hermit/
 │   ├── list_transfers.rs
 │   ├── mayan_fixtures.rs
 │   ├── mayan_persistence.rs
+│   ├── ntt_fixtures.rs
 │   ├── persistence_idempotency.rs
 │   ├── v1_api_snapshots.rs
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json, account_<name>_vaa.json
@@ -992,9 +1015,11 @@ timestamp; unknown chain, direction, status, protocol; `from >= to`), 500 `INTER
 No cache on this path. Plans and the one added index:
 [3g-list-endpoint.md](3g-list-endpoint.md).
 
-The v2 transfer model still has one `message_id` shape (`wormhole`), so a page
-containing a row for another protocol fails with `422 NORMALISATION_FAILED`
-until that protocol gets a `MessageId` variant.
+The v2 transfer model has one `message_id` shape per protocol, taken from the
+stored row: `wormhole` (`emitter_chain`, `emitter_address`, `sequence`), `cctp`
+(`source_domain`, `nonce`), `debridge` (`order_id`) and `mayan` (`order_hash`).
+A row whose protocol has no variant, or whose identity columns are missing,
+fails with `422 NORMALISATION_FAILED` rather than returning a partial shape.
 
 ### Live feed (`GET /api/v2/transfers/live`)
 
@@ -1396,8 +1421,10 @@ cargo test
   tx, missing/foreign `Sequence` logs, malformed/truncated data; inbound for all
   four `complete_*` variants, missing or foreign-owned VAA account, garbage
   data, payload for another chain). `posted_vaa.rs` covers the layout parser.
-* `tests/chain_registry_db.rs`: Postgres (Docker). Migration seeds ten chains,
-  one chain resolves from every namespace, unknown IDs unresolved,
+* `tests/chain_registry_db.rs`: Postgres (Docker). Migration seeds the 10
+  original chains plus Monad, Arc and HyperEVM (with their CCTP domains), and
+  the deBridge and CCTP mappings; one chain resolves from every namespace,
+  unknown IDs unresolved,
   `pending_review` resolves only once activated, DB rejects unknown status, a
   failed refresh keeps the previous snapshot.
 * `src/clients/wormhole.rs`, `src/clients/helius.rs`, `src/services/detect.rs`:
