@@ -78,6 +78,7 @@ fn test_config(
             enabled: false,
             backfill: false,
             backfill_max: 0,
+            backfill_max_age_secs: 0,
             backfill_pace_ms: 0,
             rewind_slots: 20,
             dedupe_ttl_secs: 0,
@@ -104,7 +105,8 @@ fn test_config(
             reclaim_idle_ms: 50,
             reclaim_interval_secs,
             worker_count: 1,
-            read_count: 10,
+            concurrency: 2,
+            read_count: 4,
         },
         evm: bridge::config::EvmConfig {
             enabled: false,
@@ -525,6 +527,56 @@ async fn a_reclaimed_message_failing_with_overloaded_stays_pending() {
     assert_eq!(
         persisted(&db.pool, &["transient-reclaim".to_string()]).await,
         0
+    );
+
+    shutdown.cancel();
+    let _ = recovery.await;
+}
+
+/// A message that has only been waiting, not failing, must not be reclaimed: an
+/// `XAUTOCLAIM` would spend one of its deliveries even though analysis never ran.
+/// Several recovery sweeps inside the idle window must leave the count at one.
+#[tokio::test]
+async fn a_message_inside_the_idle_threshold_is_not_reclaimed() {
+    let fake = common::start_fake_upstream().await;
+
+    let db = common::test_db().await;
+    let redis = common::test_redis().await;
+    let mut connection = connect(&redis.url).await;
+    create_group(&mut connection).await;
+    publish(&mut connection, "solana", "still-waiting", 1).await;
+    pre_deliver(&mut connection, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A minute of idle patience against a one-second sweep interval: recovery runs
+    // repeatedly and must still leave the message alone.
+    let mut config = test_config(UNUSED_DB_URL, &redis.url, &fake.base_url, 10, 1);
+    config.worker.reclaim_idle_ms = 60_000;
+    let state = live_state(&db.pool, config).await;
+
+    let shutdown = CancellationToken::new();
+    let recovery = spawn_consumer(&redis.url, state, "recovery-worker", shutdown.clone(), true);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let pending = pending(&mut connection).await;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the waiting message left the pending list: {pending:?}"
+    );
+    assert_eq!(
+        pending[0].1, 1,
+        "a message only waiting for its idle window was re-delivered"
+    );
+    assert_eq!(
+        fake_calls_to(&fake.base_url, "helius:getTransaction").await,
+        0,
+        "the waiting message was analysed before its idle window elapsed"
+    );
+    assert!(
+        dead_letters(&mut connection).await.is_empty(),
+        "a waiting message was dead-lettered"
     );
 
     shutdown.cancel();

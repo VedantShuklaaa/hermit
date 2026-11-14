@@ -33,6 +33,15 @@ use crate::{
 /// before the acknowledgement, so silence past this means the connection is dead.
 const SUBSCRIBE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Wall-clock seconds, for the backfill age cap. A clock before the epoch is treated
+/// as 0, which keeps the cap disabled rather than dropping every signature.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 /// Why a connection ended. `Stopped` is the clean shutdown path; every other variant is
 /// a reconnect and carries the static label reported in `ingest_reconnects_total`.
 #[derive(Debug)]
@@ -611,6 +620,8 @@ impl SolanaIngester {
                 start_checkpoint,
                 self.config.rewind_slots,
                 remaining,
+                self.config.backfill_max_age_secs,
+                unix_now(),
             );
 
             for candidate in &page.candidates {
@@ -642,7 +653,12 @@ impl SolanaIngester {
             }
 
             if page.done {
-                if stats.published >= self.config.backfill_max {
+                if page.truncated_by_age {
+                    warn!(
+                        max_age_secs = self.config.backfill_max_age_secs,
+                        "Backfill stopped at INGEST_BACKFILL_MAX_AGE_SECS, older signatures were not replayed"
+                    );
+                } else if stats.published >= self.config.backfill_max {
                     warn!(
                         max = self.config.backfill_max,
                         "Backfill stopped at INGEST_BACKFILL_MAX, older signatures were not replayed"

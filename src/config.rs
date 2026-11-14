@@ -150,13 +150,19 @@ pub struct WorkerConfig {
     /// leaves the message pending, so this bounds how many times it can come back.
     pub max_deliveries: u32,
     /// How long a message must sit unacknowledged before recovery reclaims it.
-    /// Must stay well below any outage that would justify a dead letter.
+    /// Raise it above the worst case a message can spend waiting on a provider
+    /// token and in analysis: a message that is merely queued must never be
+    /// reclaimed, because `XAUTOCLAIM` would spend one of its deliveries.
     pub reclaim_idle_ms: u64,
     /// Seconds between recovery sweeps.
     pub reclaim_interval_secs: u64,
     /// Worker tasks reading the stream.
     pub worker_count: usize,
-    /// `XREADGROUP COUNT`: messages a worker reads per round.
+    /// Messages one worker analyses at once.
+    pub concurrency: usize,
+    /// `XREADGROUP COUNT`: messages a worker claims per round. Keep it at one
+    /// to two times `concurrency`, so an entry is claimed shortly before it is
+    /// analysed rather than sitting unacknowledged behind a large batch.
     pub read_count: usize,
 }
 
@@ -170,6 +176,9 @@ pub struct IngestConfig {
     /// Most signatures one backfill run will publish. Bounds the Helius spend after a long
     /// outage; the checkpoint still moves forward, so the next restart does not repeat it.
     pub backfill_max: usize,
+    /// Oldest signature one backfill run will publish, in seconds. A long outage no longer
+    /// enqueues everything the checkpoint missed. `0` disables the age cap.
+    pub backfill_max_age_secs: u64,
     /// Pause between backfilled signatures, to stay under the Helius plan's rate cap.
     /// A backfilled message costs up to three live Helius calls, so the pause has to
     /// be long enough that publishing cannot outrun the live limiter.
@@ -355,6 +364,19 @@ impl AppConfig {
         let ping_secs = number("INGEST_PING_SECS", 30u64).max(1);
         let watchdog_secs = number("INGEST_WATCHDOG_SECS", 90u64).max(ping_secs + 1);
 
+        // A worker should claim only a little more than it can analyse at once.
+        // The default batch is twice the default concurrency.
+        let concurrency = number("CONSUMER_CONCURRENCY", 2usize).max(1);
+        let read_count = number("CONSUMER_READ_COUNT", concurrency * 2).max(1);
+        if read_count > concurrency.saturating_mul(2) {
+            tracing::warn!(
+                read_count,
+                concurrency,
+                "CONSUMER_READ_COUNT is more than twice CONSUMER_CONCURRENCY; \
+                 claimed entries may wait unacknowledged behind the limiter"
+            );
+        }
+
         // EVM_RPC_<CHAIN>: the suffix is the chain registry slug. Empty values are
         // ignored so a commented-out placeholder cannot start a watcher with no URL.
         // Every endpoint defaults to the process-wide range and rate.
@@ -461,6 +483,7 @@ impl AppConfig {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true),
                 backfill_max: number("INGEST_BACKFILL_MAX", 5000usize),
+                backfill_max_age_secs: number("INGEST_BACKFILL_MAX_AGE_SECS", 21_600u64),
                 backfill_pace_ms: number("INGEST_BACKFILL_PACE_MS", 750u64),
                 rewind_slots: number("INGEST_REWIND_SLOTS", 20u64),
                 dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 7200u64),
@@ -477,10 +500,15 @@ impl AppConfig {
             },
             worker: WorkerConfig {
                 max_deliveries: number("WORKER_MAX_DELIVERIES", 10u32).max(1),
-                reclaim_idle_ms: number("WORKER_RECLAIM_IDLE_MS", 300_000u64),
+                // One analysis can spend a 20 s first-token wait, transient retries
+                // with their own token waits, and a 90 s VAA window. 15 min leaves
+                // room for all of that plus queueing behind the limiter, so an
+                // entry that is still waiting is never reclaimed.
+                reclaim_idle_ms: number("WORKER_RECLAIM_IDLE_MS", 900_000u64).max(1),
                 reclaim_interval_secs: number("WORKER_RECLAIM_INTERVAL_SECS", 30u64).max(1),
                 worker_count: number("CONSUMER_COUNT", 5usize).max(1),
-                read_count: number("CONSUMER_READ_COUNT", 10usize).max(1),
+                concurrency,
+                read_count,
             },
             evm: EvmConfig {
                 enabled: evm_enabled,
@@ -621,6 +649,7 @@ impl AppConfig {
                 enabled: false,
                 backfill: false,
                 backfill_max: 0,
+                backfill_max_age_secs: 0,
                 backfill_pace_ms: 0,
                 rewind_slots: 20,
                 dedupe_ttl_secs: 0,
@@ -647,7 +676,8 @@ impl AppConfig {
                 reclaim_idle_ms: 1,
                 reclaim_interval_secs: 1,
                 worker_count: 5,
-                read_count: 10,
+                concurrency: 2,
+                read_count: 4,
             },
             evm: EvmConfig {
                 enabled: false,
@@ -856,6 +886,21 @@ mod tests {
         assert!(error.contains("invalid ROLE"), "{error}");
         assert!(error.contains("wokrer"), "{error}");
         assert!(error.contains("all, api, stream"), "{error}");
+    }
+
+    #[test]
+    fn a_worker_claims_no_more_than_twice_what_it_runs_at_once() {
+        let worker = AppConfig::test_config().worker;
+
+        assert!(worker.concurrency >= 1);
+        assert!(
+            worker.read_count >= worker.concurrency,
+            "a batch smaller than the concurrency wastes a worker"
+        );
+        assert!(
+            worker.read_count <= 2 * worker.concurrency,
+            "a large batch claims entries long before they are analysed"
+        );
     }
 
     #[test]
